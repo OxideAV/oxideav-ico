@@ -127,7 +127,7 @@ fn bits_per_pixel_for(fmt: SubFormatChosen) -> u16 {
 fn encode_sub_image(im: &IconImage, fmt: SubFormatChosen) -> Result<Vec<u8>> {
     let frame = iconimage_to_frame(im);
     match fmt {
-        SubFormatChosen::Png => oxideav_png::encoder::encode_single(&frame, PixelFormat::Rgba, &[]),
+        SubFormatChosen::Png => oxideav_png::encode_single(&frame, PixelFormat::Rgba, &[]),
         SubFormatChosen::Bmp => {
             // The BMP-inside-ICO convention is doubled height + AND
             // mask appended; oxideav-bmp handles both via the

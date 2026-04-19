@@ -97,7 +97,7 @@ fn decode_entry_payload(
 ) -> Result<IconImage> {
     let is_png = payload.len() >= PNG_MAGIC.len() && payload[..PNG_MAGIC.len()] == PNG_MAGIC;
     if is_png {
-        let frame = oxideav_png::decoder::decode_png_to_frame(payload, None, TimeBase::new(1, 1))?;
+        let frame = oxideav_png::decode_png_to_frame(payload, None, TimeBase::new(1, 1))?;
         let rgba = frame_to_rgba_bytes(&frame)?;
         Ok(IconImage {
             width: frame.width,

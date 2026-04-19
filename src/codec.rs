@@ -89,7 +89,7 @@ impl Encoder for IcoEncoder {
         // the standalone `WriteOptions::default()` heuristic.
         let use_png = vf.width.min(vf.height) >= 64;
         let bytes = if use_png {
-            oxideav_png::encoder::encode_single(vf, PixelFormat::Rgba, &[])?
+            oxideav_png::encode_single(vf, PixelFormat::Rgba, &[])?
         } else {
             oxideav_bmp::encode_dib(vf, /* doubled */ true)?
         };
@@ -120,7 +120,7 @@ impl Encoder for IcoEncoder {
 
 pub(crate) fn decode_sub_image_bytes(payload: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
     if payload.len() >= PNG_MAGIC.len() && payload[..PNG_MAGIC.len()] == PNG_MAGIC {
-        let mut f = oxideav_png::decoder::decode_png_to_frame(payload, pts, TimeBase::new(1, 1))?;
+        let mut f = oxideav_png::decode_png_to_frame(payload, pts, TimeBase::new(1, 1))?;
         // PNG is typically RGBA already; normalise for downstream so
         // the rest of the pipeline can count on a stable format.
         f.pts = pts;
