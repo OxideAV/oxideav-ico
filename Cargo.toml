@@ -14,8 +14,6 @@ categories = ["multimedia::encoding", "multimedia::images"]
 
 [dependencies]
 oxideav-core = "0.1"
-oxideav-codec = "0.1"
-oxideav-container = "0.1"
 oxideav-pixfmt = "0.1"
 # Sub-image codecs. These crates are pure-Rust too; between them they
 # cover every image payload an ICO / CUR can legally hold.

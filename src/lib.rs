@@ -29,9 +29,9 @@ pub mod reader;
 pub mod types;
 pub mod writer;
 
-use oxideav_codec::{CodecInfo, CodecRegistry};
-use oxideav_container::ContainerRegistry;
+use oxideav_core::ContainerRegistry;
 use oxideav_core::{CodecCapabilities, CodecId, PixelFormat};
+use oxideav_core::{CodecInfo, CodecRegistry};
 
 /// Codec id for individual ICO / CUR sub-image frames.
 pub const CODEC_ID_STR: &str = "ico";

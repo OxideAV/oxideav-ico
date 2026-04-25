@@ -9,10 +9,10 @@
 //! PNG or a BMP DIB (with the doubled-height + AND-mask layout), so
 //! the muxer can splice the bytes straight into a file.
 
-use oxideav_codec::{Decoder, Encoder};
 use oxideav_core::{
     CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Result, TimeBase, VideoFrame,
 };
+use oxideav_core::{Decoder, Encoder};
 
 const PNG_MAGIC: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
 

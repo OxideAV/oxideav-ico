@@ -12,12 +12,12 @@
 
 use std::io::{Read, SeekFrom, Write};
 
-use oxideav_container::{
-    ContainerRegistry, Demuxer, Muxer, ProbeData, ProbeScore, ReadSeek, WriteSeek, MAX_PROBE_SCORE,
-};
 use oxideav_core::{
     CodecId, CodecParameters, CodecResolver, Error, MediaType, Packet, PixelFormat, Result,
     StreamInfo, TimeBase,
+};
+use oxideav_core::{
+    ContainerRegistry, Demuxer, Muxer, ProbeData, ProbeScore, ReadSeek, WriteSeek, MAX_PROBE_SCORE,
 };
 
 pub fn register(reg: &mut ContainerRegistry) {
@@ -38,7 +38,7 @@ fn probe(data: &ProbeData) -> ProbeScore {
     {
         MAX_PROBE_SCORE
     } else if matches!(data.ext, Some("ico") | Some("cur")) {
-        oxideav_container::PROBE_SCORE_EXTENSION
+        oxideav_core::PROBE_SCORE_EXTENSION
     } else {
         0
     }
