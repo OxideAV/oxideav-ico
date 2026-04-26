@@ -4,7 +4,7 @@
 //! and decodes the pointed-at payload (either PNG or BMP-DIB) into an
 //! RGBA [`IconImage`].
 
-use oxideav_core::{Error, Result, TimeBase};
+use oxideav_core::{Error, Result};
 
 use crate::types::*;
 
@@ -97,11 +97,16 @@ fn decode_entry_payload(
 ) -> Result<IconImage> {
     let is_png = payload.len() >= PNG_MAGIC.len() && payload[..PNG_MAGIC.len()] == PNG_MAGIC;
     if is_png {
-        let frame = oxideav_png::decode_png_to_frame(payload, None, TimeBase::new(1, 1))?;
-        let rgba = frame_to_rgba_bytes(&frame)?;
+        let frame = oxideav_png::decode_png_to_frame(payload, None)?;
+        // PNG path: dimensions come from the embedded IHDR chunk
+        // (width/height are at bytes 16..24 of every PNG: 8-byte magic
+        // + 8-byte chunk header). The directory entry's declared dims
+        // are only a hint and may be 0 (encoded as 256).
+        let (w, h) = parse_png_dims(payload).unwrap_or((declared_w, declared_h));
+        let rgba = frame_to_rgba_bytes(&frame, w, h)?;
         Ok(IconImage {
-            width: frame.width,
-            height: frame.height,
+            width: w,
+            height: h,
             pixels: rgba,
             bit_depth: 32,
             sub_format: IconSubFormat::Png,
@@ -109,16 +114,11 @@ fn decode_entry_payload(
         })
     } else {
         // BMP-inside-ICO: headerless DIB with doubled height + AND mask.
+        // The DIB header itself carries the true dimensions; parse them
+        // from the header so a lying directory entry doesn't mislead us.
         let frame = oxideav_bmp::decode_dib(payload, /* doubled */ true)?;
-        // Sanity-check against the directory entry. Mostly harmless if
-        // they disagree; we trust the DIB header's dimensions because
-        // it's what was actually used to lay out pixels.
-        let (w, h) = (frame.width, frame.height);
-        if (declared_w != w && declared_w != 256) || (declared_h != h && declared_h != 256) {
-            // Not fatal — just note that the ICONDIRENTRY header
-            // lied. Real-world icon files do this.
-        }
-        let rgba = frame_to_rgba_bytes(&frame)?;
+        let (w, h) = parse_dib_dims(payload, declared_w, declared_h);
+        let rgba = frame_to_rgba_bytes(&frame, w, h)?;
         // Read back the BMP bit-depth from the header so callers can
         // preserve it on roundtrip.
         let bpp = if payload.len() >= 16 {
@@ -137,18 +137,38 @@ fn decode_entry_payload(
     }
 }
 
+/// Pull (width, height) from a PNG IHDR chunk. PNG layout: 8-byte
+/// magic, then a 4-byte length, 4-byte chunk type ("IHDR"), then the
+/// IHDR payload starting with two big-endian u32s (width, height).
+fn parse_png_dims(payload: &[u8]) -> Option<(u32, u32)> {
+    if payload.len() < 24 {
+        return None;
+    }
+    let w = u32::from_be_bytes([payload[16], payload[17], payload[18], payload[19]]);
+    let h = u32::from_be_bytes([payload[20], payload[21], payload[22], payload[23]]);
+    Some((w, h))
+}
+
+/// Pull (width, height) from a headerless DIB (BITMAPINFOHEADER). The
+/// height field is doubled (image + AND-mask) for the ICO sub-image
+/// convention; we halve it back. Falls back to the directory entry's
+/// declared dims when the header is too short to parse.
+fn parse_dib_dims(payload: &[u8], declared_w: u32, declared_h: u32) -> (u32, u32) {
+    if payload.len() < 12 {
+        return (declared_w, declared_h);
+    }
+    let w = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+    let h_signed = i32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]);
+    let h_abs = h_signed.unsigned_abs();
+    // Doubled-height ICO convention: the stored value is 2× the real height.
+    (w, h_abs / 2)
+}
+
 /// Copy a `VideoFrame` (produced by either oxideav-png or oxideav-bmp,
 /// always in `Rgba`) into a tightly-packed top-down RGBA byte Vec.
-fn frame_to_rgba_bytes(frame: &oxideav_core::VideoFrame) -> Result<Vec<u8>> {
-    use oxideav_core::PixelFormat;
-    if frame.format != PixelFormat::Rgba {
-        return Err(Error::invalid(format!(
-            "ICO: sub-image decoder returned {:?}; expected Rgba",
-            frame.format
-        )));
-    }
-    let w = frame.width as usize;
-    let h = frame.height as usize;
+fn frame_to_rgba_bytes(frame: &oxideav_core::VideoFrame, w: u32, h: u32) -> Result<Vec<u8>> {
+    let w = w as usize;
+    let h = h as usize;
     if frame.planes.is_empty() {
         return Err(Error::invalid("ICO: sub-image frame has no planes"));
     }

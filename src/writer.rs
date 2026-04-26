@@ -4,7 +4,7 @@
 //! PNG for sizes ≥ 64, BMP otherwise), lays out the `ICONDIR` header,
 //! the contiguous `ICONDIRENTRY` table, and the packed payloads.
 
-use oxideav_core::{Error, PixelFormat, Result, TimeBase, VideoFrame, VideoPlane};
+use oxideav_core::{Error, PixelFormat, Result, VideoFrame, VideoPlane};
 
 use crate::types::*;
 
@@ -127,23 +127,27 @@ fn bits_per_pixel_for(fmt: SubFormatChosen) -> u16 {
 fn encode_sub_image(im: &IconImage, fmt: SubFormatChosen) -> Result<Vec<u8>> {
     let frame = iconimage_to_frame(im);
     match fmt {
-        SubFormatChosen::Png => oxideav_png::encode_single(&frame, PixelFormat::Rgba, &[]),
+        SubFormatChosen::Png => {
+            oxideav_png::encode_single(&frame, im.width, im.height, PixelFormat::Rgba, &[])
+        }
         SubFormatChosen::Bmp => {
             // The BMP-inside-ICO convention is doubled height + AND
             // mask appended; oxideav-bmp handles both via the
             // `double_height_for_ico_mask` flag.
-            oxideav_bmp::encode_dib(&frame, /* doubled */ true)
+            oxideav_bmp::encode_dib(
+                &frame,
+                PixelFormat::Rgba,
+                im.width,
+                im.height,
+                /* doubled */ true,
+            )
         }
     }
 }
 
 fn iconimage_to_frame(im: &IconImage) -> VideoFrame {
     VideoFrame {
-        format: PixelFormat::Rgba,
-        width: im.width,
-        height: im.height,
         pts: None,
-        time_base: TimeBase::new(1, 1),
         planes: vec![VideoPlane {
             stride: im.width as usize * 4,
             data: im.pixels.clone(),

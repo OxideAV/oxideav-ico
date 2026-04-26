@@ -24,10 +24,14 @@ pub fn make_decoder(_params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     }))
 }
 
-pub fn make_encoder(_params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+    let mut out_params = CodecParameters::video(CodecId::new(crate::CODEC_ID_STR));
+    out_params.width = params.width;
+    out_params.height = params.height;
+    out_params.pixel_format = params.pixel_format.or(Some(PixelFormat::Rgba));
     Ok(Box::new(IcoEncoder {
         codec_id: CodecId::new(crate::CODEC_ID_STR),
-        out_params: CodecParameters::video(CodecId::new(crate::CODEC_ID_STR)),
+        out_params,
         pending: None,
         eof: false,
     }))
@@ -85,13 +89,21 @@ impl Encoder for IcoEncoder {
             Frame::Video(v) => v,
             _ => return Err(Error::invalid("ICO encoder: expected video frame")),
         };
+        let width = self
+            .out_params
+            .width
+            .ok_or_else(|| Error::invalid("ICO encoder: missing width in CodecParameters"))?;
+        let height = self
+            .out_params
+            .height
+            .ok_or_else(|| Error::invalid("ICO encoder: missing height in CodecParameters"))?;
         // Default to PNG for large sub-images, BMP for small — mirrors
         // the standalone `WriteOptions::default()` heuristic.
-        let use_png = vf.width.min(vf.height) >= 64;
+        let use_png = width.min(height) >= 64;
         let bytes = if use_png {
-            oxideav_png::encode_single(vf, PixelFormat::Rgba, &[])?
+            oxideav_png::encode_single(vf, width, height, PixelFormat::Rgba, &[])?
         } else {
-            oxideav_bmp::encode_dib(vf, /* doubled */ true)?
+            oxideav_bmp::encode_dib(vf, PixelFormat::Rgba, width, height, /* doubled */ true)?
         };
         self.pending = Some(bytes);
         Ok(())
@@ -120,7 +132,7 @@ impl Encoder for IcoEncoder {
 
 pub(crate) fn decode_sub_image_bytes(payload: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
     if payload.len() >= PNG_MAGIC.len() && payload[..PNG_MAGIC.len()] == PNG_MAGIC {
-        let mut f = oxideav_png::decode_png_to_frame(payload, pts, TimeBase::new(1, 1))?;
+        let mut f = oxideav_png::decode_png_to_frame(payload, pts)?;
         // PNG is typically RGBA already; normalise for downstream so
         // the rest of the pipeline can count on a stable format.
         f.pts = pts;
