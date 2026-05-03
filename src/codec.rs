@@ -103,7 +103,13 @@ impl Encoder for IcoEncoder {
         let bytes = if use_png {
             oxideav_png::encode_single(vf, width, height, PixelFormat::Rgba, &[])?
         } else {
-            oxideav_bmp::encode_dib(vf, PixelFormat::Rgba, width, height, /* doubled */ true)?
+            oxideav_bmp::encode_dib(
+                vf,
+                PixelFormat::Rgba,
+                width,
+                height,
+                /* doubled */ true,
+            )?
         };
         self.pending = Some(bytes);
         Ok(())
