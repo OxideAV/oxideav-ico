@@ -1,0 +1,18 @@
+name: Fuzz
+
+# Daily fuzz run for the cargo-fuzz harnesses under fuzz/. ICO is
+# self-roundtrip only (no external library oracle worth pulling in —
+# libgdiplus etc. aren't reasonable workspace deps), so just one
+# target gets the whole 30-minute budget.
+
+on:
+  schedule:
+    - cron: "11 6 * * *"   # daily 06:11 UTC, jittered off the hour
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    uses: OxideAV/.github/.github/workflows/crate-fuzz.yml@master
+    with:
+      time_budget_seconds: 1800
+    secrets: inherit

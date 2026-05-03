@@ -1,0 +1,38 @@
+[package]
+name = "oxideav-ico-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# ICO is a container wrapping BMP or PNG sub-images. There is no
+# standard system library to cross-decode against (libgdiplus etc.
+# aren't worth pulling in), so this fuzz crate is **self-roundtrip
+# only**: encode RGBA via oxideav, decode the resulting sub-image
+# bytes back through oxideav, assert pixel equality.
+
+[dependencies]
+libfuzzer-sys = "0.4"
+oxideav-core = "0.1"
+
+[dependencies.oxideav-ico]
+path = ".."
+
+[lib]
+name = "oxideav_ico_fuzz"
+path = "src/lib.rs"
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "ico_self_roundtrip"
+path = "fuzz_targets/ico_self_roundtrip.rs"
+test = false
+doc = false
