@@ -13,67 +13,69 @@
 //!   encoding. Write ← same, with per-image choice of PNG or BMP via
 //!   [`WriteOptions`].
 //!
-//! Depends on:
+//! ## Standalone vs registry-integrated
+//!
+//! The crate's default `registry` Cargo feature pulls in `oxideav-core`
+//! (plus `oxideav-bmp` / `oxideav-png` for sub-image decoding) and
+//! exposes the framework `Decoder` / `Encoder` trait surface, the
+//! container demuxer / muxer, and the [`read_ico`] / [`write_ico`]
+//! helpers that materialise pixels into [`IconImage`]s.
+//!
+//! Disable the feature (`default-features = false`) for an
+//! `oxideav-core`-free build that exposes only the lower-level
+//! [`read_ico_raw`] / [`write_ico_raw`] container parser. Those return
+//! one [`IconEntryRaw`] per directory entry — directory metadata
+//! (width, height, hotspot, source encoding) plus the raw sub-image
+//! payload bytes (PNG file or BMP DIB). Bring your own PNG / BMP-DIB
+//! implementation to materialise pixels.
+//!
+//! Depends on (only with `registry`):
 //! * [`oxideav_bmp`] for the BMP-inside-ICO path (and the headerless
 //!   `DIB` variant with the doubled-height + 1bpp AND-mask layout
 //!   that icons require).
 //! * [`oxideav_png`] for the PNG-inside-ICO path.
-//!
-//! The crate registers a single `"ico"` codec (one sub-image per
-//! `Packet`) and a single `"ico"` container, matching the
-//! `register` shape the rest of the workspace uses.
 
+#[cfg(feature = "registry")]
 pub mod codec;
+#[cfg(feature = "registry")]
 pub mod container;
+pub mod error;
+pub mod raw;
+#[cfg(feature = "registry")]
 pub mod reader;
+#[cfg(feature = "registry")]
+pub mod registry;
 pub mod types;
+#[cfg(feature = "registry")]
 pub mod writer;
-
-use oxideav_core::ContainerRegistry;
-use oxideav_core::{CodecCapabilities, CodecId, PixelFormat};
-use oxideav_core::{CodecInfo, CodecRegistry};
 
 /// Codec id for individual ICO / CUR sub-image frames.
 pub const CODEC_ID_STR: &str = "ico";
 
-pub fn register_codecs(reg: &mut CodecRegistry) {
-    let caps = CodecCapabilities::video("ico_sw")
-        .with_intra_only(true)
-        .with_lossless(true)
-        // `bIcon*` width/height are u8 → max 256. Larger entries
-        // aren't legally representable in the directory.
-        .with_max_size(256, 256)
-        .with_pixel_formats(vec![PixelFormat::Rgba]);
-    reg.register(
-        CodecInfo::new(CodecId::new(CODEC_ID_STR))
-            .capabilities(caps)
-            .decoder(codec::make_decoder)
-            .encoder(codec::make_encoder),
-    );
-}
-
-pub fn register_containers(reg: &mut ContainerRegistry) {
-    container::register(reg);
-}
-
-pub fn register(codecs: &mut CodecRegistry, containers: &mut ContainerRegistry) {
-    register_codecs(codecs);
-    register_containers(containers);
-}
-
 // ---------------------------------------------------------------------------
-// Public standalone surface — read_ico / write_ico for callers that
-// don't want to plumb through the codec / container registries.
+// Public standalone surface — always available.
 // ---------------------------------------------------------------------------
 
-pub use reader::read_ico;
+pub use error::{IcoError, Result};
+pub use raw::{read_ico_raw, write_ico_raw, IconEntryRaw};
 pub use types::{HotSpot, IconImage, IconSubFormat, IconType, WriteOptions};
+
+// ---------------------------------------------------------------------------
+// Registry-side surface — gated behind the default-on `registry` feature.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "registry")]
+pub use reader::read_ico;
+#[cfg(feature = "registry")]
+pub use registry::{register, register_codecs, register_containers};
+#[cfg(feature = "registry")]
 pub use writer::write_ico;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(feature = "registry")]
     fn checker_rgba(w: u32, h: u32) -> Vec<u8> {
         let mut v = Vec::with_capacity((w * h * 4) as usize);
         for y in 0..h {
@@ -91,6 +93,7 @@ mod tests {
         v
     }
 
+    #[cfg(feature = "registry")]
     #[test]
     fn roundtrip_multi_resolution_ico_mixed_bmp_png() {
         // 16×16 (below threshold → BMP), 64×64 (at threshold → PNG),
@@ -122,6 +125,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "registry")]
     #[test]
     fn cur_hotspot_roundtrip() {
         let mut img = IconImage::from_rgba(32, 32, checker_rgba(32, 32));
@@ -133,12 +137,14 @@ mod tests {
         assert_eq!(got[0].hotspot, img.hotspot);
     }
 
+    #[cfg(feature = "registry")]
     #[test]
     fn read_rejects_non_ico_magic() {
         let bytes = [1, 2, 3, 4, 5, 6];
         assert!(read_ico(&bytes).is_err());
     }
 
+    #[cfg(feature = "registry")]
     #[test]
     fn force_all_bmp_write() {
         let img = IconImage::from_rgba(128, 128, checker_rgba(128, 128));
@@ -152,5 +158,14 @@ mod tests {
         .unwrap();
         let (_, got) = read_ico(&bytes).unwrap();
         assert_eq!(got[0].sub_format, IconSubFormat::Bmp);
+    }
+
+    /// The `read_ico_raw` standalone parser must catch a non-ICO magic
+    /// without involving any decoder. Available even with the
+    /// `registry` feature off.
+    #[test]
+    fn raw_parser_rejects_non_ico_magic() {
+        let bytes = [1, 2, 3, 4, 5, 6];
+        assert!(read_ico_raw(&bytes).is_err());
     }
 }

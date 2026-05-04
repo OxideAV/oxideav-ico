@@ -13,9 +13,30 @@ keywords = ["multimedia", "image", "ico", "cursor", "pure-rust"]
 categories = ["multimedia::encoding", "multimedia::images"]
 
 [dependencies]
-oxideav-core = "0.1"
-oxideav-pixfmt = "0.1"
-# Sub-image codecs. These crates are pure-Rust too; between them they
-# cover every image payload an ICO / CUR can legally hold.
-oxideav-bmp = "0.1"
-oxideav-png = "0.1"
+# All three deps are gated behind the default-on `registry` feature so
+# image-library consumers can depend on `oxideav-ico` with
+# `default-features = false` to get the standalone container parser
+# (`read_ico_raw` / `write_ico_raw`) without dragging in the
+# `oxideav-core` framework dependency tree or the BMP / PNG sub-image
+# codec crates.
+oxideav-core = { version = "0.1", optional = true }
+# Needs the `decode_dib_videoframe` / `encode_dib_videoframe` compat
+# wrappers that ship with oxideav-bmp 0.1.3 alongside the `BmpImage`
+# standalone retrofit. Loose `0.1` constraint here so the workspace
+# path-dep stays usable; the published-from-crates.io build needs
+# oxideav-bmp 0.1.3 to be on the registry.
+oxideav-bmp = { version = "0.1", optional = true }
+oxideav-png = { version = "0.1", optional = true }
+
+[features]
+default = ["registry"]
+
+# Wires up the codec / encoder / decoder / container demuxer + muxer
+# trait implementations against `oxideav-core` and pulls in
+# `oxideav-bmp` / `oxideav-png` for the actual sub-image decode +
+# encode (PNG-inside-ICO + BMP-DIB-inside-ICO). Also exposes the
+# `read_ico` / `write_ico` helpers that materialise pixels into
+# `IconImage`s. Default-on; turn off for image-library use-cases that
+# only need the standalone `read_ico_raw` / `write_ico_raw` container
+# parser.
+registry = ["dep:oxideav-core", "dep:oxideav-bmp", "dep:oxideav-png"]

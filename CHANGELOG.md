@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Standalone-friendly retrofit (#360): `oxideav-core`, `oxideav-bmp`
+  and `oxideav-png` are now optional deps behind a default-on
+  `registry` cargo feature. Image-library consumers can depend on
+  `oxideav-ico` with `default-features = false` to get a framework-free
+  build that exposes `read_ico_raw` / `write_ico_raw` plus crate-local
+  `IconEntryRaw` / `IcoError` types — directory metadata + raw
+  sub-image payload bytes (PNG file or BMP DIB), no decoding. Bring
+  your own PNG / BMP-DIB implementation to materialise pixels.
+- The `Decoder` / `Encoder` trait surface, the container demuxer /
+  muxer, and the `read_ico` / `write_ico` (decoded `IconImage`)
+  helpers stay behind the `registry` feature.
+- `read_ico` / `write_ico` are now thin wrappers around the new
+  `read_ico_raw` / `write_ico_raw` parser plus `oxideav-png` /
+  `oxideav-bmp` for the actual sub-image decode + encode. Behaviour
+  is unchanged.
+- Updated `oxideav-bmp` dep to `0.1.3` for the new
+  `decode_dib_videoframe` / `encode_dib_videoframe` compat wrappers.
+
 ## [0.0.4](https://github.com/OxideAV/oxideav-ico/compare/v0.0.3...v0.0.4) - 2026-05-03
 
 ### Other

@@ -103,7 +103,7 @@ impl Encoder for IcoEncoder {
         let bytes = if use_png {
             oxideav_png::encode_single(vf, width, height, PixelFormat::Rgba, &[])?
         } else {
-            oxideav_bmp::encode_dib(
+            oxideav_bmp::encode_dib_videoframe(
                 vf,
                 PixelFormat::Rgba,
                 width,
@@ -144,7 +144,7 @@ pub(crate) fn decode_sub_image_bytes(payload: &[u8], pts: Option<i64>) -> Result
         f.pts = pts;
         Ok(f)
     } else {
-        let mut f = oxideav_bmp::decode_dib(payload, /* doubled */ true)?;
+        let mut f = oxideav_bmp::decode_dib_videoframe(payload, /* doubled */ true)?;
         f.pts = pts;
         Ok(f)
     }
