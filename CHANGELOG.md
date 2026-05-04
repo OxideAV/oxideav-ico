@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-ico/compare/v0.0.4...v0.0.5) - 2026-05-04
+
+### Other
+
+- Standalone-friendly retrofit: gate oxideav-core/bmp/png behind `registry`
+- add self-roundtrip cargo-fuzz harness
+
 ### Changed
 
 - Standalone-friendly retrofit (#360): `oxideav-core`, `oxideav-bmp`
