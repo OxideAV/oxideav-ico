@@ -17,6 +17,23 @@ use crate::types::{HotSpot, IconSubFormat, IconType};
 
 const PNG_MAGIC: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
 
+/// `RIFF` magic — every `.ani` animated-cursor file starts with this,
+/// followed by a 4-byte size and the `ACON` form type. Recognised
+/// up-front so callers get a clear "this is a different container"
+/// error instead of a generic "bad idType" once we'd read past the
+/// `RIFF`-as-little-endian-u16 garbage.
+const RIFF_MAGIC: &[u8; 4] = b"RIFF";
+/// `.ani` (animated cursor) form type, found at byte offset 8 of a
+/// valid RIFF file. Together with [`RIFF_MAGIC`] this uniquely tags
+/// an animated cursor.
+const ACON_FORM: &[u8; 4] = b"ACON";
+
+/// Legal `ICONDIRENTRY.wBitCount` values for ICO entries. `0` means
+/// "unspecified — look at the DIB header", which is what most
+/// PNG-payload entries store. The other values mirror what
+/// `BITMAPINFOHEADER` itself accepts.
+const VALID_ICO_BIT_DEPTHS: [u16; 7] = [0, 1, 4, 8, 16, 24, 32];
+
 /// One ICO / CUR sub-image entry as stored on disk: directory metadata
 /// (width, height, optional hotspot, source encoding) plus the raw
 /// payload bytes.
@@ -61,6 +78,17 @@ pub fn read_ico_raw(input: &[u8]) -> Result<(IconType, Vec<IconEntryRaw>)> {
     if input.len() < 6 {
         return Err(Error::invalid("ICO: too short for ICONDIR"));
     }
+    // Animated cursors share the `.ani` extension's user expectation
+    // but are a completely different RIFF-based container. Recognise
+    // the RIFF/ACON tag pair before we mistakenly read "RIFF" as the
+    // ICONDIR header (which would produce a misleading "idType 0x4952"
+    // error). 12 bytes covers `RIFF`+u32 size+`ACON`.
+    if input.len() >= 12 && &input[..4] == RIFF_MAGIC && &input[8..12] == ACON_FORM {
+        return Err(Error::unsupported(
+            "ICO: input is a .ani animated cursor (RIFF/ACON); \
+             oxideav-ico parses static ICO + CUR only",
+        ));
+    }
     let reserved = u16::from_le_bytes([input[0], input[1]]);
     let id_type = u16::from_le_bytes([input[2], input[3]]);
     let count = u16::from_le_bytes([input[4], input[5]]) as usize;
@@ -78,6 +106,11 @@ pub fn read_ico_raw(input: &[u8]) -> Result<(IconType, Vec<IconEntryRaw>)> {
             )))
         }
     };
+    if count == 0 {
+        return Err(Error::invalid(
+            "ICO: ICONDIR.idCount = 0 (need at least one sub-image)",
+        ));
+    }
     let dir_end = 6usize
         .checked_add(
             count
@@ -94,26 +127,72 @@ pub fn read_ico_raw(input: &[u8]) -> Result<(IconType, Vec<IconEntryRaw>)> {
         let e = &input[6 + i * 16..6 + i * 16 + 16];
         let declared_width = normalise_dim(e[0]);
         let declared_height = normalise_dim(e[1]);
-        // `e[2]` = bColorCount, `e[3]` = bReserved.
+        let color_count = e[2];
+        let reserved_byte = e[3];
         let planes_or_hotx = u16::from_le_bytes([e[4], e[5]]);
         let bits_or_hoty = u16::from_le_bytes([e[6], e[7]]);
         let data_size = u32::from_le_bytes([e[8], e[9], e[10], e[11]]) as usize;
         let data_offset = u32::from_le_bytes([e[12], e[13], e[14], e[15]]) as usize;
 
-        if input.len() < data_offset.saturating_add(data_size) {
+        if reserved_byte != 0 {
             return Err(Error::invalid(format!(
-                "ICO: entry {i} payload spans {data_offset}..{} past input",
-                data_offset + data_size
+                "ICO: entry {i} bReserved = {reserved_byte} (must be 0)"
             )));
         }
-        let payload = input[data_offset..data_offset + data_size].to_vec();
+        if data_size == 0 {
+            return Err(Error::invalid(format!(
+                "ICO: entry {i} dwBytesInRes = 0 (empty payload)"
+            )));
+        }
+        if data_offset < dir_end {
+            return Err(Error::invalid(format!(
+                "ICO: entry {i} dwImageOffset {data_offset} overlaps directory (ends at {dir_end})"
+            )));
+        }
+        // `data_offset + data_size` overflow + EOF check in one go.
+        let data_end = data_offset
+            .checked_add(data_size)
+            .ok_or_else(|| Error::invalid(format!("ICO: entry {i} payload extent overflows")))?;
+        if data_end > input.len() {
+            return Err(Error::invalid(format!(
+                "ICO: entry {i} payload spans {data_offset}..{data_end} past input ({} bytes)",
+                input.len()
+            )));
+        }
+        let payload = input[data_offset..data_end].to_vec();
 
         let hotspot = if icon_type == IconType::Cur {
+            // Per the CUR convention the hotspot must lie within the
+            // sub-image. Real cursors regularly write `(0, 0)` so
+            // accept that even when the dimensions are also 0 (e.g.
+            // unparseable BMP body — the caller will fail later).
+            if (planes_or_hotx as u32) >= declared_width.max(1)
+                || (bits_or_hoty as u32) >= declared_height.max(1)
+            {
+                return Err(Error::invalid(format!(
+                    "CUR: entry {i} hotspot ({planes_or_hotx},{bits_or_hoty}) \
+                     outside sub-image {declared_width}×{declared_height}"
+                )));
+            }
             Some(HotSpot {
                 x: planes_or_hotx,
                 y: bits_or_hoty,
             })
         } else {
+            // ICO path: `wPlanes` is legally 0 ("unspecified") or 1.
+            // Real-world writers always emit 1; defenders against
+            // garbage inputs should reject anything else.
+            if planes_or_hotx > 1 {
+                return Err(Error::invalid(format!(
+                    "ICO: entry {i} wPlanes = {planes_or_hotx} (must be 0 or 1)"
+                )));
+            }
+            if !VALID_ICO_BIT_DEPTHS.contains(&bits_or_hoty) {
+                return Err(Error::invalid(format!(
+                    "ICO: entry {i} wBitCount = {bits_or_hoty} \
+                     (must be one of 0/1/4/8/16/24/32)"
+                )));
+            }
             None
         };
 
@@ -125,6 +204,18 @@ pub fn read_ico_raw(input: &[u8]) -> Result<(IconType, Vec<IconEntryRaw>)> {
             IconSubFormat::Bmp => parse_dib_dims(&payload, declared_width, declared_height),
         };
         let bit_depth = sniff_bpp(&payload);
+
+        // `bColorCount` consistency: must be 0 for ≥ 8 bpp (the palette
+        // is too large to fit in a single byte). For ≤ 8 bpp the value
+        // is the palette entry count, or 0 to mean "use the default for
+        // this bit depth" — both are legal so we only error on the
+        // clearly-impossible high-bpp case.
+        if bit_depth >= 16 && color_count != 0 {
+            return Err(Error::invalid(format!(
+                "ICO: entry {i} bColorCount = {color_count} \
+                 contradicts {bit_depth}-bpp payload (must be 0)"
+            )));
+        }
 
         entries.push(IconEntryRaw {
             width,
@@ -159,6 +250,21 @@ pub fn write_ico_raw(icon_type: IconType, entries: &[IconEntryRaw]) -> Result<Ve
                 "ICO: entry {i} dimensions {}×{} out of 1..=256",
                 e.width, e.height
             )));
+        }
+        if e.data.is_empty() {
+            return Err(Error::invalid(format!("ICO: entry {i} has empty payload")));
+        }
+        // CUR hotspot must fall inside the sub-image. We mirror
+        // `read_ico_raw`'s tolerance: `(0, 0)` is always accepted.
+        if icon_type == IconType::Cur {
+            if let Some(h) = e.hotspot {
+                if (h.x as u32) >= e.width || (h.y as u32) >= e.height {
+                    return Err(Error::invalid(format!(
+                        "CUR: entry {i} hotspot ({},{}) outside sub-image {}×{}",
+                        h.x, h.y, e.width, e.height
+                    )));
+                }
+            }
         }
     }
 
@@ -306,5 +412,190 @@ mod tests {
         assert_eq!(got[0].height, 16);
         assert_eq!(got[0].sub_format, IconSubFormat::Png);
         assert_eq!(got[0].data, entry.data);
+    }
+
+    /// Build a minimal valid-looking ICO with one fake-PNG entry, so
+    /// the validation tests below can mutate one byte at a time and
+    /// assert the parser flags the tampered field.
+    fn build_minimal_ico() -> Vec<u8> {
+        let entry = IconEntryRaw {
+            width: 16,
+            height: 16,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Png,
+            hotspot: None,
+            data: PNG_MAGIC.to_vec(),
+        };
+        write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap()
+    }
+
+    #[test]
+    fn read_rejects_ani_riff_acon() {
+        // RIFF???? ACON ???? — animated cursor magic.
+        let mut bytes = vec![0u8; 12];
+        bytes[..4].copy_from_slice(b"RIFF");
+        bytes[8..12].copy_from_slice(b"ACON");
+        let err = read_ico_raw(&bytes).unwrap_err();
+        match err {
+            Error::Unsupported(msg) => assert!(msg.contains(".ani"), "{msg}"),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_rejects_zero_count_dir() {
+        // Reserved=0, idType=1 (ICO), count=0 — no entries.
+        let bytes = [0, 0, 1, 0, 0, 0];
+        assert!(read_ico_raw(&bytes).is_err());
+    }
+
+    #[test]
+    fn read_rejects_non_zero_breserved() {
+        let mut bytes = build_minimal_ico();
+        // bReserved sits at offset 9 (header 6 + entry byte 3).
+        bytes[6 + 3] = 1;
+        let err = read_ico_raw(&bytes).unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)));
+    }
+
+    #[test]
+    fn read_rejects_offset_into_directory() {
+        let mut bytes = build_minimal_ico();
+        // Rewrite the dwImageOffset to point inside the directory (0)
+        // — entry byte 12..16 holds dwImageOffset LE.
+        bytes[6 + 12..6 + 16].copy_from_slice(&0u32.to_le_bytes());
+        assert!(read_ico_raw(&bytes).is_err());
+    }
+
+    #[test]
+    fn read_rejects_zero_bytes_in_res() {
+        let mut bytes = build_minimal_ico();
+        // dwBytesInRes lives at entry bytes 8..12.
+        bytes[6 + 8..6 + 12].copy_from_slice(&0u32.to_le_bytes());
+        assert!(read_ico_raw(&bytes).is_err());
+    }
+
+    #[test]
+    fn read_rejects_overflowing_payload_extent() {
+        let mut bytes = build_minimal_ico();
+        // dwImageOffset huge → offset + size overflows usize.
+        bytes[6 + 12..6 + 16].copy_from_slice(&u32::MAX.to_le_bytes());
+        bytes[6 + 8..6 + 12].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(read_ico_raw(&bytes).is_err());
+    }
+
+    #[test]
+    fn read_rejects_ico_planes_field_above_one() {
+        let mut bytes = build_minimal_ico();
+        // wPlanes lives at entry bytes 4..6.
+        bytes[6 + 4..6 + 6].copy_from_slice(&7u16.to_le_bytes());
+        let err = read_ico_raw(&bytes).unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)));
+    }
+
+    #[test]
+    fn read_rejects_ico_invalid_bit_count() {
+        let mut bytes = build_minimal_ico();
+        // wBitCount lives at entry bytes 6..8. 17 is not a valid BMP
+        // bit depth.
+        bytes[6 + 6..6 + 8].copy_from_slice(&17u16.to_le_bytes());
+        assert!(read_ico_raw(&bytes).is_err());
+    }
+
+    #[test]
+    fn read_accepts_ico_wbitcount_zero() {
+        // 0 is "unspecified — defer to the DIB / PNG header" and is
+        // common in real files; must not be rejected.
+        let mut bytes = build_minimal_ico();
+        bytes[6 + 6..6 + 8].copy_from_slice(&0u16.to_le_bytes());
+        assert!(read_ico_raw(&bytes).is_ok());
+    }
+
+    #[test]
+    fn read_rejects_cur_hotspot_outside_image() {
+        // Build a 16×16 CUR with hotspot (100, 100) — way out of bounds.
+        let entry = IconEntryRaw {
+            width: 16,
+            height: 16,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Png,
+            hotspot: Some(HotSpot { x: 0, y: 0 }),
+            data: PNG_MAGIC.to_vec(),
+        };
+        let mut bytes = write_ico_raw(IconType::Cur, std::slice::from_ref(&entry)).unwrap();
+        // Overwrite the hotspot at entry bytes 4..8.
+        bytes[6 + 4..6 + 6].copy_from_slice(&100u16.to_le_bytes());
+        bytes[6 + 6..6 + 8].copy_from_slice(&100u16.to_le_bytes());
+        assert!(read_ico_raw(&bytes).is_err());
+    }
+
+    #[test]
+    fn read_accepts_cur_hotspot_zero_zero() {
+        let entry = IconEntryRaw {
+            width: 16,
+            height: 16,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Png,
+            hotspot: Some(HotSpot { x: 0, y: 0 }),
+            data: PNG_MAGIC.to_vec(),
+        };
+        let bytes = write_ico_raw(IconType::Cur, std::slice::from_ref(&entry)).unwrap();
+        let (ty, got) = read_ico_raw(&bytes).unwrap();
+        assert_eq!(ty, IconType::Cur);
+        assert_eq!(got[0].hotspot, Some(HotSpot { x: 0, y: 0 }));
+    }
+
+    #[test]
+    fn write_rejects_cur_hotspot_outside_image() {
+        let entry = IconEntryRaw {
+            width: 16,
+            height: 16,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Png,
+            hotspot: Some(HotSpot { x: 50, y: 0 }),
+            data: PNG_MAGIC.to_vec(),
+        };
+        assert!(write_ico_raw(IconType::Cur, std::slice::from_ref(&entry)).is_err());
+    }
+
+    #[test]
+    fn write_rejects_empty_payload() {
+        let entry = IconEntryRaw {
+            width: 16,
+            height: 16,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Png,
+            hotspot: None,
+            data: Vec::new(),
+        };
+        assert!(write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).is_err());
+    }
+
+    #[test]
+    fn read_rejects_bcolorcount_for_highbpp_bmp() {
+        // Build a synthetic 16×16 minimal BMP DIB payload claiming
+        // 32 bpp, then flip bColorCount to non-zero — the parser must
+        // reject the contradiction.
+        let mut dib = vec![0u8; 64];
+        // biSize = 40 (BITMAPINFOHEADER)
+        dib[0..4].copy_from_slice(&40u32.to_le_bytes());
+        // biWidth = 16, biHeight = 32 (doubled), biPlanes = 1
+        dib[4..8].copy_from_slice(&16u32.to_le_bytes());
+        dib[8..12].copy_from_slice(&32u32.to_le_bytes());
+        dib[12..14].copy_from_slice(&1u16.to_le_bytes());
+        // biBitCount = 32
+        dib[14..16].copy_from_slice(&32u16.to_le_bytes());
+        let entry = IconEntryRaw {
+            width: 16,
+            height: 16,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Bmp,
+            hotspot: None,
+            data: dib,
+        };
+        let mut bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
+        // bColorCount sits at entry byte 2 of the directory entry.
+        bytes[6 + 2] = 16;
+        assert!(read_ico_raw(&bytes).is_err());
     }
 }

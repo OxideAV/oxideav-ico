@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Directory-entry validation hardening in `read_ico_raw` /
+  `write_ico_raw`:
+  - `.ani` (RIFF/ACON animated cursor) inputs are detected up front
+    and rejected with a clear "different container" error instead of
+    a misleading "bad idType 0x4952" downstream failure. Matching
+    detection in the registry-side container demuxer.
+  - `ICONDIR.idCount = 0` is now rejected.
+  - Each `ICONDIRENTRY`'s `bReserved` byte must be zero; `dwBytesInRes`
+    must be non-zero; `dwImageOffset` is rejected if it falls inside
+    the directory or if `offset + size` overflows / runs past EOF.
+  - ICO entries (idType=1): `wPlanes` must be 0 or 1; `wBitCount`
+    must be one of {0, 1, 4, 8, 16, 24, 32}. CUR entries (idType=2):
+    hotspot `(x, y)` must lie within the declared sub-image bounds
+    (both on read and on write).
+  - `bColorCount` is rejected when non-zero for >= 16-bpp payloads
+    (palette bytes can't fit in `u8`).
+- 14 new unit tests covering each rejection path plus the
+  always-legal "ICO wBitCount = 0" and "CUR hotspot (0, 0)" tolerance.
+
 ## [0.0.5](https://github.com/OxideAV/oxideav-ico/compare/v0.0.4...v0.0.5) - 2026-05-04
 
 ### Other

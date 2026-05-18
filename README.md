@@ -74,3 +74,23 @@ oxideav_ico::register(&mut codecs, &mut containers);
   (where the directory entry claims BMP but the body is secretly
   PNG). Nobody writes this; the reader already handles it because it
   sniffs the body bytes.
+- Not implemented: `.ani` animated cursors (a separate RIFF/ACON
+  container). The parser detects these and refuses cleanly so callers
+  can dispatch to a dedicated demuxer.
+
+## Validation surface
+
+`read_ico_raw` rejects malformed directories before they reach a
+sub-image decoder:
+
+- `RIFF/ACON` magic — caller passed an `.ani` animated cursor.
+- `idCount = 0`, `idType` not in {1, 2}, `idReserved != 0`.
+- Per entry: `bReserved != 0`, `dwBytesInRes = 0`, `dwImageOffset`
+  pointing into the directory, `offset + size` overflowing usize or
+  running past EOF.
+- ICO entries: `wPlanes` not in {0, 1}, `wBitCount` not in
+  {0, 1, 4, 8, 16, 24, 32}, `bColorCount != 0` for >= 16-bpp.
+- CUR entries: hotspot `(x, y)` outside `width × height`.
+
+`write_ico_raw` mirrors the CUR-hotspot and empty-payload checks so
+emitted files always round-trip through the parser.

@@ -54,6 +54,15 @@ fn open_demuxer(
     if buf.len() < 6 {
         return Err(Error::invalid("ICO: file shorter than ICONDIR"));
     }
+    // Animated cursors (.ani) are a RIFF/ACON container, not an ICO.
+    // Refuse cleanly so callers reach for the right format instead of
+    // hitting the "unknown idType 0x4952" failure-mode.
+    if buf.len() >= 12 && &buf[..4] == b"RIFF" && &buf[8..12] == b"ACON" {
+        return Err(Error::unsupported(
+            "ICO: input is a .ani animated cursor (RIFF/ACON); \
+             oxideav-ico parses static ICO + CUR only",
+        ));
+    }
     let id_type = u16::from_le_bytes([buf[2], buf[3]]);
     if !(id_type == 1 || id_type == 2) {
         return Err(Error::invalid(format!("ICO: unknown idType {id_type}")));
