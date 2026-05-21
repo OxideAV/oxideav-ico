@@ -58,7 +58,9 @@ pub const CODEC_ID_STR: &str = "ico";
 
 pub use error::{IcoError, Result};
 pub use raw::{read_ico_raw, write_ico_raw, IconEntryRaw};
-pub use types::{HotSpot, IconImage, IconSubFormat, IconType, WriteOptions};
+pub use types::{
+    select_best_fit, select_largest, HotSpot, IconImage, IconSubFormat, IconType, WriteOptions,
+};
 
 // ---------------------------------------------------------------------------
 // Registry-side surface — gated behind the default-on `registry` feature.

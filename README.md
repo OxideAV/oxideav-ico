@@ -78,6 +78,27 @@ oxideav_ico::register(&mut codecs, &mut containers);
   container). The parser detects these and refuses cleanly so callers
   can dispatch to a dedicated demuxer.
 
+## Picking a sub-image
+
+For multi-resolution `.ico` files where the caller wants a single best
+match for a given render size:
+
+```rust
+use oxideav_ico::{read_ico, select_best_fit, select_largest};
+
+let (_, images) = read_ico(&bytes)?;
+// Closest fit for a 32×32 slot. Prefers the smallest entry ≥ 32,
+// falls back to the largest available when every entry is smaller.
+// Bit-depth breaks ties (32-bpp beats 1-bpp at the same resolution).
+let idx = select_best_fit(&images, 32).unwrap();
+let chosen = &images[idx];
+
+// Or just the highest-fidelity entry, irrespective of target size.
+let idx = select_largest(&images).unwrap();
+```
+
+Matches the spirit of Windows' `LookupIconIdFromDirectoryEx`.
+
 ## Validation surface
 
 `read_ico_raw` rejects malformed directories before they reach a
@@ -91,6 +112,10 @@ sub-image decoder:
 - ICO entries: `wPlanes` not in {0, 1}, `wBitCount` not in
   {0, 1, 4, 8, 16, 24, 32}, `bColorCount != 0` for >= 16-bpp.
 - CUR entries: hotspot `(x, y)` outside `width × height`.
+- Cross-entry: no two sub-image payloads may overlap. Overlapping
+  ranges have been used to smuggle a second body through the same
+  offset window (probe sees one image, renderer parses another); the
+  parser rejects the whole file rather than picking a side.
 
 `write_ico_raw` mirrors the CUR-hotspot and empty-payload checks so
 emitted files always round-trip through the parser.

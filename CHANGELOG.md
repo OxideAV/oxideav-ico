@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Cross-entry payload-overlap detection in `read_ico_raw`. Two
+  sub-image entries whose `[dwImageOffset, dwImageOffset+dwBytesInRes)`
+  byte ranges overlap have been used by attackers to smuggle two
+  different bodies through the same offset window (probe sees one
+  image, renderer parses another). The parser now rejects any such
+  file rather than picking a side.
+- `select_best_fit(&[IconImage], target)` and
+  `select_largest(&[IconImage])` helpers for picking a sub-image
+  from a multi-resolution `.ico`. `select_best_fit` prefers the
+  smallest entry whose max-dim is ≥ target, falling back to the
+  largest available when every entry is smaller; bit-depth breaks
+  ties (32-bpp wins over 1-bpp at the same resolution). Mirrors
+  Windows' `LookupIconIdFromDirectoryEx` selection.
+- 9 new unit tests covering the overlap rejection, adjacent
+  (non-overlapping) payload acceptance, and every selection
+  branch (empty, exact target, smallest-above-target, fall-back-
+  to-largest, bit-depth tiebreak, non-square entries).
 - Directory-entry validation hardening in `read_ico_raw` /
   `write_ico_raw`:
   - `.ani` (RIFF/ACON animated cursor) inputs are detected up front

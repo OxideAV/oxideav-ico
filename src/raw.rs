@@ -123,6 +123,10 @@ pub fn read_ico_raw(input: &[u8]) -> Result<(IconType, Vec<IconEntryRaw>)> {
     }
 
     let mut entries = Vec::with_capacity(count);
+    // Track each entry's [data_offset, data_offset+data_size) range
+    // so we can flag overlapping sub-image payloads (see the
+    // cross-entry check inside the loop below).
+    let mut payload_ranges: Vec<(usize, usize)> = Vec::with_capacity(count);
     for i in 0..count {
         let e = &input[6 + i * 16..6 + i * 16 + 16];
         let declared_width = normalise_dim(e[0]);
@@ -159,6 +163,23 @@ pub fn read_ico_raw(input: &[u8]) -> Result<(IconType, Vec<IconEntryRaw>)> {
                 input.len()
             )));
         }
+        // Cross-entry payload overlap: every legit ICO/CUR writer
+        // assigns each sub-image a private byte range. Overlapping
+        // ranges have been used by attackers to smuggle two different
+        // PNG/BMP bodies through the same offset window (so e.g. the
+        // probe sees a benign image but the renderer parses a malicious
+        // one). We reject the entire file rather than try to guess
+        // which interpretation the producer intended.
+        for (j, prev) in payload_ranges.iter().enumerate() {
+            let &(prev_start, prev_end) = prev;
+            if data_offset < prev_end && prev_start < data_end {
+                return Err(Error::invalid(format!(
+                    "ICO: entry {i} payload {data_offset}..{data_end} overlaps \
+                     entry {j} payload {prev_start}..{prev_end}"
+                )));
+            }
+        }
+        payload_ranges.push((data_offset, data_end));
         let payload = input[data_offset..data_end].to_vec();
 
         let hotspot = if icon_type == IconType::Cur {
@@ -569,6 +590,76 @@ mod tests {
             data: Vec::new(),
         };
         assert!(write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).is_err());
+    }
+
+    #[test]
+    fn read_rejects_overlapping_entry_payloads() {
+        // Build a 2-entry ICO. Both entries are 8 bytes long (one PNG
+        // magic each) and the writer naturally lays them out
+        // back-to-back, so first we use `write_ico_raw` to get a valid
+        // file then we rewrite entry 1's dwImageOffset to point inside
+        // entry 0's payload window.
+        let payload = PNG_MAGIC.to_vec();
+        let entry_a = IconEntryRaw {
+            width: 16,
+            height: 16,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Png,
+            hotspot: None,
+            data: payload.clone(),
+        };
+        let entry_b = IconEntryRaw {
+            width: 32,
+            height: 32,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Png,
+            hotspot: None,
+            data: payload,
+        };
+        let mut bytes = write_ico_raw(IconType::Ico, &[entry_a, entry_b]).unwrap();
+        // Directory: header (6) + 2 × 16 = 38; entry 0 payload starts
+        // at offset 38, entry 1's at offset 46. Rewrite entry 1's
+        // dwImageOffset to 40 — that sits 2 bytes into entry 0's
+        // payload window, an unambiguous overlap.
+        // Entry 1 starts at byte (6 header + 16 first entry) = 22;
+        // its dwImageOffset field lives 12 bytes into that entry = 34.
+        let entry1_dwoffset = 6 + 16 + 12;
+        bytes[entry1_dwoffset..entry1_dwoffset + 4].copy_from_slice(&40u32.to_le_bytes());
+        let err = read_ico_raw(&bytes).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => {
+                assert!(msg.contains("overlaps"), "expected overlap msg, got {msg}")
+            }
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_accepts_adjacent_non_overlapping_payloads() {
+        // Two entries with payloads laid out exactly back-to-back —
+        // the writer's natural output. Must not be flagged as overlap
+        // because the ranges are `[38, 46)` and `[46, 54)`, sharing
+        // only the boundary.
+        let payload = PNG_MAGIC.to_vec();
+        let entry_a = IconEntryRaw {
+            width: 16,
+            height: 16,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Png,
+            hotspot: None,
+            data: payload.clone(),
+        };
+        let entry_b = IconEntryRaw {
+            width: 32,
+            height: 32,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Png,
+            hotspot: None,
+            data: payload,
+        };
+        let bytes = write_ico_raw(IconType::Ico, &[entry_a, entry_b]).unwrap();
+        let (_, got) = read_ico_raw(&bytes).unwrap();
+        assert_eq!(got.len(), 2);
     }
 
     #[test]

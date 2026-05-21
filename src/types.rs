@@ -94,3 +94,164 @@ impl Default for WriteOptions {
         }
     }
 }
+
+/// Pick the sub-image that best fits a target render size, returning
+/// its index in `images`. Returns `None` only when the slice is empty.
+///
+/// The heuristic matches the spirit of Windows' `LookupIconIdFromDirectoryEx`:
+///
+/// 1. Prefer the smallest entry whose largest dimension is **≥**
+///    `target`. That gives a sub-image that can be downscaled to fit
+///    without ever needing to upscale — always sharper than blowing up
+///    a smaller entry. Among ties, the highest bit depth wins (so a
+///    32-bpp entry beats a 1-bpp entry at the same resolution).
+/// 2. If every entry is smaller than `target`, fall back to the
+///    largest entry (closest to the target without overshooting in
+///    the "no bigger entry exists" sense). Same bit-depth tiebreaker.
+///
+/// `target` is in pixels and applies to the longer side of each
+/// candidate; this matches how shell icons are sized (a 32×32 entry
+/// fits any target up to 32 px).
+pub fn select_best_fit(images: &[IconImage], target: u32) -> Option<usize> {
+    if images.is_empty() {
+        return None;
+    }
+    // First pass: smallest entry whose max-dim is ≥ target.
+    let mut best: Option<usize> = None;
+    for (i, im) in images.iter().enumerate() {
+        let max_dim = im.width.max(im.height);
+        if max_dim < target {
+            continue;
+        }
+        let better = match best {
+            None => true,
+            Some(j) => {
+                let cur = images[j].width.max(images[j].height);
+                match max_dim.cmp(&cur) {
+                    core::cmp::Ordering::Less => true,
+                    core::cmp::Ordering::Equal => im.bit_depth > images[j].bit_depth,
+                    core::cmp::Ordering::Greater => false,
+                }
+            }
+        };
+        if better {
+            best = Some(i);
+        }
+    }
+    if best.is_some() {
+        return best;
+    }
+    // Fallback: every entry is smaller than `target`. Return the
+    // largest one — the closest we have without making the user
+    // upscale a tiny entry.
+    Some(select_largest(images).expect("non-empty slice has a largest entry"))
+}
+
+/// Pick the largest sub-image by pixel area. Ties broken by bit depth
+/// (higher wins). Returns `None` only when the slice is empty.
+///
+/// Useful when the caller wants the highest-fidelity entry regardless
+/// of render size — e.g. extracting the canonical "main" icon from a
+/// multi-resolution `.ico` to feed a thumbnail pipeline.
+pub fn select_largest(images: &[IconImage]) -> Option<usize> {
+    if images.is_empty() {
+        return None;
+    }
+    let mut best = 0;
+    for i in 1..images.len() {
+        let im = &images[i];
+        let cur = &images[best];
+        let im_area = (im.width as u64) * (im.height as u64);
+        let cur_area = (cur.width as u64) * (cur.height as u64);
+        let pick = match im_area.cmp(&cur_area) {
+            core::cmp::Ordering::Greater => true,
+            core::cmp::Ordering::Equal => im.bit_depth > cur.bit_depth,
+            core::cmp::Ordering::Less => false,
+        };
+        if pick {
+            best = i;
+        }
+    }
+    Some(best)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn img(w: u32, h: u32, bpp: u8) -> IconImage {
+        let mut im = IconImage::from_rgba(w, h, vec![0u8; (w * h * 4) as usize]);
+        im.bit_depth = bpp;
+        im
+    }
+
+    #[test]
+    fn select_largest_empty() {
+        assert!(select_largest(&[]).is_none());
+    }
+
+    #[test]
+    fn select_largest_picks_max_area() {
+        let images = [img(16, 16, 32), img(64, 64, 32), img(32, 32, 32)];
+        assert_eq!(select_largest(&images), Some(1));
+    }
+
+    #[test]
+    fn select_largest_breaks_tie_on_bpp() {
+        // Two 32×32 entries — one 1-bpp legacy, one 32-bpp modern.
+        // Higher bit depth wins.
+        let images = [img(32, 32, 1), img(32, 32, 32)];
+        assert_eq!(select_largest(&images), Some(1));
+    }
+
+    #[test]
+    fn select_best_fit_empty() {
+        assert!(select_best_fit(&[], 32).is_none());
+    }
+
+    #[test]
+    fn select_best_fit_smallest_entry_at_or_above_target() {
+        // Target 32; entries 16, 32, 64, 128. Picks 32 — smallest
+        // entry that's ≥ target.
+        let images = [
+            img(16, 16, 32),
+            img(32, 32, 32),
+            img(64, 64, 32),
+            img(128, 128, 32),
+        ];
+        assert_eq!(select_best_fit(&images, 32), Some(1));
+    }
+
+    #[test]
+    fn select_best_fit_falls_back_to_largest_when_all_smaller() {
+        // Target 256; entries 16, 32, 48. None are ≥ target, so the
+        // largest one (48) wins.
+        let images = [img(16, 16, 32), img(32, 32, 32), img(48, 48, 32)];
+        assert_eq!(select_best_fit(&images, 256), Some(2));
+    }
+
+    #[test]
+    fn select_best_fit_exact_target_match_wins() {
+        // Target 32 with both a 32-px entry and a 64-px entry; the
+        // 32-px exact match should beat the larger entry.
+        let images = [img(32, 32, 32), img(64, 64, 32)];
+        assert_eq!(select_best_fit(&images, 32), Some(0));
+    }
+
+    #[test]
+    fn select_best_fit_breaks_tie_on_bpp() {
+        // Two 32×32 entries at different bit depths. Target 32.
+        // 32-bpp wins.
+        let images = [img(32, 32, 1), img(32, 32, 32)];
+        assert_eq!(select_best_fit(&images, 32), Some(1));
+    }
+
+    #[test]
+    fn select_best_fit_handles_non_square_entries() {
+        // Non-square entries — `max(width, height)` is what counts.
+        // A 16×48 entry has max-dim 48, so target 32 should pick it
+        // over a square 16×16.
+        let images = [img(16, 16, 32), img(16, 48, 32), img(64, 64, 32)];
+        assert_eq!(select_best_fit(&images, 32), Some(1));
+    }
+}
