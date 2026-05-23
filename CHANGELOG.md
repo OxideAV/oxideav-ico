@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- 256×256 PNG sub-image round-trip is now exercised end-to-end:
+  `write_ico` serialises the directory width/height as the `0` byte
+  (the `0 == 256` convention, since the fields are single bytes) and
+  `read_ico` recovers 256 from the PNG body's IHDR. New regression
+  test asserts both the `0`-byte directory encoding and a pixel-exact
+  256×256 PNG payload round-trip.
+- `write_ico` (registry path) now validates each sub-image's
+  dimensions are in `1..=256` **before** the PNG / BMP encode, failing
+  with a clear `out of 1..=256` error rather than wasting an encode
+  pass and relying on the lower-level `write_ico_raw` backstop. New
+  test covers a 300×300 rejection.
+- `select_by_dimensions(&[IconImage], width, height)` — a strict,
+  pixel-exact sub-image lookup that returns the matching entry's index
+  or `None` when no entry is exactly that size (no nearest-fit
+  substitution; that remains `select_best_fit`'s job). When several
+  entries share the requested size the highest bit depth wins, the
+  same tiebreaker `select_best_fit` / `select_largest` use. 5 new unit
+  tests cover empty, exact-match, no-match, bit-depth tiebreak, and
+  order-sensitive non-square cases.
 - Cross-entry payload-overlap detection in `read_ico_raw`. Two
   sub-image entries whose `[dwImageOffset, dwImageOffset+dwBytesInRes)`
   byte ranges overlap have been used by attackers to smuggle two

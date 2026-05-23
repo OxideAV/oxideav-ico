@@ -59,7 +59,8 @@ pub const CODEC_ID_STR: &str = "ico";
 pub use error::{IcoError, Result};
 pub use raw::{read_ico_raw, write_ico_raw, IconEntryRaw};
 pub use types::{
-    select_best_fit, select_largest, HotSpot, IconImage, IconSubFormat, IconType, WriteOptions,
+    select_best_fit, select_by_dimensions, select_largest, HotSpot, IconImage, IconSubFormat,
+    IconType, WriteOptions,
 };
 
 // ---------------------------------------------------------------------------
@@ -125,6 +126,55 @@ mod tests {
             };
             assert_eq!(got.sub_format, expected_fmt, "entry {i} sub-format");
         }
+    }
+
+    #[cfg(feature = "registry")]
+    #[test]
+    fn roundtrip_256x256_png_entry() {
+        // The canonical large-icon case: a 256×256 sub-image. The
+        // directory's single-byte width/height fields can't hold 256,
+        // so they're stored as `0` and recovered on read via the
+        // `0 == 256` convention; the PNG body's IHDR carries the true
+        // dimensions. This proves the whole 256 path round-trips —
+        // directory encode/decode plus PNG payload.
+        let img = IconImage::from_rgba(256, 256, checker_rgba(256, 256));
+        let bytes = write_ico(
+            IconType::Ico,
+            std::slice::from_ref(&img),
+            WriteOptions::default(),
+        )
+        .unwrap();
+
+        // The directory byte for width (offset 6) and height (offset 7)
+        // must both be 0 — the `256 → 0` directory encoding.
+        assert_eq!(bytes[6], 0, "256 width must serialise as the 0 byte");
+        assert_eq!(bytes[7], 0, "256 height must serialise as the 0 byte");
+
+        let (ty, decoded) = read_ico(&bytes).unwrap();
+        assert_eq!(ty, IconType::Ico);
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].width, 256);
+        assert_eq!(decoded[0].height, 256);
+        assert_eq!(decoded[0].sub_format, IconSubFormat::Png);
+        assert_eq!(
+            decoded[0].pixels, img.pixels,
+            "256×256 pixels must roundtrip exactly"
+        );
+    }
+
+    #[cfg(feature = "registry")]
+    #[test]
+    fn write_rejects_dimension_above_256() {
+        // 300×300 cannot be expressed in the single-byte directory
+        // fields, so the writer must reject it up front with a clear
+        // dimension error rather than emitting a corrupt directory.
+        let img = IconImage::from_rgba(300, 300, checker_rgba(300, 300));
+        let err = write_ico(IconType::Ico, &[img], WriteOptions::default()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("1..=256"),
+            "expected a 1..=256 dimension error, got: {msg}"
+        );
     }
 
     #[cfg(feature = "registry")]

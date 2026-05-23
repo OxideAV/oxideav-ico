@@ -47,6 +47,13 @@ keeps smaller ones as BMP — matches what Windows 10+ ships. Set
 `png_size_threshold = None` to force all-BMP (maximum legacy
 compatibility).
 
+A 256×256 sub-image is the canonical large-icon case: the directory's
+single-byte width/height fields can't hold 256, so they serialise as
+`0` (the `0 == 256` convention) and the true size is recovered from
+the PNG body's IHDR on read. `write_ico` rejects any sub-image outside
+`1..=256` in either axis up front — before the encode pass — since the
+directory physically cannot describe it.
+
 ## CUR
 
 ```rust
@@ -84,7 +91,7 @@ For multi-resolution `.ico` files where the caller wants a single best
 match for a given render size:
 
 ```rust
-use oxideav_ico::{read_ico, select_best_fit, select_largest};
+use oxideav_ico::{read_ico, select_best_fit, select_by_dimensions, select_largest};
 
 let (_, images) = read_ico(&bytes)?;
 // Closest fit for a 32×32 slot. Prefers the smallest entry ≥ 32,
@@ -95,9 +102,16 @@ let chosen = &images[idx];
 
 // Or just the highest-fidelity entry, irrespective of target size.
 let idx = select_largest(&images).unwrap();
+
+// Or a strict, pixel-exact lookup — `None` if no entry is exactly
+// that size (no nearest-fit substitution). Bit-depth breaks ties when
+// the same size appears at several depths.
+let idx = select_by_dimensions(&images, 256, 256);
 ```
 
-Matches the spirit of Windows' `LookupIconIdFromDirectoryEx`.
+`select_best_fit` / `select_largest` match the spirit of Windows'
+`LookupIconIdFromDirectoryEx`; `select_by_dimensions` is the strict
+equality variant for callers that want a specific size or nothing.
 
 ## Validation surface
 

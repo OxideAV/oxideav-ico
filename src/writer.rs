@@ -22,6 +22,20 @@ pub fn write_ico(icon_type: IconType, images: &[IconImage], opts: WriteOptions) 
         ));
     }
     for (i, im) in images.iter().enumerate() {
+        // The `ICONDIRENTRY` width / height fields are single bytes
+        // (`0` encodes the 256 case), so the directory physically
+        // cannot describe a sub-image outside `1..=256` in either
+        // axis. Reject oversized inputs here — before the (potentially
+        // expensive) PNG / BMP encode — so callers get the dimension
+        // error up front rather than after wasting an encode pass.
+        // `write_ico_raw` re-checks the same bound as a backstop.
+        if im.width == 0 || im.height == 0 || im.width > 256 || im.height > 256 {
+            return Err(oxideav_core::Error::invalid(format!(
+                "ICO: entry {i} dimensions {}×{} out of 1..=256 \
+                 (ICONDIRENTRY width/height are single bytes, 0 == 256)",
+                im.width, im.height
+            )));
+        }
         if im.pixels.len() != (im.width as usize * im.height as usize * 4) {
             return Err(oxideav_core::Error::invalid(format!(
                 "ICO: entry {i} pixel buffer size {} != {}×{}×4",

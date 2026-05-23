@@ -175,6 +175,40 @@ pub fn select_largest(images: &[IconImage]) -> Option<usize> {
     Some(best)
 }
 
+/// Find the sub-image whose stored dimensions are **exactly**
+/// `width × height`, returning its index in `images`. Returns `None`
+/// when no entry matches that size.
+///
+/// Multi-resolution `.ico` files routinely carry the same nominal
+/// size at more than one bit depth (e.g. a legacy 1-bpp 32×32 next to
+/// a 32-bpp 32×32). When several entries share the requested size the
+/// highest bit depth wins — the same tiebreaker [`select_best_fit`]
+/// and [`select_largest`] use — so callers asking for "the 32×32"
+/// get the modern entry, not the legacy one.
+///
+/// Unlike [`select_best_fit`], this is a strict equality lookup: it
+/// never substitutes a larger entry to be downscaled. Use it when the
+/// caller needs a pixel-exact sub-image (a UI slot that wants
+/// precisely 256×256 and would rather fail than rescale) and
+/// [`select_best_fit`] when a nearest-fit-with-downscale is
+/// acceptable.
+pub fn select_by_dimensions(images: &[IconImage], width: u32, height: u32) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for (i, im) in images.iter().enumerate() {
+        if im.width != width || im.height != height {
+            continue;
+        }
+        let better = match best {
+            None => true,
+            Some(j) => im.bit_depth > images[j].bit_depth,
+        };
+        if better {
+            best = Some(i);
+        }
+    }
+    best
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,5 +287,41 @@ mod tests {
         // over a square 16×16.
         let images = [img(16, 16, 32), img(16, 48, 32), img(64, 64, 32)];
         assert_eq!(select_best_fit(&images, 32), Some(1));
+    }
+
+    #[test]
+    fn select_by_dimensions_empty() {
+        assert!(select_by_dimensions(&[], 32, 32).is_none());
+    }
+
+    #[test]
+    fn select_by_dimensions_exact_match() {
+        let images = [img(16, 16, 32), img(32, 32, 32), img(256, 256, 32)];
+        assert_eq!(select_by_dimensions(&images, 32, 32), Some(1));
+        assert_eq!(select_by_dimensions(&images, 256, 256), Some(2));
+    }
+
+    #[test]
+    fn select_by_dimensions_no_match_returns_none() {
+        // 48×48 isn't present — strict equality, no nearest-fit
+        // substitution (that's `select_best_fit`'s job).
+        let images = [img(16, 16, 32), img(32, 32, 32), img(64, 64, 32)];
+        assert!(select_by_dimensions(&images, 48, 48).is_none());
+    }
+
+    #[test]
+    fn select_by_dimensions_breaks_tie_on_bpp() {
+        // Two 32×32 entries, legacy 1-bpp and modern 32-bpp. The exact
+        // lookup returns the higher-bit-depth one.
+        let images = [img(32, 32, 1), img(32, 32, 32)];
+        assert_eq!(select_by_dimensions(&images, 32, 32), Some(1));
+    }
+
+    #[test]
+    fn select_by_dimensions_respects_non_square() {
+        // 16×48 must not match a request for 48×16 — order matters.
+        let images = [img(16, 48, 32), img(48, 16, 32)];
+        assert_eq!(select_by_dimensions(&images, 16, 48), Some(0));
+        assert_eq!(select_by_dimensions(&images, 48, 16), Some(1));
     }
 }
