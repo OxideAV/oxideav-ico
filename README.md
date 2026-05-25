@@ -133,3 +133,20 @@ sub-image decoder:
 
 `write_ico_raw` mirrors the CUR-hotspot and empty-payload checks so
 emitted files always round-trip through the parser.
+
+## Fuzzing
+
+The `fuzz/` crate ships two complementary cargo-fuzz targets:
+
+- `ico_self_roundtrip` — RGBA → `make_encoder` → packet → `make_decoder`
+  → RGBA pixel-equality. Catches encoder bugs that emit corrupt
+  sub-images and decoder bugs that mis-parse legitimate output.
+- `ico_raw_parser` — arbitrary fuzz bytes → standalone `read_ico_raw`
+  directory walker (no codec / PNG / BMP-DIB decode in scope). On
+  inputs the parser accepts, round-trips through `write_ico_raw` and
+  re-parses to assert byte-stability. This is where icon parsers
+  historically take CVE hits — adversarial input goes after the
+  offset arithmetic, the payload-overlap detector, the RIFF/ACON
+  detection, and the `planes` / `bit_count` range checks.
+
+Run with `cargo fuzz run ico_raw_parser` (or `ico_self_roundtrip`).

@@ -663,6 +663,113 @@ mod tests {
     }
 
     #[test]
+    fn read_write_read_identity_for_mixed_two_entries() {
+        // Parse → write → re-parse must be a pure identity for every
+        // observable field on a valid 2-entry file. Locks the
+        // round-trip contract that callers depend on for "load an ICO,
+        // edit one entry, save it back" workflows.
+        let entry_a = IconEntryRaw {
+            width: 16,
+            height: 16,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Png,
+            hotspot: None,
+            data: PNG_MAGIC.to_vec(),
+        };
+        // A synthetic 32×32 BMP DIB body (BITMAPINFOHEADER header + a
+        // few payload bytes, doubled height for the ICO mask
+        // convention).
+        let mut dib = vec![0u8; 48];
+        dib[0..4].copy_from_slice(&40u32.to_le_bytes()); // biSize
+        dib[4..8].copy_from_slice(&32u32.to_le_bytes()); // biWidth
+        dib[8..12].copy_from_slice(&64u32.to_le_bytes()); // biHeight (doubled)
+        dib[12..14].copy_from_slice(&1u16.to_le_bytes()); // biPlanes
+        dib[14..16].copy_from_slice(&32u16.to_le_bytes()); // biBitCount
+        let entry_b = IconEntryRaw {
+            width: 32,
+            height: 32,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Bmp,
+            hotspot: None,
+            data: dib,
+        };
+        let pass1 = write_ico_raw(IconType::Ico, &[entry_a, entry_b]).unwrap();
+        let (ty1, parsed1) = read_ico_raw(&pass1).unwrap();
+        // Round-trip the parsed entries through the writer again — the
+        // bytes must converge to the same file.
+        let pass2 = write_ico_raw(ty1, &parsed1).unwrap();
+        assert_eq!(
+            pass1, pass2,
+            "read→write→read should be a byte-identical fixed point"
+        );
+        let (ty2, parsed2) = read_ico_raw(&pass2).unwrap();
+        assert_eq!(ty1, ty2);
+        assert_eq!(parsed1.len(), parsed2.len());
+        for (a, b) in parsed1.iter().zip(parsed2.iter()) {
+            assert_eq!(a.width, b.width);
+            assert_eq!(a.height, b.height);
+            assert_eq!(a.sub_format, b.sub_format);
+            assert_eq!(a.hotspot, b.hotspot);
+            assert_eq!(a.data, b.data);
+        }
+    }
+
+    #[test]
+    fn read_accepts_single_entry_without_overlap_check_trip() {
+        // The overlap detector iterates over prior entries; on a
+        // single-entry file the inner loop should never execute and
+        // the entry must be accepted unconditionally. Regression for a
+        // hypothetical refactor that swaps the seed `Vec::new()` for
+        // something with a synthetic first range.
+        let entry = IconEntryRaw {
+            width: 8,
+            height: 8,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Png,
+            hotspot: None,
+            data: PNG_MAGIC.to_vec(),
+        };
+        let bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
+        let (_, got) = read_ico_raw(&bytes).unwrap();
+        assert_eq!(got.len(), 1);
+    }
+
+    #[test]
+    fn read_rejects_truncated_payload_one_byte_short() {
+        // Entry declares dwBytesInRes = N but the file ends N-1 bytes
+        // into the payload. The off-by-one is the most common
+        // truncation case for partial downloads / interrupted writes.
+        let entry = IconEntryRaw {
+            width: 16,
+            height: 16,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Png,
+            hotspot: None,
+            data: PNG_MAGIC.to_vec(),
+        };
+        let mut bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
+        bytes.pop();
+        let err = read_ico_raw(&bytes).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => assert!(
+                msg.contains("past input"),
+                "expected truncation msg, got {msg}"
+            ),
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_rejects_dir_count_overflow_via_u16_max() {
+        // idCount = 0xFFFF — directory itself is 6 + 65535*16 ≈ 1 MB,
+        // which is fine to size-check but truncated input must produce
+        // a clean "directory truncated" error rather than a panic.
+        let bytes = [0, 0, 1, 0, 0xff, 0xff];
+        let err = read_ico_raw(&bytes).unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)));
+    }
+
+    #[test]
     fn read_rejects_bcolorcount_for_highbpp_bmp() {
         // Build a synthetic 16×16 minimal BMP DIB payload claiming
         // 32 bpp, then flip bColorCount to non-zero — the parser must

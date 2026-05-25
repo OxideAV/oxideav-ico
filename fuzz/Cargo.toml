@@ -9,9 +9,17 @@ cargo-fuzz = true
 
 # ICO is a container wrapping BMP or PNG sub-images. There is no
 # standard system library to cross-decode against (libgdiplus etc.
-# aren't worth pulling in), so this fuzz crate is **self-roundtrip
-# only**: encode RGBA via oxideav, decode the resulting sub-image
-# bytes back through oxideav, assert pixel equality.
+# aren't worth pulling in), so this crate ships two complementary
+# self-checking fuzz targets instead of differential ones:
+#
+# * `ico_self_roundtrip` — RGBA → codec encode → codec decode → RGBA
+#   pixel-equality. Catches encoder bugs that emit corrupt sub-images
+#   and decoder bugs that mis-parse legitimate output.
+# * `ico_raw_parser` — arbitrary bytes → standalone `read_ico_raw`
+#   container parser, then writer round-trip on accepted inputs. Catches
+#   panics / overflows / OOB in the directory walker, the RIFF/ACON
+#   detection, the payload-overlap detector, and the planes / bit_count
+#   validators.
 
 [dependencies]
 libfuzzer-sys = "0.4"
@@ -34,5 +42,17 @@ debug = 1
 [[bin]]
 name = "ico_self_roundtrip"
 path = "fuzz_targets/ico_self_roundtrip.rs"
+test = false
+doc = false
+
+# Standalone container-parser harness. Drives `read_ico_raw` /
+# `write_ico_raw` on arbitrary fuzz bytes — covers the directory
+# walker, RIFF/ACON detection, payload-overlap detector, planes /
+# bit_count validators, offset overflow guards, and round-trips parser
+# output through the writer. Independent from `ico_self_roundtrip`
+# (which fuzzes the codec / PNG / BMP-DIB encode + decode pair).
+[[bin]]
+name = "ico_raw_parser"
+path = "fuzz_targets/ico_raw_parser.rs"
 test = false
 doc = false

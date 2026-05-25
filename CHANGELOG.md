@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Second cargo-fuzz target `ico_raw_parser`: drives the standalone
+  `read_ico_raw` directory walker on arbitrary fuzz bytes (no codec /
+  PNG / BMP-DIB decode in scope) and, on accepted inputs, round-trips
+  through `write_ico_raw` + re-parses to assert byte-stability. Sits
+  alongside the existing `ico_self_roundtrip` codec-path target —
+  together they cover both the validator surface (offset arithmetic,
+  payload-overlap detector, RIFF/ACON detection, planes / bit_count
+  range checks) and the sub-image encode + decode pair. Asserts every
+  parser-guaranteed invariant (icon_type ∈ {Ico, Cur}, non-empty
+  entries, dims in `(0, 256]`, CUR-only hotspots, non-empty payloads)
+  so a future regression that silently weakens the validator would be
+  caught by the harness.
+- 3 new unit tests for `read_ico_raw` corner cases: byte-identical
+  `read→write→read` fixed-point on a 2-entry mixed-format
+  (PNG+BMP-DIB) file; single-entry acceptance (overlap detector's
+  inner loop must be a no-op on the first iteration); off-by-one
+  payload truncation rejection (most common partial-download failure
+  mode); `idCount = 0xFFFF` directory-size-overflow path produces a
+  clean truncation error rather than a panic.
 - 256×256 PNG sub-image round-trip is now exercised end-to-end:
   `write_ico` serialises the directory width/height as the `0` byte
   (the `0 == 256` convention, since the fields are single bytes) and
