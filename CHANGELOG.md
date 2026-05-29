@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `read_ico_raw` now re-validates the CUR hotspot against the
+  body-derived sub-image dimensions, not just the directory-declared
+  ones. The directory's single-byte width/height fields (with the
+  `0 == 256` convention) can legally describe a 256×256 canvas, but
+  the actual PNG / BMP body may decode to a much smaller sub-image —
+  at which point a hotspot legal against the directory (e.g.
+  `(0, 128)` on the 256×256 dummy) is *outside* the real sub-image
+  (e.g. 2×33 BMP). Same probe-vs-render shape as r178's body-dim
+  fix, but for the hotspot field: a renderer that sees the body's
+  dims would crash where a directory-only probe would call the file
+  fine. The parser now rejects the file rather than emit an
+  `IconEntryRaw` whose `hotspot` falls outside the recovered
+  `width × height`. Caught by `ico_raw_parser` cargo-fuzz target
+  (crash `10593ac8…`); three new unit tests cover the BMP-body
+  case (the fuzz crash itself), the symmetric PNG-IHDR-body case,
+  and the happy-path "hotspot legal against both directory and
+  body" acceptance.
 - `read_ico_raw` no longer accepts entries whose recovered sub-image
   dimensions fall outside the `1..=256` ICO directory range. The
   walker pulls width/height from the payload header (PNG IHDR or DIB

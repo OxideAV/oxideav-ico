@@ -130,6 +130,13 @@ sub-image decoder:
   ranges have been used to smuggle a second body through the same
   offset window (probe sees one image, renderer parses another); the
   parser rejects the whole file rather than picking a side.
+- CUR hotspot probe-vs-render: the hotspot is re-checked against the
+  **body-derived** dimensions (PNG IHDR or DIB header) after the
+  initial directory-declared check. A directory that claims 256×256
+  (the canonical `bWidth = bHeight = 0` encoding) with a body that
+  decodes to 2×33 can no longer slip a (0, 128) hotspot through —
+  what the directory probe sees and what the PNG/BMP renderer sees
+  must agree.
 
 `write_ico_raw` mirrors the CUR-hotspot and empty-payload checks so
 emitted files always round-trip through the parser.

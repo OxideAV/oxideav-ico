@@ -187,12 +187,18 @@ pub fn read_ico_raw(input: &[u8]) -> Result<(IconType, Vec<IconEntryRaw>)> {
             // sub-image. Real cursors regularly write `(0, 0)` so
             // accept that even when the dimensions are also 0 (e.g.
             // unparseable BMP body — the caller will fail later).
+            //
+            // Note: we re-check the hotspot against the body-derived
+            // dimensions below, after the BMP/PNG header has been
+            // parsed. This first pass uses the directory-declared
+            // dimensions so a clearly-broken hotspot (e.g. > 256) is
+            // rejected before we even sniff the body.
             if (planes_or_hotx as u32) >= declared_width.max(1)
                 || (bits_or_hoty as u32) >= declared_height.max(1)
             {
                 return Err(Error::invalid(format!(
                     "CUR: entry {i} hotspot ({planes_or_hotx},{bits_or_hoty}) \
-                     outside sub-image {declared_width}×{declared_height}"
+                     outside directory sub-image {declared_width}×{declared_height}"
                 )));
             }
             Some(HotSpot {
@@ -244,6 +250,28 @@ pub fn read_ico_raw(input: &[u8]) -> Result<(IconType, Vec<IconEntryRaw>)> {
             return Err(Error::invalid(format!(
                 "ICO: entry {i} sub-image header claims height {height} (must be 1..=256)"
             )));
+        }
+        // CUR hotspot probe-vs-render check: the directory's u8 fields
+        // can encode 256×256 by convention (the `0 == 256` rule), but
+        // the body's BMP / PNG header may describe a much smaller
+        // sub-image — at which point a hotspot legal against the
+        // directory dimensions (e.g. (0, 128) on a 256×256 declared
+        // canvas) is *outside* the actual sub-image (e.g. 2×33 BMP).
+        // That's the same probe-vs-render shape r178 caught for the
+        // body-dim range; here we re-validate the hotspot against the
+        // dims the body actually decodes to. Caught by fuzz crash
+        // `10593ac8…` 2026-05-29: directory said 256×256, body was a
+        // BMP with biWidth=2 + biHeight=66 (doubled → 33), and the
+        // hotspot (0, 128) silently slipped through the first-pass
+        // check.
+        if let Some(ref h) = hotspot {
+            if (h.x as u32) >= width || (h.y as u32) >= height {
+                return Err(Error::invalid(format!(
+                    "CUR: entry {i} hotspot ({},{}) outside body sub-image {width}×{height} \
+                     (probe-vs-render: directory declared {declared_width}×{declared_height})",
+                    h.x, h.y
+                )));
+            }
         }
         let bit_depth = sniff_bpp(&payload);
 
@@ -895,6 +923,112 @@ mod tests {
             ),
             other => panic!("expected InvalidData, got {other:?}"),
         }
+    }
+
+    /// Regression for fuzz crash `10593ac8…` (2026-05-29): a CUR file
+    /// whose directory declares 256×256 (canonical `bWidth = bHeight =
+    /// 0`) with a hotspot of (0, 128), but whose BMP DIB body decodes
+    /// to a 2×33 sub-image (biWidth = 2, biHeight = 66 doubled →
+    /// halved = 33). The first-pass hotspot check used the directory's
+    /// declared dims (`256 × 256`) and let the entry through, so the
+    /// parser emitted an `IconEntryRaw` whose `hotspot.y = 128` was
+    /// outside the body-derived `height = 33` — and the fuzz
+    /// harness's invariant check then panicked.
+    ///
+    /// Same probe-vs-render mismatch shape r178 caught for the body
+    /// dim range — the directory says one thing, the body says
+    /// another, and a hotspot validated against only the directory
+    /// silently passes a sub-image where the renderer would crash.
+    /// Parser must now re-check the hotspot against the body-derived
+    /// dimensions, rejecting the file rather than emitting a rogue
+    /// entry.
+    #[test]
+    fn read_rejects_cur_hotspot_outside_body_after_dim_recovery() {
+        // 2×33 BMP DIB body: biWidth = 2 at body[4..8], biHeight = 66
+        // (doubled) at body[8..12]. The doubled-height convention
+        // halves it back to 33.
+        let mut dib = vec![0u8; 18];
+        dib[4..8].copy_from_slice(&2u32.to_le_bytes());
+        dib[8..12].copy_from_slice(&66u32.to_le_bytes());
+        let entry = IconEntryRaw {
+            // Directory declares 256×256 (the `0 → 256` convention)
+            // even though the body is 2×33. The writer doesn't
+            // validate this mismatch (it serialises width/height
+            // verbatim), so we drive it directly.
+            width: 256,
+            height: 256,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Bmp,
+            // Hotspot (0, 128): legal against 256×256, *illegal*
+            // against the body's 2×33.
+            hotspot: Some(HotSpot { x: 0, y: 128 }),
+            data: dib,
+        };
+        let bytes = write_ico_raw(IconType::Cur, std::slice::from_ref(&entry)).unwrap();
+        let err = read_ico_raw(&bytes).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => assert!(
+                msg.contains("hotspot") && msg.contains("outside body"),
+                "expected body-hotspot rejection, got {msg}"
+            ),
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    /// Same probe-vs-render shape as above, but for the PNG-body path:
+    /// directory claims 256×256, PNG IHDR claims 8×8, hotspot (16, 0)
+    /// is outside the body-derived dims. Symmetric coverage with the
+    /// BMP case so a future refactor that fixes one path but not the
+    /// other gets caught.
+    #[test]
+    fn read_rejects_cur_hotspot_outside_png_body_after_dim_recovery() {
+        // PNG magic + 8-byte filler + (width, height) = (8, 8) BE.
+        let mut png = Vec::with_capacity(24);
+        png.extend_from_slice(&PNG_MAGIC);
+        png.extend_from_slice(&[0; 8]);
+        png.extend_from_slice(&8u32.to_be_bytes());
+        png.extend_from_slice(&8u32.to_be_bytes());
+        let entry = IconEntryRaw {
+            width: 256,
+            height: 256,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Png,
+            // hotspot.x = 16 sits inside 256 but outside the body's 8.
+            hotspot: Some(HotSpot { x: 16, y: 0 }),
+            data: png,
+        };
+        let bytes = write_ico_raw(IconType::Cur, std::slice::from_ref(&entry)).unwrap();
+        let err = read_ico_raw(&bytes).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => assert!(
+                msg.contains("hotspot") && msg.contains("outside body"),
+                "expected body-hotspot rejection, got {msg}"
+            ),
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    /// CUR hotspot that's legal against *both* the directory and the
+    /// body-derived dims must still be accepted — confirm the new
+    /// second-pass check doesn't over-reject on the happy path.
+    #[test]
+    fn read_accepts_cur_hotspot_inside_body_dims() {
+        // 16×16 BMP body, hotspot (5, 7) — well inside.
+        let mut dib = vec![0u8; 18];
+        dib[4..8].copy_from_slice(&16u32.to_le_bytes());
+        dib[8..12].copy_from_slice(&32u32.to_le_bytes()); // doubled → 16
+        let entry = IconEntryRaw {
+            width: 16,
+            height: 16,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Bmp,
+            hotspot: Some(HotSpot { x: 5, y: 7 }),
+            data: dib,
+        };
+        let bytes = write_ico_raw(IconType::Cur, std::slice::from_ref(&entry)).unwrap();
+        let (ty, got) = read_ico_raw(&bytes).unwrap();
+        assert_eq!(ty, IconType::Cur);
+        assert_eq!(got[0].hotspot, Some(HotSpot { x: 5, y: 7 }));
     }
 
     #[test]
