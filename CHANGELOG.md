@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `read_ico_raw` no longer accepts entries whose recovered sub-image
+  dimensions fall outside the `1..=256` ICO directory range. The
+  walker pulls width/height from the payload header (PNG IHDR or DIB
+  `biWidth` / doubled `biHeight`) and previously emitted those values
+  verbatim, letting a body claim e.g. 2_097_152 px even though the
+  `u8` directory fields can only describe `1..=256`. That was the
+  classic probe-vs-render shape: a directory walker sees one size, a
+  PNG / BMP-aware renderer sees another. The parser now rejects any
+  entry whose body-derived dim falls outside `(0, 256]`. Caught by the
+  scheduled `ico_raw_parser` cargo-fuzz target. Three new unit tests
+  cover the BMP-height-overflow case (the fuzz crash itself), the
+  BMP-zero-width case, and the analogous PNG-IHDR oversized-dims case.
+
 ### Added
 
 - Second cargo-fuzz target `ico_raw_parser`: drives the standalone

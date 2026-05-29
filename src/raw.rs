@@ -224,6 +224,27 @@ pub fn read_ico_raw(input: &[u8]) -> Result<(IconType, Vec<IconEntryRaw>)> {
             }
             IconSubFormat::Bmp => parse_dib_dims(&payload, declared_width, declared_height),
         };
+        // The ICO/CUR directory width/height are single bytes (with the
+        // `0 == 256` convention) so a legal entry's true dimensions
+        // always fall inside `1..=256`. A body whose IHDR / DIB header
+        // claims something outside that range is either corrupt or a
+        // probe-vs-render mismatch attack (the directory says one size
+        // but the body decodes to another); reject the file rather
+        // than emit a sub-image the directory physically can't
+        // describe. Same fuzz-harness invariant the lower-level
+        // `(0, 256]` assertion checks — promoted here so the parser
+        // refuses the input cleanly instead of producing a value the
+        // harness then panics on.
+        if width == 0 || width > 256 {
+            return Err(Error::invalid(format!(
+                "ICO: entry {i} sub-image header claims width {width} (must be 1..=256)"
+            )));
+        }
+        if height == 0 || height > 256 {
+            return Err(Error::invalid(format!(
+                "ICO: entry {i} sub-image header claims height {height} (must be 1..=256)"
+            )));
+        }
         let bit_depth = sniff_bpp(&payload);
 
         // `bColorCount` consistency: must be 0 for ≥ 8 bpp (the palette
@@ -767,6 +788,113 @@ mod tests {
         let bytes = [0, 0, 1, 0, 0xff, 0xff];
         let err = read_ico_raw(&bytes).unwrap_err();
         assert!(matches!(err, Error::InvalidData(_)));
+    }
+
+    /// Regression for fuzz crash `eacf46ac…`: a CUR file whose
+    /// directory declares the canonical `256×256` sub-image (`bWidth`
+    /// = `bHeight` = 0) but whose BMP DIB body's `biHeight` decodes to
+    /// `2 × 2_097_152` (so the halved height is 2_097_152), well
+    /// outside the ICO `(0, 256]` invariant. The fuzz harness flagged
+    /// this because the directory walker propagated the body-derived
+    /// dimensions without re-checking them against the directory's
+    /// `u8` range — meaning probe-vs-render attacks could disagree on
+    /// what the sub-image dimensions are. Parser must now reject the
+    /// file on the body-derived dimension overflow rather than emit a
+    /// rogue `IconEntryRaw` for the harness (or any caller) to choke
+    /// on later.
+    #[test]
+    fn read_rejects_bmp_body_height_above_256() {
+        // 256×256 CUR directory + hotspot (64, 2). Body is a synthetic
+        // DIB whose biHeight = 0x00400000 (doubled), recovering to
+        // 2_097_152 once halved — way outside 256.
+        let mut dib = vec![0u8; 18];
+        // biSize doesn't matter for the dim check; biWidth at body[4..8]
+        // = 2 keeps the legit-width side simple.
+        dib[4..8].copy_from_slice(&2u32.to_le_bytes());
+        // biHeight (doubled) = 0x00400000 → halved = 2_097_152. That's
+        // the value the fuzz crash file landed on.
+        dib[8..12].copy_from_slice(&0x00400000u32.to_le_bytes());
+        let entry = IconEntryRaw {
+            width: 256,
+            height: 256,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Bmp,
+            hotspot: Some(HotSpot { x: 64, y: 2 }),
+            data: dib,
+        };
+        let bytes = write_ico_raw(IconType::Cur, std::slice::from_ref(&entry)).unwrap();
+        let err = read_ico_raw(&bytes).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => assert!(
+                msg.contains("height") && msg.contains("1..=256"),
+                "expected height-out-of-range msg, got {msg}"
+            ),
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    /// Same probe-vs-render attack but on the PNG path: the directory
+    /// describes a tiny sub-image (16×16 width/height fields), but the
+    /// PNG body's IHDR encodes (1_000_000, 1_000_000). A probe reading
+    /// the directory sees one size, a PNG-aware renderer reading the
+    /// payload sees another — the parser must reject rather than pick.
+    #[test]
+    fn read_rejects_png_body_dims_above_256() {
+        // 8-byte PNG magic + IHDR with width = height = 1_000_000.
+        let mut png = Vec::with_capacity(24);
+        png.extend_from_slice(&PNG_MAGIC);
+        // PNG IHDR length+type are at bytes 8..16; `parse_png_dims`
+        // reads the two BE u32s at bytes 16..24 unconditionally.
+        png.extend_from_slice(&[0; 8]);
+        png.extend_from_slice(&1_000_000u32.to_be_bytes());
+        png.extend_from_slice(&1_000_000u32.to_be_bytes());
+        let entry = IconEntryRaw {
+            width: 16,
+            height: 16,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Png,
+            hotspot: None,
+            data: png,
+        };
+        let bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
+        let err = read_ico_raw(&bytes).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => assert!(
+                msg.contains("1..=256"),
+                "expected oversized dim msg, got {msg}"
+            ),
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    /// Body claims a zero dimension — the BMP DIB header can encode
+    /// `biWidth = 0` or `biHeight = 0` (which the doubled-height
+    /// convention halves to 0). Either way it's outside the `(0, 256]`
+    /// ICO range and must be rejected, just like the >256 case above.
+    #[test]
+    fn read_rejects_bmp_body_zero_width() {
+        let mut dib = vec![0u8; 18];
+        // biWidth = 0 — invalid for a real sub-image.
+        dib[4..8].copy_from_slice(&0u32.to_le_bytes());
+        // biHeight (doubled) = 32 → halved = 16, plausible.
+        dib[8..12].copy_from_slice(&32u32.to_le_bytes());
+        let entry = IconEntryRaw {
+            width: 16,
+            height: 16,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Bmp,
+            hotspot: None,
+            data: dib,
+        };
+        let bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
+        let err = read_ico_raw(&bytes).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => assert!(
+                msg.contains("width") && msg.contains("1..=256"),
+                "expected width-out-of-range msg, got {msg}"
+            ),
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
     }
 
     #[test]
