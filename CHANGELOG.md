@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-ico/compare/v0.0.5...v0.0.6) - 2026-05-29
+
+### Other
+
+- reject CUR hotspot outside body-derived sub-image dims
+- reject sub-image header dims outside ICO 1..=256 range
+- standalone-parser fuzz target + read→write→read identity test
+- 256×256 PNG round-trip coverage + write dimension guard + select_by_dimensions
+- payload-overlap detection + best-fit / largest selection helpers
+- harden ICONDIRENTRY validation + detect .ani RIFF/ACON
+
 ### Fixed
 
 - `read_ico_raw` now re-validates the CUR hotspot against the
