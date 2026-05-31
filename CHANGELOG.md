@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `read_ico_raw` now rejects entries whose BMP body declares a
+  `biBitCount` outside the legal `wBitCount` set
+  ({0,1,4,8,16,24,32}). The walker previously only validated the
+  directory's `wBitCount` field; a BMP body claiming e.g.
+  `biBitCount = 72` would slip past, get sniffed into
+  `IconEntryRaw.bit_depth`, and the writer would fold that rogue
+  value back into a fresh directory — producing a file that fails
+  its own re-read check (broken parser/writer fixpoint). Caught by
+  the scheduled `ico_raw_parser` cargo-fuzz target (crash
+  `591dc2ca…`). Same error wording as the directory-side check so
+  triage maps both reports to the same root cause; new unit test
+  covers the BMP-body-bad-biBitCount path.
+
 ### Added
 
 - Standalone Windows ANI (animated cursor) RIFF/ACON parser:

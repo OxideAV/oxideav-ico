@@ -275,6 +275,25 @@ pub fn read_ico_raw(input: &[u8]) -> Result<(IconType, Vec<IconEntryRaw>)> {
         }
         let bit_depth = sniff_bpp(&payload);
 
+        // Body bit-depth must be one of the legal `wBitCount` values
+        // (0/1/4/8/16/24/32). The directory's `wBitCount` field is
+        // already validated above, but the BMP body's `biBitCount`
+        // can carry arbitrary values that the writer would otherwise
+        // dutifully fold back into a fresh directory — producing a
+        // file that fails its *own* `wBitCount` re-read check, i.e.
+        // breaking the parser/writer fixpoint. Reject any body whose
+        // `biBitCount` falls outside the legal set, with the same
+        // wording as the directory-side check so a triage grep maps
+        // both reports to the same root cause. Caught by
+        // `ico_raw_parser` fuzz crash `591dc2ca…` (BMP body with
+        // `biBitCount = 72`).
+        if !VALID_ICO_BIT_DEPTHS.contains(&(bit_depth as u16)) {
+            return Err(Error::invalid(format!(
+                "ICO: entry {i} body biBitCount = {bit_depth} \
+                 (must be one of 0/1/4/8/16/24/32)"
+            )));
+        }
+
         // `bColorCount` consistency: must be 0 for ≥ 8 bpp (the palette
         // is too large to fit in a single byte). For ≤ 8 bpp the value
         // is the palette entry count, or 0 to mean "use the default for
@@ -920,6 +939,49 @@ mod tests {
             Error::InvalidData(msg) => assert!(
                 msg.contains("width") && msg.contains("1..=256"),
                 "expected width-out-of-range msg, got {msg}"
+            ),
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    /// Regression for fuzz crash `591dc2ca…` (2026-05-31): a BMP DIB
+    /// body whose `biBitCount` is 72 (i.e. anything outside the legal
+    /// {0,1,4,8,16,24,32} set). The parser previously validated
+    /// `wBitCount` in the directory but trusted the body's
+    /// `biBitCount` verbatim — fine for the read path, but the writer
+    /// would dutifully fold the rogue value back into a fresh
+    /// directory, producing a file that fails its own re-read check
+    /// (`wBitCount = 72 must be one of 0/1/4/8/16/24/32`). That broke
+    /// the parser/writer fixpoint the fuzz harness asserts. The
+    /// parser now rejects body bit-depths outside the legal set up
+    /// front, with the same error wording as the directory-side
+    /// check so triage maps both reports to the same root cause.
+    #[test]
+    fn read_rejects_bmp_body_invalid_bit_count() {
+        // 16×16 BMP DIB body with biBitCount = 72. Width / height
+        // are set to plausible values so the dim range check passes
+        // and the bit-depth check is the one that triggers.
+        let mut dib = vec![0u8; 18];
+        dib[4..8].copy_from_slice(&16u32.to_le_bytes()); // biWidth
+        dib[8..12].copy_from_slice(&32u32.to_le_bytes()); // doubled biHeight → 16
+        dib[14..16].copy_from_slice(&72u16.to_le_bytes()); // biBitCount = 72 (illegal)
+        let entry = IconEntryRaw {
+            width: 16,
+            height: 16,
+            // wBitCount in the directory stays at 0 ("defer to body
+            // header") so this entry only fails on the body-side
+            // check we just added.
+            bit_depth: 0,
+            sub_format: IconSubFormat::Bmp,
+            hotspot: None,
+            data: dib,
+        };
+        let bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
+        let err = read_ico_raw(&bytes).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => assert!(
+                msg.contains("biBitCount") && msg.contains("72"),
+                "expected biBitCount-out-of-range msg, got {msg}"
             ),
             other => panic!("expected InvalidData, got {other:?}"),
         }
