@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Standalone Windows ANI (animated cursor) RIFF/ACON parser:
+  `read_ani_raw(&[u8]) -> Result<AniFile>`. Returns the 36-byte
+  `anih` ANIHEADER, optional `LIST 'INFO'` title / author, optional
+  `seq ` step-sequence override, optional `rate` per-step jiffy
+  durations, and the raw bytes of every `icon` chunk inside
+  `LIST 'fram'` — ready to feed back into `read_ico_raw` frame by
+  frame when `header.frames_are_icons()` is true (the common case).
+  Lives behind the same `#![cfg]`-free standalone surface as
+  `read_ico_raw`, so image-library consumers can pull in the ANI
+  walker without taking the `oxideav-core` framework dep tree.
+- 19 new ANI unit tests covering: minimal 3-frame happy path; full
+  `seq ` + `rate` + `AF_SEQUENCE` flag; `LIST 'INFO'` `INAM` / `IART`
+  extraction; odd-length payload + RIFF even-padding handling;
+  trailing-data-after-RIFF-body tolerance; end-to-end ANI → frame →
+  `read_ico_raw` cross-API round-trip with mixed ICO+CUR frames; and
+  rejection paths for missing RIFF magic, wrong form type, truncated
+  declared size, undersized input, missing `anih`, missing
+  `LIST 'fram'`, frame-count mismatch, zero `nFrames`, pathological
+  `nFrames` (sanity-cap at 65_536), stray non-`icon` chunk inside
+  `LIST 'fram'`, chunk size running past its parent, and `seq `
+  before `anih`.
+- `read_ico_raw`'s `.ani` rejection message now points callers at
+  `oxideav_ico::read_ani_raw` (the new helper) instead of
+  dead-ending with "static ICO + CUR only".
+
 ## [0.0.6](https://github.com/OxideAV/oxideav-ico/compare/v0.0.5...v0.0.6) - 2026-05-29
 
 ### Other

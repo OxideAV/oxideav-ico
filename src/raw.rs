@@ -86,7 +86,7 @@ pub fn read_ico_raw(input: &[u8]) -> Result<(IconType, Vec<IconEntryRaw>)> {
     if input.len() >= 12 && &input[..4] == RIFF_MAGIC && &input[8..12] == ACON_FORM {
         return Err(Error::unsupported(
             "ICO: input is a .ani animated cursor (RIFF/ACON); \
-             oxideav-ico parses static ICO + CUR only",
+             use oxideav_ico::read_ani_raw for animated cursors",
         ));
     }
     let reserved = u16::from_le_bytes([input[0], input[1]]);

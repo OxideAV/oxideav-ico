@@ -35,6 +35,7 @@
 //!   that icons require).
 //! * [`oxideav_png`] for the PNG-inside-ICO path.
 
+pub mod ani;
 #[cfg(feature = "registry")]
 pub mod codec;
 #[cfg(feature = "registry")]
@@ -56,6 +57,7 @@ pub const CODEC_ID_STR: &str = "ico";
 // Public standalone surface — always available.
 // ---------------------------------------------------------------------------
 
+pub use ani::{read_ani_raw, AniFile, AniHeader, AniInfo, AF_ICON, AF_SEQUENCE};
 pub use error::{IcoError, Result};
 pub use raw::{read_ico_raw, write_ico_raw, IconEntryRaw};
 pub use types::{

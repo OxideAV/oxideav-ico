@@ -81,9 +81,10 @@ oxideav_ico::register(&mut codecs, &mut containers);
   (where the directory entry claims BMP but the body is secretly
   PNG). Nobody writes this; the reader already handles it because it
   sniffs the body bytes.
-- Not implemented: `.ani` animated cursors (a separate RIFF/ACON
-  container). The parser detects these and refuses cleanly so callers
-  can dispatch to a dedicated demuxer.
+- ANI (Windows animated cursor, RIFF/ACON) is parsed by the
+  separate `read_ani_raw` helper (see "ANI" below). `read_ico_raw`
+  still refuses ANI input cleanly — its error message points the
+  caller at `read_ani_raw`.
 
 ## Picking a sub-image
 
@@ -140,6 +141,54 @@ sub-image decoder:
 
 `write_ico_raw` mirrors the CUR-hotspot and empty-payload checks so
 emitted files always round-trip through the parser.
+
+## ANI (animated cursors)
+
+`.ani` is a RIFF container whose form-type is `ACON`. Each file
+carries an `anih` ANIHEADER, an optional `LIST 'INFO'` (title /
+author), optional `seq ` / `rate` chunks (step-sequence override
+and per-step jiffy durations), and a `LIST 'fram'` containing N
+`icon` chunks — each `icon` is a complete ICO or CUR resource when
+`bfAttributes & AF_ICON` is set (the common case), or a raw
+headerless BMP otherwise.
+
+```rust
+use oxideav_ico::{read_ani_raw, read_ico_raw};
+
+let bytes = std::fs::read("cursor.ani")?;
+let ani = read_ani_raw(&bytes)?;
+
+println!(
+    "{} frames, {} steps, default {}/60s, AF_ICON={}",
+    ani.header.n_frames,
+    ani.header.n_steps,
+    ani.header.i_disp_rate,
+    ani.header.frames_are_icons(),
+);
+
+if ani.header.frames_are_icons() {
+    for (i, frame_bytes) in ani.frames.iter().enumerate() {
+        let (ty, entries) = read_ico_raw(frame_bytes)?;
+        println!("frame {i}: {ty:?} with {} sub-image(s)", entries.len());
+    }
+}
+
+// `seq` / `rate` are `None` when the chunk was absent — fall back
+// to identity step order / `header.i_disp_rate` respectively.
+let step_order: Vec<u32> = ani.sequence.unwrap_or_else(
+    || (0..ani.header.n_frames).collect(),
+);
+let durations: Vec<u32> = ani.rates.unwrap_or_else(
+    || vec![ani.header.i_disp_rate; step_order.len()],
+);
+```
+
+The parser is hardened against the usual cursor-file CVE surface:
+truncated declared RIFF size, missing or out-of-order `anih`,
+oversized `nFrames` (capped at 65_536 to bound allocator pressure),
+stray non-`icon` chunks inside `LIST 'fram'`, child chunks that
+declare a length running past their parent, and `seq ` / `rate`
+appearing before `anih`.
 
 ## Fuzzing
 
