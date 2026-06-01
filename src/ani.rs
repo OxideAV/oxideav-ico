@@ -199,7 +199,25 @@ pub fn read_ani_raw(input: &[u8]) -> Result<AniFile> {
             }
             b"seq " => {
                 let count = expected_step_count(&header)?;
-                sequence = Some(parse_u32_array(payload, count, "seq")?);
+                let indices = parse_u32_array(payload, count, "seq")?;
+                // Bounds-check each step index against `nFrames` — a
+                // renderer reaches `frames[seq[i]]` directly, so an
+                // out-of-range entry would panic / out-of-bounds-read
+                // downstream. Same probe-vs-render shape as the CUR
+                // hotspot body-dim check: the directory walker sees
+                // the indices, the renderer dereferences them.
+                let n_frames = header
+                    .as_ref()
+                    .map(|h| h.n_frames)
+                    .ok_or_else(|| Error::invalid("ANI: seq chunk appeared before anih"))?;
+                for (i, &idx) in indices.iter().enumerate() {
+                    if idx >= n_frames {
+                        return Err(Error::invalid(format!(
+                            "ANI: seq[{i}] = {idx} out of range (nFrames = {n_frames})"
+                        )));
+                    }
+                }
+                sequence = Some(indices);
             }
             b"rate" => {
                 let count = expected_step_count(&header)?;
@@ -992,5 +1010,96 @@ mod tests {
         let parsed = read_ani_raw(&bytes).unwrap();
         assert_eq!(parsed.header.n_frames, 1);
         assert_eq!(parsed.frames.len(), 1);
+    }
+
+    /// Build a 2-frame ANI with an explicit `seq ` chunk carrying the
+    /// caller's 4 step indices. Mirrors `parses_seq_and_rate_chunks`
+    /// but factored out so the out-of-range tests stay focused.
+    fn build_ani_with_seq(n_frames: u32, n_steps: u32, seq_indices: &[u32]) -> Vec<u8> {
+        let mut anih_payload = vec![0u8; 36];
+        anih_payload[0..4].copy_from_slice(&36u32.to_le_bytes());
+        anih_payload[4..8].copy_from_slice(&n_frames.to_le_bytes());
+        anih_payload[8..12].copy_from_slice(&n_steps.to_le_bytes());
+        anih_payload[24..28].copy_from_slice(&1u32.to_le_bytes()); // nPlanes
+        anih_payload[28..32].copy_from_slice(&10u32.to_le_bytes()); // iDispRate
+        anih_payload[32..36].copy_from_slice(&(AF_ICON | AF_SEQUENCE).to_le_bytes());
+        let mut anih_chunk = Vec::new();
+        anih_chunk.extend_from_slice(b"anih");
+        anih_chunk.extend_from_slice(&(anih_payload.len() as u32).to_le_bytes());
+        anih_chunk.extend_from_slice(&anih_payload);
+
+        let seq_payload: Vec<u8> = seq_indices.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let mut seq_chunk = Vec::new();
+        seq_chunk.extend_from_slice(b"seq ");
+        seq_chunk.extend_from_slice(&(seq_payload.len() as u32).to_le_bytes());
+        seq_chunk.extend_from_slice(&seq_payload);
+
+        let mut fram_body = Vec::new();
+        fram_body.extend_from_slice(b"fram");
+        for i in 0..n_frames {
+            let frame_payload = [b'F', b'R', b'M', i as u8];
+            fram_body.extend_from_slice(b"icon");
+            fram_body.extend_from_slice(&(frame_payload.len() as u32).to_le_bytes());
+            fram_body.extend_from_slice(&frame_payload);
+        }
+        let mut fram_chunk = Vec::new();
+        fram_chunk.extend_from_slice(b"LIST");
+        fram_chunk.extend_from_slice(&(fram_body.len() as u32).to_le_bytes());
+        fram_chunk.extend_from_slice(&fram_body);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(b"ACON");
+        body.extend_from_slice(&anih_chunk);
+        body.extend_from_slice(&seq_chunk);
+        body.extend_from_slice(&fram_chunk);
+
+        let mut out = Vec::new();
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(&body);
+        out
+    }
+
+    #[test]
+    fn rejects_seq_index_equal_to_n_frames() {
+        // 2 frames → valid indices are {0, 1}. An entry == n_frames is
+        // a one-past-the-end pointer, the classic off-by-one downstream
+        // panic source.
+        let bytes = build_ani_with_seq(2, 4, &[0, 1, 0, 2]);
+        let err = read_ani_raw(&bytes).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => {
+                assert!(msg.contains("seq[3]"), "{msg}");
+                assert!(msg.contains("out of range"), "{msg}");
+                assert!(msg.contains("nFrames = 2"), "{msg}");
+            }
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_seq_index_far_past_n_frames() {
+        // Pathological adversarial value — 0xFFFF_FFFF in the seq array
+        // would index gigabytes off the end of the frame vector on any
+        // renderer that dereferences blindly.
+        let bytes = build_ani_with_seq(2, 4, &[0, 0xFFFF_FFFF, 0, 1]);
+        let err = read_ani_raw(&bytes).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => {
+                assert!(msg.contains("seq[1]"), "{msg}");
+                assert!(msg.contains("out of range"), "{msg}");
+            }
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_seq_with_all_indices_in_range() {
+        // Sanity-check the positive path: all entries < n_frames is
+        // accepted (and indices may legitimately repeat / play out of
+        // storage order — that's the whole point of `seq `).
+        let bytes = build_ani_with_seq(2, 4, &[0, 1, 1, 0]);
+        let parsed = read_ani_raw(&bytes).unwrap();
+        assert_eq!(parsed.sequence.as_ref().unwrap(), &vec![0u32, 1, 1, 0]);
     }
 }

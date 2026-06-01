@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `read_ani_raw` now bounds-checks every `seq ` step index against
+  `anih.nFrames`. The spec defines `seq[i]` as a zero-based index into
+  the `LIST 'fram'` frame array, but the previous parser stored the
+  raw `u32`s verbatim — a renderer that reaches `frames[seq[i]]`
+  directly would panic / out-of-bounds-read on an entry `>= nFrames`
+  (e.g. the classic adversarial `seq[k] = 0xFFFFFFFF`). The walker
+  now rejects the file with a clear `seq[i] = N out of range
+  (nFrames = M)` error rather than emit a sequence array that's
+  unsafe to dereference. Same probe-vs-render hardening shape as the
+  CUR-hotspot body-dim check (r188) and the BMP-body biBitCount
+  check (r198). Three new unit tests cover the off-by-one
+  `seq[k] == nFrames` case (most common spec misreading), the
+  pathological `0xFFFFFFFF` case (the cargo-fuzz crash shape), and
+  the positive in-range repeat-and-reorder acceptance path.
 - `read_ico_raw` now rejects entries whose BMP body declares a
   `biBitCount` outside the legal `wBitCount` set
   ({0,1,4,8,16,24,32}). The walker previously only validated the

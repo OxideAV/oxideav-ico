@@ -187,8 +187,13 @@ The parser is hardened against the usual cursor-file CVE surface:
 truncated declared RIFF size, missing or out-of-order `anih`,
 oversized `nFrames` (capped at 65_536 to bound allocator pressure),
 stray non-`icon` chunks inside `LIST 'fram'`, child chunks that
-declare a length running past their parent, and `seq ` / `rate`
-appearing before `anih`.
+declare a length running past their parent, `seq ` / `rate`
+appearing before `anih`, and **`seq ` step indices `>= nFrames`** —
+a renderer reaches `frames[seq[i]]` directly, so an out-of-range
+entry (the classic `seq[k] = 0xFFFFFFFF` adversarial value) would
+panic / out-of-bounds-read downstream. The walker rejects the file
+up front rather than emit a sequence array a caller can't safely
+index.
 
 ## Fuzzing
 
