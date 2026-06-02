@@ -138,6 +138,18 @@ sub-image decoder:
   decodes to 2×33 can no longer slip a (0, 128) hotspot through —
   what the directory probe sees and what the PNG/BMP renderer sees
   must agree.
+- Directory-vs-body **dimension** probe-vs-render: when the directory's
+  `bWidth` / `bHeight` byte is non-zero, the value is an exact
+  assertion of the sub-image dimension; the body's PNG IHDR
+  width/height or BMP `biWidth` / halved-`biHeight` must agree. A
+  directory that says `bWidth = 16` shipping a body whose IHDR
+  reports 64 is rejected up front rather than emitting an
+  `IconEntryRaw { width: 64, … }` that silently contradicts the
+  directory the caller just inspected. The `bWidth = 0` (canonical
+  256-encoding) case is the only carve-out: the directory cannot
+  physically encode a literal dimension other than 256, so the
+  body is authoritative for that case (still subject to the
+  `1..=256` body-dim range check).
 
 `write_ico_raw` mirrors the CUR-hotspot and empty-payload checks so
 emitted files always round-trip through the parser.

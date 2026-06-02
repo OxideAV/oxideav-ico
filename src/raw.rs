@@ -251,6 +251,40 @@ pub fn read_ico_raw(input: &[u8]) -> Result<(IconType, Vec<IconEntryRaw>)> {
                 "ICO: entry {i} sub-image header claims height {height} (must be 1..=256)"
             )));
         }
+        // Directory-vs-body dimension consistency.
+        //
+        // The ICONDIRENTRY's `bWidth` / `bHeight` are `u8` fields with
+        // the `0 == 256` convention. When the raw byte is non-zero,
+        // it's an exact assertion of the sub-image dimension; the
+        // body's PNG IHDR or BMP `biWidth` / halved-`biHeight` MUST
+        // agree. A body that disagrees is the same probe-vs-render
+        // shape the body-dim range check (entry size > 256), the
+        // CUR hotspot body-derived check, and the BMP `biBitCount`
+        // body check already close for adjacent fields: the
+        // directory walker advertises one value, the renderer
+        // decodes a different one. Reject the file rather than
+        // emit an `IconEntryRaw` whose `width` / `height` silently
+        // contradict the directory the caller just inspected.
+        //
+        // The `0 == 256` carve-out: when the raw `bWidth` byte is
+        // `0`, the directory physically cannot encode a literal
+        // dimension other than 256, so the body's value is taken
+        // as authoritative (any value already inside the validated
+        // `1..=256` range is accepted). Same for `bHeight`.
+        let raw_dir_width = e[0];
+        let raw_dir_height = e[1];
+        if raw_dir_width != 0 && width != raw_dir_width as u32 {
+            return Err(Error::invalid(format!(
+                "ICO: entry {i} directory width {raw_dir_width} disagrees \
+                 with body sub-image width {width} (probe-vs-render mismatch)"
+            )));
+        }
+        if raw_dir_height != 0 && height != raw_dir_height as u32 {
+            return Err(Error::invalid(format!(
+                "ICO: entry {i} directory height {raw_dir_height} disagrees \
+                 with body sub-image height {height} (probe-vs-render mismatch)"
+            )));
+        }
         // CUR hotspot probe-vs-render check: the directory's u8 fields
         // can encode 256×256 by convention (the `0 == 256` rule), but
         // the body's BMP / PNG header may describe a much smaller
@@ -1119,5 +1153,175 @@ mod tests {
         // bColorCount sits at entry byte 2 of the directory entry.
         bytes[6 + 2] = 16;
         assert!(read_ico_raw(&bytes).is_err());
+    }
+
+    /// Directory-vs-body width mismatch on the BMP path. The directory
+    /// entry advertises `bWidth = 16`, but the BMP DIB body's
+    /// `biWidth` decodes to a different value — the same shape as
+    /// the r178 body-dim range check, the r184 CUR hotspot
+    /// body-derived check, and the r198 `biBitCount` body check,
+    /// applied to the dim *value* (not its range). A probe that
+    /// inspected the directory before deciding to render would see
+    /// one size; the renderer reading the BMP body would see
+    /// another. Reject the file rather than emit an `IconEntryRaw`
+    /// whose `width` silently contradicts the directory.
+    #[test]
+    fn read_rejects_directory_width_mismatch_bmp() {
+        let mut dib = vec![0u8; 18];
+        // biWidth = 32 (body says 32) — disagrees with directory.
+        dib[4..8].copy_from_slice(&32u32.to_le_bytes());
+        // doubled biHeight = 32 → halved = 16 (directory's claim).
+        dib[8..12].copy_from_slice(&32u32.to_le_bytes());
+        let entry = IconEntryRaw {
+            width: 16,
+            height: 16,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Bmp,
+            hotspot: None,
+            data: dib,
+        };
+        let bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
+        let err = read_ico_raw(&bytes).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => assert!(
+                msg.contains("directory width 16")
+                    && msg.contains("body sub-image width 32")
+                    && msg.contains("probe-vs-render mismatch"),
+                "expected dir/body width mismatch msg, got {msg}"
+            ),
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    /// Directory-vs-body height mismatch on the BMP path. Same shape
+    /// as the width mismatch above, exercising the second axis.
+    #[test]
+    fn read_rejects_directory_height_mismatch_bmp() {
+        let mut dib = vec![0u8; 18];
+        // biWidth = 16 (matches directory).
+        dib[4..8].copy_from_slice(&16u32.to_le_bytes());
+        // doubled biHeight = 64 → halved = 32 (disagrees with directory).
+        dib[8..12].copy_from_slice(&64u32.to_le_bytes());
+        let entry = IconEntryRaw {
+            width: 16,
+            height: 16,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Bmp,
+            hotspot: None,
+            data: dib,
+        };
+        let bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
+        let err = read_ico_raw(&bytes).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => assert!(
+                msg.contains("directory height 16")
+                    && msg.contains("body sub-image height 32")
+                    && msg.contains("probe-vs-render mismatch"),
+                "expected dir/body height mismatch msg, got {msg}"
+            ),
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    /// Directory-vs-body width mismatch on the PNG path. Same probe-
+    /// vs-render attack: directory says 16×16, PNG IHDR says 64×16.
+    #[test]
+    fn read_rejects_directory_width_mismatch_png() {
+        let mut png = Vec::with_capacity(24);
+        png.extend_from_slice(&PNG_MAGIC);
+        // PNG length+type bytes 8..16 are ignored by parse_png_dims.
+        png.extend_from_slice(&[0; 8]);
+        // PNG IHDR width = 64 (disagrees), height = 16 (matches).
+        png.extend_from_slice(&64u32.to_be_bytes());
+        png.extend_from_slice(&16u32.to_be_bytes());
+        let entry = IconEntryRaw {
+            width: 16,
+            height: 16,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Png,
+            hotspot: None,
+            data: png,
+        };
+        let bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
+        let err = read_ico_raw(&bytes).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => assert!(
+                msg.contains("directory width 16")
+                    && msg.contains("body sub-image width 64")
+                    && msg.contains("probe-vs-render mismatch"),
+                "expected dir/body width mismatch msg, got {msg}"
+            ),
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    /// Canonical 256-encoding carve-out. The directory's `bWidth` /
+    /// `bHeight` bytes are `0` (the `0 == 256` convention, because a
+    /// literal 256 doesn't fit in a `u8`); the body's PNG IHDR
+    /// reports `(256, 256)`. The new dir-vs-body consistency check
+    /// MUST accept this — the directory cannot physically encode a
+    /// disagreeing dim, so the body is authoritative for the 256
+    /// case (still subject to the `1..=256` body-dim range check
+    /// already enforced).
+    #[test]
+    fn read_accepts_256_canonical_directory_zero_with_body_256() {
+        let mut png = Vec::with_capacity(24);
+        png.extend_from_slice(&PNG_MAGIC);
+        png.extend_from_slice(&[0; 8]);
+        png.extend_from_slice(&256u32.to_be_bytes());
+        png.extend_from_slice(&256u32.to_be_bytes());
+        let entry = IconEntryRaw {
+            width: 256,
+            height: 256,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Png,
+            hotspot: None,
+            data: png,
+        };
+        let bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
+        // Sanity-check: the directory bytes are physically `0` for
+        // both axes (the writer applied the canonical encoding).
+        assert_eq!(bytes[6], 0, "bWidth byte must be 0 for the 256 case");
+        assert_eq!(bytes[7], 0, "bHeight byte must be 0 for the 256 case");
+        let (_, got) = read_ico_raw(&bytes).unwrap();
+        assert_eq!(got[0].width, 256);
+        assert_eq!(got[0].height, 256);
+    }
+
+    /// A second carve-out test: directory byte `0` paired with a body
+    /// reporting an in-range non-256 dim is still accepted, because
+    /// the directory's `0` doesn't actually constrain the body's
+    /// dim (the writer wouldn't normally produce this, but a
+    /// hand-rolled file can; the spec is silent on which side wins
+    /// when the directory writes 0 for a non-256 image, so be
+    /// permissive — the body's dim is what the renderer uses).
+    #[test]
+    fn read_accepts_256_canonical_directory_zero_with_smaller_body() {
+        let mut png = Vec::with_capacity(24);
+        png.extend_from_slice(&PNG_MAGIC);
+        png.extend_from_slice(&[0; 8]);
+        // Body claims 128×128 — directory bytes still 0 (canonical).
+        png.extend_from_slice(&128u32.to_be_bytes());
+        png.extend_from_slice(&128u32.to_be_bytes());
+        // Build a directory by hand: byte 6 = bWidth, byte 7 = bHeight,
+        // both set to 0; the writer would normally tighten them to
+        // match `e.width` / `e.height`, but we want to force the
+        // canonical case here.
+        let entry = IconEntryRaw {
+            width: 256, // tells write_ico_raw to emit 0 for the dir byte
+            height: 256,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Png,
+            hotspot: None,
+            data: png,
+        };
+        let bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
+        assert_eq!(bytes[6], 0);
+        assert_eq!(bytes[7], 0);
+        let (_, got) = read_ico_raw(&bytes).unwrap();
+        // The renderer takes the body's value (128) because the
+        // directory's 0 imposes no constraint.
+        assert_eq!(got[0].width, 128);
+        assert_eq!(got[0].height, 128);
     }
 }

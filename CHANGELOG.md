@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `read_ico_raw` now rejects entries whose directory-declared
+  `bWidth` / `bHeight` byte disagrees with the body-derived sub-image
+  dimension (PNG IHDR width/height or BMP `biWidth` /
+  halved-`biHeight`). The directory entry's `u8` width / height
+  fields with the `0 == 256` convention are an exact assertion of
+  the sub-image dim when the raw byte is non-zero; a body that
+  reports a different value is the same probe-vs-render attack the
+  body-dim range check (entry size in `(0, 256]`), the CUR hotspot
+  body-derived check, and the BMP `biBitCount` body check already
+  close for adjacent fields: a probe inspecting the directory before
+  rendering sees one value, the renderer reading the payload sees
+  another. The walker now produces a clear
+  `directory width N disagrees with body sub-image width M
+  (probe-vs-render mismatch)` error instead of emitting an
+  `IconEntryRaw` whose `width` / `height` silently override the
+  directory. The `bWidth = 0` (canonical 256-encoding) carve-out is
+  preserved: the directory cannot physically encode a literal
+  dimension other than 256, so the body is authoritative for that
+  case. Four new unit tests cover BMP-width-mismatch,
+  BMP-height-mismatch, PNG-width-mismatch, and the canonical-256
+  acceptance path (with a second carve-out test covering
+  directory-byte-0 paired with a smaller in-range body dim, for
+  hand-rolled files where the writer-side `0 == 256` normalisation
+  doesn't apply).
 - `read_ani_raw` now bounds-checks every `seq ` step index against
   `anih.nFrames`. The spec defines `seq[i]` as a zero-based index into
   the `LIST 'fram'` frame array, but the previous parser stored the
