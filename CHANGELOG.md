@@ -10,6 +10,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - `read_ico_raw` now rejects BMP-body entries whose
+  `BITMAPINFOHEADER.biCompression` field falls outside
+  `{BI_RGB = 0, BI_BITFIELDS = 3}`. The ICO spec mandates
+  uncompressed RGB for sub-images; the `BI_BITFIELDS` carve-out
+  covers 16-bpp / 32-bpp DIBs that declare explicit per-channel
+  masks (the wider Windows ecosystem produces those). Every other
+  value — `BI_RLE8 = 1`, `BI_RLE4 = 2`, `BI_JPEG = 4`,
+  `BI_PNG = 5`, `BI_ALPHABITFIELDS = 6`, opaque FOURCC video codes —
+  is explicitly excluded by the spec for icon sub-images: RLE codecs
+  need a per-row state machine no ICO renderer implements, and
+  `BI_JPEG` / `BI_PNG` would smuggle a second codec body through
+  the BMP-DIB code path while the PNG-magic sniff already routes
+  proper PNG bodies via the PNG branch. Same probe-vs-render
+  hardening shape as the `biPlanes` body check, the `biBitCount`
+  body check, and the `bWidth` / `bHeight` mismatch fix: the
+  directory advertises an icon, the renderer parses a header field
+  no icon renderer can honour, and a body that smuggles a
+  non-icon codec slips past unless the walker rejects it up
+  front. Walker now emits `body biCompression = N (must be
+  0 = BI_RGB or 3 = BI_BITFIELDS)` rather than emitting an
+  `IconEntryRaw` the harness (or any downstream BMP decoder) then
+  chokes on. Eight new unit tests cover the BI_RLE8 / BI_RLE4 /
+  BI_JPEG / BI_PNG / BI_ALPHABITFIELDS rejection paths, the
+  BI_RGB and BI_BITFIELDS acceptance paths, the PNG-body
+  exemption (PNG entries have no `biCompression` field — their
+  bytes 16..20 sit inside the IHDR width/height and must not trip
+  the new check), and the short-DIB (< 20 bytes) skip path.
+- `read_ico_raw` now rejects BMP-body entries whose
   `BITMAPINFOHEADER.biPlanes` field falls outside `{0, 1}`. The ICO
   spec mandates `biPlanes = 1` (multi-plane DIBs were a planar-video
   relic that ICO never used); the directory's `wPlanes` is already

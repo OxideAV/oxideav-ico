@@ -34,6 +34,19 @@ const ACON_FORM: &[u8; 4] = b"ACON";
 /// `BITMAPINFOHEADER` itself accepts.
 const VALID_ICO_BIT_DEPTHS: [u16; 7] = [0, 1, 4, 8, 16, 24, 32];
 
+/// `BITMAPINFOHEADER.biCompression = BI_RGB` — uncompressed RGB. The
+/// spec mandates this for ICO sub-images; the BMP body's colour bits
+/// follow the header verbatim with no per-row state.
+const BI_RGB: u32 = 0;
+/// `BITMAPINFOHEADER.biCompression = BI_BITFIELDS` — uncompressed RGB
+/// with explicit per-channel masks. Valid for 16-bpp and 32-bpp DIBs
+/// per the BITMAPINFOHEADER reference; tolerated for ICO sub-images
+/// since the wider Windows ecosystem occasionally produces it (a
+/// 32-bpp ARGB layout declared via masks rather than the implied
+/// 8-8-8-8 packing) and the rest of the body still parses with the
+/// same row-stride rules.
+const BI_BITFIELDS: u32 = 3;
+
 /// One ICO / CUR sub-image entry as stored on disk: directory metadata
 /// (width, height, optional hotspot, source encoding) plus the raw
 /// payload bytes.
@@ -359,6 +372,47 @@ pub fn read_ico_raw(input: &[u8]) -> Result<(IconType, Vec<IconEntryRaw>)> {
             }
         }
 
+        // BMP body `biCompression` consistency. The ICO spec narrows
+        // the wider DIB `biCompression` field: an ICO sub-image's DIB
+        // header carries `BI_RGB = 0` (uncompressed). `BI_BITFIELDS =
+        // 3` is the only practical alternative — it lets 16-bpp and
+        // 32-bpp DIBs declare per-channel masks instead of the implied
+        // 5-5-5 / 8-8-8-8 layout — and the wider Windows imaging
+        // ecosystem produces it in the wild. Every other value
+        // (`BI_RLE8 = 1`, `BI_RLE4 = 2`, `BI_JPEG = 4`, `BI_PNG = 5`,
+        // `BI_ALPHABITFIELDS = 6`, opaque FOURCC video codes) is
+        // explicitly excluded by the spec for icon sub-images — RLE
+        // codecs need a per-row state machine no ICO renderer
+        // implements, and `BI_JPEG` / `BI_PNG` would smuggle a second
+        // codec body through the BMP-DIB code path while the magic
+        // sniff already routes proper PNG bodies via the PNG branch.
+        //
+        // Same probe-vs-render shape as the r198 `biBitCount`, r210
+        // `bWidth` / `bHeight`, and the `biPlanes` body check just
+        // above: the directory advertises an icon, the body carries a
+        // header field that no icon renderer can honour, and a probe
+        // inspecting the directory before rendering would miss the
+        // mismatch entirely. Reject `biCompression` outside the legal
+        // `{BI_RGB, BI_BITFIELDS}` set up front rather than emit an
+        // `IconEntryRaw` the harness (or any downstream BMP decoder)
+        // then chokes on.
+        //
+        // The 0-byte tolerance carve-out mirrors the rest of the BMP
+        // checks: when the DIB header is too short to carry a
+        // `biCompression` field (`< 20` bytes), the value is
+        // unobservable and we don't flag it — earlier checks have
+        // already taken responsibility for "this isn't a DIB".
+        if sub_format == IconSubFormat::Bmp {
+            if let Some(compression) = parse_dib_compression(&payload) {
+                if compression != BI_RGB && compression != BI_BITFIELDS {
+                    return Err(Error::invalid(format!(
+                        "ICO: entry {i} body biCompression = {compression} \
+                         (must be 0 = BI_RGB or 3 = BI_BITFIELDS)"
+                    )));
+                }
+            }
+        }
+
         // `bColorCount` consistency: must be 0 for ≥ 8 bpp (the palette
         // is too large to fit in a single byte). For ≤ 8 bpp the value
         // is the palette entry count, or 0 to mean "use the default for
@@ -535,6 +589,20 @@ fn sniff_bpp(body: &[u8]) -> u8 {
 fn parse_dib_planes(body: &[u8]) -> Option<u16> {
     if body.len() >= 14 {
         Some(u16::from_le_bytes([body[12], body[13]]))
+    } else {
+        None
+    }
+}
+
+/// Read the BMP DIB body's `biCompression` (DWORD at offset 16).
+/// Returns `None` for headers shorter than 20 bytes — short DIBs are
+/// rejected by earlier dimension / bit-depth checks, so we don't
+/// double-flag the same body. Layout: `biSize` (4) + `biWidth` (4) +
+/// `biHeight` (4) + `biPlanes` (2) + `biBitCount` (2) =
+/// 16 bytes ahead of the `biCompression` field.
+fn parse_dib_compression(body: &[u8]) -> Option<u32> {
+    if body.len() >= 20 {
+        Some(u32::from_le_bytes([body[16], body[17], body[18], body[19]]))
     } else {
         None
     }
@@ -1441,6 +1509,242 @@ mod tests {
         };
         let bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
         // Must NOT trip the biPlanes check — PNG bodies are exempt.
+        let (_, got) = read_ico_raw(&bytes).unwrap();
+        assert_eq!(got.len(), 1);
+    }
+
+    /// Build a 16×16 BMP DIB body with the supplied `biCompression`
+    /// value, all other fields filled to plausible defaults. Used by
+    /// the biCompression test cluster below.
+    fn dib_with_compression(compression: u32) -> Vec<u8> {
+        let mut dib = vec![0u8; 40];
+        dib[0..4].copy_from_slice(&40u32.to_le_bytes()); // biSize
+        dib[4..8].copy_from_slice(&16u32.to_le_bytes()); // biWidth
+        dib[8..12].copy_from_slice(&32u32.to_le_bytes()); // biHeight (doubled)
+        dib[12..14].copy_from_slice(&1u16.to_le_bytes()); // biPlanes
+        dib[14..16].copy_from_slice(&32u16.to_le_bytes()); // biBitCount
+        dib[16..20].copy_from_slice(&compression.to_le_bytes()); // biCompression
+        dib
+    }
+
+    /// `biCompression = BI_RLE8` (= 1) is run-length-encoded 8-bpp —
+    /// no ICO renderer handles RLE bodies and the spec explicitly
+    /// excludes it. Same probe-vs-render rejection as the `biPlanes`
+    /// check above: directory advertises an icon, body carries a
+    /// header field no renderer can honour.
+    #[test]
+    fn read_rejects_bmp_body_compression_rle8() {
+        let entry = IconEntryRaw {
+            width: 16,
+            height: 16,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Bmp,
+            hotspot: None,
+            data: dib_with_compression(1), // BI_RLE8
+        };
+        let bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
+        let err = read_ico_raw(&bytes).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => assert!(
+                msg.contains("biCompression = 1") && msg.contains("BI_RGB"),
+                "expected biCompression rejection msg, got {msg}"
+            ),
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    /// `biCompression = BI_RLE4` (= 2) — same rejection class as
+    /// BI_RLE8; covers the 4-bpp RLE variant.
+    #[test]
+    fn read_rejects_bmp_body_compression_rle4() {
+        let entry = IconEntryRaw {
+            width: 16,
+            height: 16,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Bmp,
+            hotspot: None,
+            data: dib_with_compression(2), // BI_RLE4
+        };
+        let bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
+        let err = read_ico_raw(&bytes).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => assert!(
+                msg.contains("biCompression = 2"),
+                "expected biCompression rejection msg, got {msg}"
+            ),
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    /// `biCompression = BI_JPEG` (= 4) — would smuggle a JPEG body
+    /// through the BMP-DIB code path. The PNG-magic sniff routes
+    /// proper PNG payloads via the PNG branch up front; BI_JPEG /
+    /// BI_PNG are explicitly excluded from the BMP-side carve-out.
+    #[test]
+    fn read_rejects_bmp_body_compression_jpeg() {
+        let entry = IconEntryRaw {
+            width: 16,
+            height: 16,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Bmp,
+            hotspot: None,
+            data: dib_with_compression(4), // BI_JPEG
+        };
+        let bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
+        let err = read_ico_raw(&bytes).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => assert!(
+                msg.contains("biCompression = 4"),
+                "expected biCompression rejection msg, got {msg}"
+            ),
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    /// `biCompression = BI_PNG` (= 5) — companion to the BI_JPEG case
+    /// above. Same rejection: PNG bodies are routed via the PNG
+    /// magic-sniff branch, not by trusting a BMP-DIB header field.
+    #[test]
+    fn read_rejects_bmp_body_compression_png() {
+        let entry = IconEntryRaw {
+            width: 16,
+            height: 16,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Bmp,
+            hotspot: None,
+            data: dib_with_compression(5), // BI_PNG
+        };
+        let bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
+        let err = read_ico_raw(&bytes).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => assert!(
+                msg.contains("biCompression = 5"),
+                "expected biCompression rejection msg, got {msg}"
+            ),
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    /// `biCompression = BI_ALPHABITFIELDS` (= 6) — also explicitly
+    /// excluded for ICO sub-images even though it's a near-cousin of
+    /// the tolerated BI_BITFIELDS case. ICO writers don't produce it
+    /// and no ICO renderer parses the trailing alpha mask.
+    #[test]
+    fn read_rejects_bmp_body_compression_alphabitfields() {
+        let entry = IconEntryRaw {
+            width: 16,
+            height: 16,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Bmp,
+            hotspot: None,
+            data: dib_with_compression(6), // BI_ALPHABITFIELDS
+        };
+        let bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
+        let err = read_ico_raw(&bytes).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => assert!(
+                msg.contains("biCompression = 6"),
+                "expected biCompression rejection msg, got {msg}"
+            ),
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    /// `biCompression = BI_RGB` (= 0) is the canonical, mandated
+    /// value — happy-path regression so a future refactor that swaps
+    /// the constant or flips the comparison gets caught.
+    #[test]
+    fn read_accepts_bmp_body_compression_bi_rgb() {
+        let entry = IconEntryRaw {
+            width: 16,
+            height: 16,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Bmp,
+            hotspot: None,
+            data: dib_with_compression(0), // BI_RGB
+        };
+        let bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
+        let (_, got) = read_ico_raw(&bytes).unwrap();
+        assert_eq!(got.len(), 1);
+    }
+
+    /// `biCompression = BI_BITFIELDS` (= 3) is tolerated for 16-bpp /
+    /// 32-bpp DIBs: the body still parses with the same row-stride
+    /// rules, the channel masks just live in the bytes after the
+    /// fixed BITMAPINFOHEADER. Must be accepted (this is the
+    /// carve-out the rejection branch above guards).
+    #[test]
+    fn read_accepts_bmp_body_compression_bi_bitfields() {
+        let entry = IconEntryRaw {
+            width: 16,
+            height: 16,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Bmp,
+            hotspot: None,
+            data: dib_with_compression(3), // BI_BITFIELDS
+        };
+        let bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
+        let (_, got) = read_ico_raw(&bytes).unwrap();
+        assert_eq!(got.len(), 1);
+    }
+
+    /// The biCompression check is BMP-specific — a PNG entry whose
+    /// IHDR happens to place a non-zero `u32` at bytes 16..20 (which
+    /// is the PNG IHDR width / height, big-endian) must not trip on
+    /// the new check. Same exemption shape as the biPlanes PNG-body
+    /// test above.
+    #[test]
+    fn read_png_body_does_not_validate_bicompression() {
+        // PNG: magic + 8-byte chunk header filler + IHDR width/height
+        // (BE) at bytes 16..24. Width = 16 LE-decoded as a u32 at
+        // bytes 16..20 would be `0x00000010`, which equals 16 (one of
+        // the rejection values if the BMP path mis-fired).
+        let mut png = Vec::with_capacity(24);
+        png.extend_from_slice(&PNG_MAGIC);
+        png.extend_from_slice(&[0; 8]);
+        png.extend_from_slice(&16u32.to_be_bytes());
+        png.extend_from_slice(&16u32.to_be_bytes());
+        let entry = IconEntryRaw {
+            width: 16,
+            height: 16,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Png,
+            hotspot: None,
+            data: png,
+        };
+        let bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
+        let (_, got) = read_ico_raw(&bytes).unwrap();
+        assert_eq!(got.len(), 1);
+    }
+
+    /// Short DIB bodies (< 20 bytes — the `biCompression` field sits
+    /// at offset 16..20) are exempt from the new check. They've
+    /// already failed earlier dim / bit-depth checks; we don't
+    /// double-flag the same body, and the helper must return `None`
+    /// rather than indexing past the slice. Belt-and-braces sanity:
+    /// the existing 18-byte synthetic-body tests must still parse to
+    /// their existing failure modes.
+    #[test]
+    fn read_short_dib_skips_bicompression_check() {
+        // 18-byte body — `biCompression` would live at 16..20 but the
+        // body is too short. The body still has valid `biWidth = 16`
+        // and doubled `biHeight = 32` so the dim / bit-depth checks
+        // pass, and the parser falls through to the bColorCount /
+        // overlap checks just like a normal short body.
+        let mut dib = vec![0u8; 18];
+        dib[4..8].copy_from_slice(&16u32.to_le_bytes());
+        dib[8..12].copy_from_slice(&32u32.to_le_bytes());
+        dib[14..16].copy_from_slice(&32u16.to_le_bytes()); // biBitCount = 32
+        let entry = IconEntryRaw {
+            width: 16,
+            height: 16,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Bmp,
+            hotspot: None,
+            data: dib,
+        };
+        let bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
+        // Must NOT trip the biCompression check on the truncated body.
         let (_, got) = read_ico_raw(&bytes).unwrap();
         assert_eq!(got.len(), 1);
     }
