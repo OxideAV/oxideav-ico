@@ -136,6 +136,16 @@ sub-image decoder:
   `BI_RLE4` / `BI_RLE8` / `BI_JPEG` / `BI_PNG` / `BI_ALPHABITFIELDS`
   bodies are rejected up front rather than silently routed to a
   BMP-DIB renderer that doesn't implement them.
+  `biSize` outside {40 (`BITMAPINFOHEADER`), 108 (`BITMAPV4HEADER`),
+  124 (`BITMAPV5HEADER`)} — the 1995 ICO spec mandates v3
+  (`BITMAPINFOHEADER`, 40 bytes); v4 / v5 are accepted as drop-in
+  successors whose extra colour-space cells sit after the v3
+  layout. The OS/2 `BITMAPCOREHEADER` (12) is rejected — its
+  16-bit `bcWidth` / `bcHeight` fields can't carry the
+  doubled-height ICO convention; the Adobe-Photoshop
+  `BITMAPV2INFOHEADER` (52) / `BITMAPV3INFOHEADER` (56)
+  extensions are also rejected (not part of Microsoft's
+  documented BITMAPINFOHEADER family).
 - CUR entries: hotspot `(x, y)` outside `width × height`.
 - Cross-entry: no two sub-image payloads may overlap. Overlapping
   ranges have been used to smuggle a second body through the same

@@ -10,6 +10,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - `read_ico_raw` now rejects BMP-body entries whose
+  `BITMAPINFOHEADER.biSize` field falls outside the legal
+  ICO-sub-image set `{40 = BITMAPINFOHEADER, 108 = BITMAPV4HEADER,
+  124 = BITMAPV5HEADER}`. The 1995 ICO spec mandates the v3
+  `BITMAPINFOHEADER` (40 bytes); later Windows tooling accepts v4
+  and v5 as drop-in successors whose extra colour-space / gamma /
+  endpoint cells sit after the v3 layout and don't perturb the
+  fields the ICO renderer reads. Every other value is corrupt for
+  the ICO path: the OS/2 `BITMAPCOREHEADER` (12) has 16-bit
+  `bcWidth` / `bcHeight` fields that can't carry the
+  doubled-height ICO convention and lacks a `biCompression` cell
+  entirely; the Adobe-Photoshop `BITMAPV2INFOHEADER` (52) /
+  `BITMAPV3INFOHEADER` (56) extensions are not part of Microsoft's
+  documented BITMAPINFOHEADER family. Same probe-vs-render
+  hardening shape as the existing `biBitCount` / `biPlanes` /
+  `biCompression` body checks: a body claiming `biSize = 12`
+  shipped through the BMP-DIB code path would route the next 8
+  bytes (BITMAPCOREHEADER's `bcWidth` u16 + `bcHeight` u16) into
+  the v3 `biWidth` u32 slot — so a fresh re-read on the writer
+  side would see arbitrary garbage in every downstream field. PNG
+  entries don't have a `biSize` and are exempt; bodies shorter
+  than 4 bytes are also exempt (earlier dim / bit-depth checks
+  have already taken responsibility for "this isn't a DIB").
+  Nine new unit tests cover the BITMAPCOREHEADER / V2 / V3 /
+  garbage rejection paths, the V3 / V4 / V5 acceptance paths, the
+  PNG-body exemption (the PNG signature's first 4 bytes
+  LE-decode outside the legal set — the test asserts this so the
+  exemption is load-bearing), and the short-DIB (< 4 bytes) skip
+  path.
+- `read_ico_raw` now rejects BMP-body entries whose
   `BITMAPINFOHEADER.biCompression` field falls outside
   `{BI_RGB = 0, BI_BITFIELDS = 3}`. The ICO spec mandates
   uncompressed RGB for sub-images; the `BI_BITFIELDS` carve-out

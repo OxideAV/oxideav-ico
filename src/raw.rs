@@ -47,6 +47,24 @@ const BI_RGB: u32 = 0;
 /// same row-stride rules.
 const BI_BITFIELDS: u32 = 3;
 
+/// Legal `BITMAPINFOHEADER.biSize` values for an ICO sub-image's DIB
+/// body. The 1995 spec mandates a v3 `BITMAPINFOHEADER` (40 bytes);
+/// later Windows versions accept the v4 (`BITMAPV4HEADER`, 108 bytes)
+/// and v5 (`BITMAPV5HEADER`, 124 bytes) extensions as drop-in
+/// replacements — the colour-space / gamma / endpoint fields they add
+/// sit after the v3 layout and don't perturb the bits the ICO
+/// renderer reads.
+///
+/// The OS/2 `BITMAPCOREHEADER` (12 bytes) is **not** legal for ICO:
+/// its 16-bit `bcWidth` / `bcHeight` fields can't carry the
+/// doubled-height ICO convention, and its missing `biCompression` /
+/// `biClrUsed` cells mean every renderer-side check downstream of
+/// `biSize` would have to special-case it. The Adobe-Photoshop
+/// `BITMAPV2INFOHEADER` (52) and `BITMAPV3INFOHEADER` (56) extensions
+/// are not part of Microsoft's documented `BITMAPINFOHEADER` family
+/// either. Every other value is corrupt.
+const VALID_DIB_HEADER_SIZES: [u32; 3] = [40, 108, 124];
+
 /// One ICO / CUR sub-image entry as stored on disk: directory metadata
 /// (width, height, optional hotspot, source encoding) plus the raw
 /// payload bytes.
@@ -341,6 +359,51 @@ pub fn read_ico_raw(input: &[u8]) -> Result<(IconType, Vec<IconEntryRaw>)> {
             )));
         }
 
+        // BMP body `biSize` consistency. The 1995 ICO spec mandates a
+        // v3 `BITMAPINFOHEADER` (40 bytes) for sub-image DIB bodies;
+        // later Windows tooling accepts the v4 (`BITMAPV4HEADER` =
+        // 108) and v5 (`BITMAPV5HEADER` = 124) extensions as drop-in
+        // replacements — the colour-space / gamma / endpoint cells they
+        // add sit after the v3 layout and don't perturb the
+        // `biWidth` / `biHeight` / `biPlanes` / `biBitCount` /
+        // `biCompression` fields the ICO renderer reads. Every other
+        // value is corrupt for the ICO path: the OS/2
+        // `BITMAPCOREHEADER` (12) has 16-bit width/height fields that
+        // can't carry the doubled-height ICO convention and lacks a
+        // `biCompression` cell entirely, and the Adobe-Photoshop
+        // `BITMAPV2INFOHEADER` (52) / `BITMAPV3INFOHEADER` (56) are
+        // not part of Microsoft's documented BITMAPINFOHEADER family.
+        //
+        // Same probe-vs-render shape as the `biBitCount` / `biPlanes`
+        // / `biCompression` body checks above: a probe inspecting the
+        // directory sees one shape, the renderer parses the body and
+        // sees a wholly different header layout. A body claiming
+        // `biSize = 12` shipped through the BMP-DIB code path would
+        // route the next 8 bytes (BITMAPCOREHEADER's `bcWidth` u16 +
+        // `bcHeight` u16) into the v3 `biWidth` u32 slot — so a fresh
+        // re-read on the writer side would see arbitrary garbage in
+        // every downstream field. Reject up front rather than emit an
+        // `IconEntryRaw` whose `data` then explodes the consumer's
+        // DIB decoder. PNG entries don't have a `biSize` and are
+        // exempt.
+        //
+        // The 0-byte tolerance carve-out mirrors the rest of the BMP
+        // checks: when the body is too short to carry the `biSize`
+        // u32 (< 4 bytes), the value is unobservable and earlier
+        // dim/bit-depth checks have already taken responsibility for
+        // "this isn't a DIB".
+        if sub_format == IconSubFormat::Bmp {
+            if let Some(size) = parse_dib_size(&payload) {
+                if !VALID_DIB_HEADER_SIZES.contains(&size) {
+                    return Err(Error::invalid(format!(
+                        "ICO: entry {i} body biSize = {size} \
+                         (must be one of 40 = BITMAPINFOHEADER, \
+                         108 = BITMAPV4HEADER, 124 = BITMAPV5HEADER)"
+                    )));
+                }
+            }
+        }
+
         // BMP body `biPlanes` consistency. The ICO/CUR spec mandates
         // `biPlanes = 1` in the BITMAPINFOHEADER (a single colour plane
         // — multi-plane DIBs were a planar-video relic that ICO never
@@ -580,6 +643,20 @@ fn sniff_bpp(body: &[u8]) -> u8 {
         u16::from_le_bytes([body[14], body[15]]) as u8
     } else {
         32
+    }
+}
+
+/// Read the BMP DIB body's `biSize` (DWORD at offset 0). Returns
+/// `None` for bodies shorter than 4 bytes — those already fail the
+/// earlier dim-parse path and don't need a second error. `biSize`
+/// is the field that disambiguates v3 / v4 / v5 BITMAPINFOHEADER
+/// variants (40 / 108 / 124) and uniquely tags OS/2 BITMAPCOREHEADER
+/// (12).
+fn parse_dib_size(body: &[u8]) -> Option<u32> {
+    if body.len() >= 4 {
+        Some(u32::from_le_bytes([body[0], body[1], body[2], body[3]]))
+    } else {
+        None
     }
 }
 
@@ -1221,6 +1298,7 @@ mod tests {
     fn read_accepts_cur_hotspot_inside_body_dims() {
         // 16×16 BMP body, hotspot (5, 7) — well inside.
         let mut dib = vec![0u8; 18];
+        dib[0..4].copy_from_slice(&40u32.to_le_bytes()); // biSize = 40
         dib[4..8].copy_from_slice(&16u32.to_le_bytes());
         dib[8..12].copy_from_slice(&32u32.to_le_bytes()); // doubled → 16
         let entry = IconEntryRaw {
@@ -1411,6 +1489,7 @@ mod tests {
     #[test]
     fn read_rejects_bmp_body_planes_above_one() {
         let mut dib = vec![0u8; 18];
+        dib[0..4].copy_from_slice(&40u32.to_le_bytes()); // biSize = 40
         dib[4..8].copy_from_slice(&16u32.to_le_bytes()); // biWidth
         dib[8..12].copy_from_slice(&32u32.to_le_bytes()); // doubled biHeight → 16
                                                           // biPlanes = 7 — outside the legal {0, 1} set.
@@ -1443,6 +1522,7 @@ mod tests {
     #[test]
     fn read_accepts_bmp_body_planes_zero() {
         let mut dib = vec![0u8; 18];
+        dib[0..4].copy_from_slice(&40u32.to_le_bytes()); // biSize = 40
         dib[4..8].copy_from_slice(&16u32.to_le_bytes()); // biWidth
         dib[8..12].copy_from_slice(&32u32.to_le_bytes()); // doubled biHeight → 16
         dib[12..14].copy_from_slice(&0u16.to_le_bytes()); // biPlanes = 0
@@ -1464,6 +1544,7 @@ mod tests {
     #[test]
     fn read_accepts_bmp_body_planes_one() {
         let mut dib = vec![0u8; 18];
+        dib[0..4].copy_from_slice(&40u32.to_le_bytes()); // biSize = 40
         dib[4..8].copy_from_slice(&16u32.to_le_bytes());
         dib[8..12].copy_from_slice(&32u32.to_le_bytes());
         dib[12..14].copy_from_slice(&1u16.to_le_bytes()); // biPlanes = 1
@@ -1732,6 +1813,7 @@ mod tests {
         // pass, and the parser falls through to the bColorCount /
         // overlap checks just like a normal short body.
         let mut dib = vec![0u8; 18];
+        dib[0..4].copy_from_slice(&40u32.to_le_bytes()); // biSize = 40
         dib[4..8].copy_from_slice(&16u32.to_le_bytes());
         dib[8..12].copy_from_slice(&32u32.to_le_bytes());
         dib[14..16].copy_from_slice(&32u16.to_le_bytes()); // biBitCount = 32
@@ -1784,5 +1866,270 @@ mod tests {
         // directory's 0 imposes no constraint.
         assert_eq!(got[0].width, 128);
         assert_eq!(got[0].height, 128);
+    }
+
+    // ------------------------------------------------------------------
+    // biSize body-header-size validation
+    //
+    // The DIB body's first 4 bytes carry `biSize` — the field that
+    // discriminates v3 `BITMAPINFOHEADER` (40), v4 `BITMAPV4HEADER`
+    // (108), v5 `BITMAPV5HEADER` (124), OS/2 `BITMAPCOREHEADER` (12),
+    // and the Adobe-Photoshop v2/v3 extensions (52, 56). Only the
+    // first three are legal for ICO sub-images: v3 is what the 1995
+    // spec mandates, v4 and v5 are drop-in successors whose extra
+    // colour-space cells sit after the v3 layout and don't perturb the
+    // fields the ICO renderer reads. Every other value is corrupt for
+    // the ICO path — `BITMAPCOREHEADER` in particular has 16-bit
+    // `bcWidth` / `bcHeight` fields that can't carry the
+    // doubled-height ICO convention, so its bytes would slot into the
+    // v3 `biWidth` u32 cell and produce arbitrary garbage downstream.
+    // ------------------------------------------------------------------
+
+    /// Build an N-byte DIB body whose `biSize` field is set to the
+    /// supplied value. The width / height / planes / bit-depth cells
+    /// fill plausible defaults. Used by the biSize test cluster
+    /// below.
+    fn dib_with_size(size: u32) -> Vec<u8> {
+        let mut dib = vec![0u8; 40];
+        dib[0..4].copy_from_slice(&size.to_le_bytes()); // biSize
+        dib[4..8].copy_from_slice(&16u32.to_le_bytes()); // biWidth
+        dib[8..12].copy_from_slice(&32u32.to_le_bytes()); // biHeight (doubled → 16)
+        dib[12..14].copy_from_slice(&1u16.to_le_bytes()); // biPlanes = 1
+        dib[14..16].copy_from_slice(&32u16.to_le_bytes()); // biBitCount = 32
+        dib[16..20].copy_from_slice(&0u32.to_le_bytes()); // biCompression = BI_RGB
+        dib
+    }
+
+    /// `biSize = 12` (OS/2 `BITMAPCOREHEADER`) — the 16-bit
+    /// `bcWidth` / `bcHeight` fields can't carry the doubled-height
+    /// ICO convention and the rest of the layout is incompatible with
+    /// the v3 reads downstream. The walker rejects it up front rather
+    /// than route the body's bytes through the v3 path and emit
+    /// arbitrary garbage in the `IconEntryRaw`.
+    #[test]
+    fn read_rejects_bmp_body_size_bitmapcoreheader() {
+        let entry = IconEntryRaw {
+            width: 16,
+            height: 16,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Bmp,
+            hotspot: None,
+            data: dib_with_size(12),
+        };
+        let bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
+        let err = read_ico_raw(&bytes).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => assert!(
+                msg.contains("biSize = 12") && msg.contains("BITMAPINFOHEADER"),
+                "expected biSize-out-of-range msg, got {msg}"
+            ),
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    /// `biSize = 52` (Adobe-Photoshop `BITMAPV2INFOHEADER`) — not
+    /// part of Microsoft's documented BITMAPINFOHEADER family. The
+    /// Photoshop extension adds R/G/B masks at offsets 40..52 even
+    /// when `biCompression` is `BI_RGB`; no ICO renderer parses
+    /// those.
+    #[test]
+    fn read_rejects_bmp_body_size_bitmapv2infoheader() {
+        let entry = IconEntryRaw {
+            width: 16,
+            height: 16,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Bmp,
+            hotspot: None,
+            data: dib_with_size(52),
+        };
+        let bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
+        let err = read_ico_raw(&bytes).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => assert!(
+                msg.contains("biSize = 52"),
+                "expected biSize-out-of-range msg, got {msg}"
+            ),
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    /// `biSize = 56` (Adobe-Photoshop `BITMAPV3INFOHEADER`) — adds an
+    /// alpha mask at offset 52..56 on top of the v2 layout. Same
+    /// reject class as v2: not documented by Microsoft, no ICO
+    /// renderer honours the extra masks.
+    #[test]
+    fn read_rejects_bmp_body_size_bitmapv3infoheader() {
+        let entry = IconEntryRaw {
+            width: 16,
+            height: 16,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Bmp,
+            hotspot: None,
+            data: dib_with_size(56),
+        };
+        let bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
+        let err = read_ico_raw(&bytes).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => assert!(
+                msg.contains("biSize = 56"),
+                "expected biSize-out-of-range msg, got {msg}"
+            ),
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    /// `biSize = 200` (arbitrary garbage) — the catch-all rejection
+    /// path for any value outside the legal {40, 108, 124} set.
+    #[test]
+    fn read_rejects_bmp_body_size_garbage() {
+        let entry = IconEntryRaw {
+            width: 16,
+            height: 16,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Bmp,
+            hotspot: None,
+            data: dib_with_size(200),
+        };
+        let bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
+        let err = read_ico_raw(&bytes).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => assert!(
+                msg.contains("biSize = 200"),
+                "expected biSize-out-of-range msg, got {msg}"
+            ),
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    /// `biSize = 40` (canonical v3 `BITMAPINFOHEADER`) is the
+    /// happy-path the 1995 ICO spec mandates. Must continue to
+    /// round-trip cleanly — the regression test for the new check.
+    #[test]
+    fn read_accepts_bmp_body_size_bitmapinfoheader() {
+        let entry = IconEntryRaw {
+            width: 16,
+            height: 16,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Bmp,
+            hotspot: None,
+            data: dib_with_size(40),
+        };
+        let bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
+        let (_, got) = read_ico_raw(&bytes).unwrap();
+        assert_eq!(got.len(), 1);
+    }
+
+    /// `biSize = 108` (`BITMAPV4HEADER`) is the v4 successor. Adds
+    /// `bV4CSType` / `bV4Endpoints` / `bV4GammaRed` ... at offsets
+    /// 40..108. The v3 cells at offsets 0..40 still drive the ICO
+    /// renderer; the extras are inert. Must be accepted.
+    #[test]
+    fn read_accepts_bmp_body_size_bitmapv4header() {
+        // 108-byte body — biSize = 108, everything else defaulted to
+        // BI_RGB at 32 bpp. The v4 extras at offsets 40..108 stay
+        // zero (legal "unspecified" colour-space).
+        let mut dib = vec![0u8; 108];
+        dib[0..4].copy_from_slice(&108u32.to_le_bytes()); // biSize
+        dib[4..8].copy_from_slice(&16u32.to_le_bytes()); // biWidth
+        dib[8..12].copy_from_slice(&32u32.to_le_bytes()); // biHeight (doubled)
+        dib[12..14].copy_from_slice(&1u16.to_le_bytes()); // biPlanes
+        dib[14..16].copy_from_slice(&32u16.to_le_bytes()); // biBitCount
+        let entry = IconEntryRaw {
+            width: 16,
+            height: 16,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Bmp,
+            hotspot: None,
+            data: dib,
+        };
+        let bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
+        let (_, got) = read_ico_raw(&bytes).unwrap();
+        assert_eq!(got.len(), 1);
+    }
+
+    /// `biSize = 124` (`BITMAPV5HEADER`) is the v5 successor. Adds
+    /// `bV5Intent` / `bV5ProfileData` / `bV5ProfileSize` ... at
+    /// offsets 108..124. Must be accepted (same rationale as v4).
+    #[test]
+    fn read_accepts_bmp_body_size_bitmapv5header() {
+        let mut dib = vec![0u8; 124];
+        dib[0..4].copy_from_slice(&124u32.to_le_bytes()); // biSize
+        dib[4..8].copy_from_slice(&16u32.to_le_bytes());
+        dib[8..12].copy_from_slice(&32u32.to_le_bytes());
+        dib[12..14].copy_from_slice(&1u16.to_le_bytes());
+        dib[14..16].copy_from_slice(&32u16.to_le_bytes());
+        let entry = IconEntryRaw {
+            width: 16,
+            height: 16,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Bmp,
+            hotspot: None,
+            data: dib,
+        };
+        let bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
+        let (_, got) = read_ico_raw(&bytes).unwrap();
+        assert_eq!(got.len(), 1);
+    }
+
+    /// The biSize check is BMP-specific — a PNG entry's first 4 bytes
+    /// are the PNG signature prefix (`89 50 4E 47`, i.e. 0x4E4 47 50
+    /// 89 little-endian = 0x474E5089), which falls nowhere near the
+    /// legal {40, 108, 124} set. The path must remain a PNG-body
+    /// exempt branch even though the LE-decoded value would otherwise
+    /// flag.
+    #[test]
+    fn read_png_body_does_not_validate_bisize() {
+        // PNG: magic at bytes 0..8 + plausible IHDR length / type
+        // filler + 16×16 IHDR dims at 16..24.
+        let mut png = Vec::with_capacity(24);
+        png.extend_from_slice(&PNG_MAGIC);
+        png.extend_from_slice(&[0; 8]);
+        png.extend_from_slice(&16u32.to_be_bytes());
+        png.extend_from_slice(&16u32.to_be_bytes());
+        let entry = IconEntryRaw {
+            width: 16,
+            height: 16,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Png,
+            hotspot: None,
+            data: png,
+        };
+        let bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
+        let (_, got) = read_ico_raw(&bytes).unwrap();
+        assert_eq!(got.len(), 1);
+        // Sanity: the PNG body's first 4 bytes LE-decode to a value
+        // that would have tripped the BMP biSize check if it had
+        // mis-fired — confirming the exemption is load-bearing.
+        let leaked_bisize =
+            u32::from_le_bytes([PNG_MAGIC[0], PNG_MAGIC[1], PNG_MAGIC[2], PNG_MAGIC[3]]);
+        assert!(!VALID_DIB_HEADER_SIZES.contains(&leaked_bisize));
+    }
+
+    /// Bodies shorter than 4 bytes can't even carry a `biSize` field
+    /// and earlier dim-parse checks already short-circuit them — the
+    /// helper must return `None` rather than indexing past the slice,
+    /// and the parser must not double-flag the same body. This sits
+    /// alongside the equivalent short-DIB skip tests for the
+    /// `biCompression` / `biPlanes` checks.
+    #[test]
+    fn read_short_dib_skips_bisize_check() {
+        // 3-byte body — `biSize` would live at 0..4 but the body is
+        // too short. Earlier dim-parse fallback (parse_dib_dims) will
+        // take the declared 16×16 dims from the directory entry, so
+        // the body skips through to the bColorCount / overlap checks
+        // (and passes those too, since bit_depth = 32 and there's no
+        // second entry).
+        let entry = IconEntryRaw {
+            width: 16,
+            height: 16,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Bmp,
+            hotspot: None,
+            data: vec![0u8; 3],
+        };
+        let bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
+        // Must NOT trip the biSize check on the truncated body.
+        let (_, got) = read_ico_raw(&bytes).unwrap();
+        assert_eq!(got.len(), 1);
     }
 }
