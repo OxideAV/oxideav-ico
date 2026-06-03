@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `read_ico_raw` now rejects BMP-body entries whose
+  `BITMAPINFOHEADER.biPlanes` field falls outside `{0, 1}`. The ICO
+  spec mandates `biPlanes = 1` (multi-plane DIBs were a planar-video
+  relic that ICO never used); the directory's `wPlanes` is already
+  validated against `{0, 1}` for ICO entries, but the BMP body's
+  `biPlanes` was previously trusted verbatim. A body claiming
+  `biPlanes = 7` is a malformed DIB that the writer would otherwise
+  fold back into a fresh directory whose `wPlanes = 7` then fails
+  the existing `wPlanes > 1` check on re-read — broken
+  parser/writer fixpoint. Same probe-vs-render hardening shape as
+  the r198 `biBitCount` body check and the r210 `bWidth` / `bHeight`
+  mismatch fix: a probe inspecting the directory sees one value, the
+  renderer parses the body and sees another. Walker now emits
+  `body biPlanes = N (must be 0 or 1)` — same wording as the
+  directory-side `wPlanes` check so a triage grep maps both reports
+  to the same root cause. Four new unit tests cover the `biPlanes > 1`
+  rejection path, the `biPlanes = 0` ("unspecified") tolerance, the
+  canonical `biPlanes = 1` happy-path acceptance, and the
+  PNG-body exemption (PNG entries have no `biPlanes` field — their
+  byte 12..14 sits inside the IHDR length/type prefix and must not
+  trip the new check).
 - `read_ico_raw` now rejects entries whose directory-declared
   `bWidth` / `bHeight` byte disagrees with the body-derived sub-image
   dimension (PNG IHDR width/height or BMP `biWidth` /

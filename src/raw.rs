@@ -328,6 +328,37 @@ pub fn read_ico_raw(input: &[u8]) -> Result<(IconType, Vec<IconEntryRaw>)> {
             )));
         }
 
+        // BMP body `biPlanes` consistency. The ICO/CUR spec mandates
+        // `biPlanes = 1` in the BITMAPINFOHEADER (a single colour plane
+        // — multi-plane DIBs were a planar-video relic that ICO never
+        // used). The directory's `wPlanes` is already validated against
+        // {0, 1} above, but the BMP body's `biPlanes` is independently
+        // present and previously trusted verbatim — same probe-vs-render
+        // shape as the r198 `biBitCount` fix and r210 `bWidth`/`bHeight`
+        // mismatch fix: a probe inspecting the directory sees one value,
+        // the renderer parses the body and sees another. A body claiming
+        // e.g. `biPlanes = 7` is a malformed DIB the writer would
+        // otherwise round-trip into a directory whose `wPlanes` then
+        // fails the very check above (broken parser/writer fixpoint).
+        // Reject body bodies whose `biPlanes` falls outside {0, 1} up
+        // front with the same wording as the directory-side check so a
+        // triage grep maps both reports to the same root cause.
+        //
+        // The legal carve-out mirrors the directory side: `0` is
+        // accepted ("unspecified — defer to a different field") for
+        // tolerance with the wider ecosystem; `1` is the canonical
+        // value. PNG entries don't have a `biPlanes` to validate.
+        if sub_format == IconSubFormat::Bmp {
+            if let Some(planes) = parse_dib_planes(&payload) {
+                if planes > 1 {
+                    return Err(Error::invalid(format!(
+                        "ICO: entry {i} body biPlanes = {planes} \
+                         (must be 0 or 1)"
+                    )));
+                }
+            }
+        }
+
         // `bColorCount` consistency: must be 0 for ≥ 8 bpp (the palette
         // is too large to fit in a single byte). For ≤ 8 bpp the value
         // is the palette entry count, or 0 to mean "use the default for
@@ -495,6 +526,17 @@ fn sniff_bpp(body: &[u8]) -> u8 {
         u16::from_le_bytes([body[14], body[15]]) as u8
     } else {
         32
+    }
+}
+
+/// Read the BMP DIB body's `biPlanes` (WORD at offset 12). Returns
+/// `None` for headers shorter than 14 bytes — those already fail an
+/// earlier check and don't need a second error.
+fn parse_dib_planes(body: &[u8]) -> Option<u16> {
+    if body.len() >= 14 {
+        Some(u16::from_le_bytes([body[12], body[13]]))
+    } else {
+        None
     }
 }
 
@@ -1286,6 +1328,121 @@ mod tests {
         let (_, got) = read_ico_raw(&bytes).unwrap();
         assert_eq!(got[0].width, 256);
         assert_eq!(got[0].height, 256);
+    }
+
+    /// BMP body `biPlanes` outside {0, 1} is the same probe-vs-render
+    /// shape as the r198 `biBitCount` body check: the directory
+    /// `wPlanes` is already validated against {0, 1}, but the body's
+    /// `biPlanes` was previously trusted verbatim. A body claiming
+    /// `biPlanes = 7` is a malformed DIB; the writer would otherwise
+    /// fold it into a fresh directory whose `wPlanes = 7` then fails
+    /// the existing `wPlanes > 1` check on re-read — broken
+    /// parser/writer fixpoint. Same wording as the directory-side
+    /// `wPlanes` check so a triage grep maps both reports to the
+    /// same root cause.
+    #[test]
+    fn read_rejects_bmp_body_planes_above_one() {
+        let mut dib = vec![0u8; 18];
+        dib[4..8].copy_from_slice(&16u32.to_le_bytes()); // biWidth
+        dib[8..12].copy_from_slice(&32u32.to_le_bytes()); // doubled biHeight → 16
+                                                          // biPlanes = 7 — outside the legal {0, 1} set.
+        dib[12..14].copy_from_slice(&7u16.to_le_bytes());
+        dib[14..16].copy_from_slice(&32u16.to_le_bytes()); // biBitCount
+        let entry = IconEntryRaw {
+            width: 16,
+            height: 16,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Bmp,
+            hotspot: None,
+            data: dib,
+        };
+        let bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
+        let err = read_ico_raw(&bytes).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => assert!(
+                msg.contains("biPlanes") && msg.contains("7") && msg.contains("must be 0 or 1"),
+                "expected biPlanes-out-of-range msg, got {msg}"
+            ),
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    /// `biPlanes = 0` carve-out: real-world writers occasionally emit
+    /// 0 ("unspecified") and the directory side accepts it (the
+    /// existing `wPlanes > 1` directory check also tolerates 0). The
+    /// body check must mirror that — reject anything > 1, accept 0
+    /// and 1.
+    #[test]
+    fn read_accepts_bmp_body_planes_zero() {
+        let mut dib = vec![0u8; 18];
+        dib[4..8].copy_from_slice(&16u32.to_le_bytes()); // biWidth
+        dib[8..12].copy_from_slice(&32u32.to_le_bytes()); // doubled biHeight → 16
+        dib[12..14].copy_from_slice(&0u16.to_le_bytes()); // biPlanes = 0
+        dib[14..16].copy_from_slice(&32u16.to_le_bytes()); // biBitCount
+        let entry = IconEntryRaw {
+            width: 16,
+            height: 16,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Bmp,
+            hotspot: None,
+            data: dib,
+        };
+        let bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
+        assert!(read_ico_raw(&bytes).is_ok());
+    }
+
+    /// The canonical `biPlanes = 1` case must continue to round-trip
+    /// cleanly — the happy-path regression for the new check.
+    #[test]
+    fn read_accepts_bmp_body_planes_one() {
+        let mut dib = vec![0u8; 18];
+        dib[4..8].copy_from_slice(&16u32.to_le_bytes());
+        dib[8..12].copy_from_slice(&32u32.to_le_bytes());
+        dib[12..14].copy_from_slice(&1u16.to_le_bytes()); // biPlanes = 1
+        dib[14..16].copy_from_slice(&32u16.to_le_bytes());
+        let entry = IconEntryRaw {
+            width: 16,
+            height: 16,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Bmp,
+            hotspot: None,
+            data: dib,
+        };
+        let bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
+        let (_, got) = read_ico_raw(&bytes).unwrap();
+        assert_eq!(got.len(), 1);
+    }
+
+    /// The biPlanes check is BMP-specific — a PNG entry must not
+    /// trip on bytes 12..14 of its payload (those are part of the
+    /// PNG `IHDR` length / type, not a DIB header).
+    #[test]
+    fn read_png_body_does_not_validate_biplanes() {
+        // Craft a PNG body whose bytes 12..14 happen to contain the
+        // value 7 (the same value the BMP test rejects on). The PNG
+        // path must ignore it because PNG bodies have no `biPlanes`.
+        let mut png = Vec::with_capacity(24);
+        png.extend_from_slice(&PNG_MAGIC);
+        // PNG bytes 8..16 are the IHDR length (BE u32) + chunk type
+        // ("IHDR"). The dim parser reads bytes 16..24 unconditionally.
+        // Place `7, 0` at bytes 12..14 so a confused BMP-style read
+        // would flag it.
+        png.extend_from_slice(&[0, 0, 0, 0, 7, 0, 0, 0]);
+        // PNG IHDR width/height (BE) at 16..24.
+        png.extend_from_slice(&16u32.to_be_bytes());
+        png.extend_from_slice(&16u32.to_be_bytes());
+        let entry = IconEntryRaw {
+            width: 16,
+            height: 16,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Png,
+            hotspot: None,
+            data: png,
+        };
+        let bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
+        // Must NOT trip the biPlanes check — PNG bodies are exempt.
+        let (_, got) = read_ico_raw(&bytes).unwrap();
+        assert_eq!(got.len(), 1);
     }
 
     /// A second carve-out test: directory byte `0` paired with a body

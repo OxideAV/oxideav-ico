@@ -126,6 +126,9 @@ sub-image decoder:
   running past EOF.
 - ICO entries: `wPlanes` not in {0, 1}, `wBitCount` not in
   {0, 1, 4, 8, 16, 24, 32}, `bColorCount != 0` for >= 16-bpp.
+- BMP body: `biBitCount` outside {0, 1, 4, 8, 16, 24, 32}; `biPlanes`
+  outside {0, 1} (the spec mandates `biPlanes = 1`; `0` is accepted
+  as the "unspecified" tolerance the directory side also allows).
 - CUR entries: hotspot `(x, y)` outside `width × height`.
 - Cross-entry: no two sub-image payloads may overlap. Overlapping
   ranges have been used to smuggle a second body through the same
