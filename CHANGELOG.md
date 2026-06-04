@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `read_ico_raw` now rejects ICO sub-image entries whose directory
+  `wBitCount` and BMP body `biBitCount` are both non-zero and
+  disagree. Both fields are already validated against the legal
+  `{0, 1, 4, 8, 16, 24, 32}` set in isolation; the new cross-check
+  catches the case where the directory advertises (say) `wBitCount =
+  8` while the body decodes to `biBitCount = 32`. Both values are
+  individually legal but they contradict each other — a probe that
+  inspected the directory and decided "this is an 8-bpp icon" would
+  disagree with the renderer that's about to parse the body, and a
+  writer round-trip would fold the body's value back into a fresh
+  directory, producing a file that disagrees with the original.
+  Same probe-vs-render hardening shape as the existing `bWidth` /
+  `bHeight` directory-vs-body mismatch check, applied to the
+  bit-depth field. The `0 == "unspecified — defer to the other
+  header"` carve-out applies to both sides: when either field is
+  `0`, it is non-assertive and any agreement check is vacuous (the
+  legal-range check already enforces "is this a recognised bit
+  depth"). The check is gated on the ICO path — for CUR, the
+  directory WORD at offset 6 is the hotspot Y rather than a
+  `wBitCount` assertion, so a cursor with hotspot Y = 8 and a
+  32-bpp BMP body is still legal; gated on the BMP body path —
+  PNG bodies have no `biBitCount` field for the directory to
+  agree with, so they're unconditionally accepted. Five new unit
+  tests cover the disagreement rejection, the directory-side and
+  body-side `0` carve-outs, the CUR hotspot-overlap carve-out, and
+  the PNG body exemption.
 - `read_ico_raw` now rejects BMP-body entries whose
   `BITMAPINFOHEADER.biSize` field falls outside the legal
   ICO-sub-image set `{40 = BITMAPINFOHEADER, 108 = BITMAPV4HEADER,

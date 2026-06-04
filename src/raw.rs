@@ -359,6 +359,42 @@ pub fn read_ico_raw(input: &[u8]) -> Result<(IconType, Vec<IconEntryRaw>)> {
             )));
         }
 
+        // Directory-vs-body `wBitCount` / `biBitCount` consistency
+        // (ICO path only — for CUR the directory WORD at offset 6 is
+        // the hotspot Y instead of a bit-depth assertion).
+        //
+        // Same probe-vs-render shape as the r210 directory-vs-body
+        // dim mismatch check: a probe that inspected the directory
+        // and decided "this is an 8-bpp icon" must agree with the
+        // renderer that's about to parse the body. A directory
+        // advertising `wBitCount = 8` shipping a body whose
+        // `biBitCount` decodes to 24 silently emits an
+        // `IconEntryRaw { bit_depth: 24, ... }` whose value
+        // contradicts the directory the caller just inspected — and
+        // a writer round-trip would fold the body's value back into
+        // a fresh directory, producing a file that disagrees with
+        // the original. Reject the file rather than pick a side.
+        //
+        // The `0 == unspecified` carve-out applies to both sides:
+        // when either the directory's `wBitCount` or the body's
+        // `biBitCount` is `0` ("defer to the other header"), the
+        // field is non-assertive and any agreement check is vacuous.
+        // The legal-range check above has already taken
+        // responsibility for "this isn't a recognised bit depth";
+        // here we only catch the case where two non-zero assertions
+        // disagree.
+        if icon_type == IconType::Ico
+            && sub_format == IconSubFormat::Bmp
+            && bits_or_hoty != 0
+            && bit_depth != 0
+            && bit_depth as u16 != bits_or_hoty
+        {
+            return Err(Error::invalid(format!(
+                "ICO: entry {i} directory wBitCount {bits_or_hoty} disagrees \
+                 with body biBitCount {bit_depth} (probe-vs-render mismatch)"
+            )));
+        }
+
         // BMP body `biSize` consistency. The 1995 ICO spec mandates a
         // v3 `BITMAPINFOHEADER` (40 bytes) for sub-image DIB bodies;
         // later Windows tooling accepts the v4 (`BITMAPV4HEADER` =
@@ -2129,6 +2165,162 @@ mod tests {
         };
         let bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
         // Must NOT trip the biSize check on the truncated body.
+        let (_, got) = read_ico_raw(&bytes).unwrap();
+        assert_eq!(got.len(), 1);
+    }
+
+    /// Directory-vs-body `wBitCount` / `biBitCount` consistency on the
+    /// BMP path. Directory advertises `wBitCount = 8` (a legitimate
+    /// in-range value), but the body's `biBitCount` decodes to 32 —
+    /// both values are legal in isolation, but they disagree. Same
+    /// probe-vs-render shape as the directory-vs-body dim mismatch
+    /// (`bWidth` / `bHeight`): a probe inspecting the directory sees
+    /// one bit depth, the renderer parses the body and sees another;
+    /// a writer round-trip would fold the body's value back into a
+    /// fresh directory, producing a file that disagrees with the
+    /// original. Reject up front rather than emit an `IconEntryRaw`
+    /// whose `bit_depth` silently contradicts the directory.
+    #[test]
+    fn read_rejects_directory_bit_count_mismatch_bmp() {
+        let mut dib = vec![0u8; 18];
+        dib[0..4].copy_from_slice(&40u32.to_le_bytes()); // biSize = 40
+        dib[4..8].copy_from_slice(&16u32.to_le_bytes()); // biWidth = 16
+        dib[8..12].copy_from_slice(&32u32.to_le_bytes()); // doubled biHeight → 16
+        dib[12..14].copy_from_slice(&1u16.to_le_bytes()); // biPlanes = 1
+        dib[14..16].copy_from_slice(&32u16.to_le_bytes()); // biBitCount = 32
+        let entry = IconEntryRaw {
+            width: 16,
+            height: 16,
+            // wBitCount the writer emits — 8 (a legal value, but it
+            // disagrees with the body's 32).
+            bit_depth: 8,
+            sub_format: IconSubFormat::Bmp,
+            hotspot: None,
+            data: dib,
+        };
+        let bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
+        let err = read_ico_raw(&bytes).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => assert!(
+                msg.contains("wBitCount 8")
+                    && msg.contains("biBitCount 32")
+                    && msg.contains("probe-vs-render mismatch"),
+                "expected dir/body bit-depth mismatch msg, got {msg}"
+            ),
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    /// Directory `wBitCount = 0` ("unspecified — defer to the DIB
+    /// header") is non-assertive; the body's `biBitCount = 32` must
+    /// be accepted as authoritative. Mirrors the directory-side
+    /// tolerance the `read_accepts_ico_wbitcount_zero` test already
+    /// exercises.
+    #[test]
+    fn read_accepts_directory_zero_bit_count_with_body_bit_count() {
+        let mut dib = vec![0u8; 18];
+        dib[0..4].copy_from_slice(&40u32.to_le_bytes()); // biSize = 40
+        dib[4..8].copy_from_slice(&16u32.to_le_bytes()); // biWidth = 16
+        dib[8..12].copy_from_slice(&32u32.to_le_bytes()); // doubled biHeight → 16
+        dib[12..14].copy_from_slice(&1u16.to_le_bytes()); // biPlanes = 1
+        dib[14..16].copy_from_slice(&32u16.to_le_bytes()); // biBitCount = 32
+        let entry = IconEntryRaw {
+            width: 16,
+            height: 16,
+            // wBitCount = 0 ("defer to DIB header") — directory side
+            // is silent, body's 32 must be accepted.
+            bit_depth: 0,
+            sub_format: IconSubFormat::Bmp,
+            hotspot: None,
+            data: dib,
+        };
+        let bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
+        let (_, got) = read_ico_raw(&bytes).unwrap();
+        assert_eq!(got.len(), 1);
+        // The body's `biBitCount` wins in the assembled entry.
+        assert_eq!(got[0].bit_depth, 32);
+    }
+
+    /// Body `biBitCount = 0` ("unspecified — defer to a different
+    /// field") is non-assertive; the directory's `wBitCount = 32`
+    /// must be accepted. Symmetric carve-out to the directory-side
+    /// zero case above.
+    #[test]
+    fn read_accepts_body_zero_bit_count_with_directory_bit_count() {
+        let mut dib = vec![0u8; 18];
+        dib[0..4].copy_from_slice(&40u32.to_le_bytes()); // biSize = 40
+        dib[4..8].copy_from_slice(&16u32.to_le_bytes()); // biWidth = 16
+        dib[8..12].copy_from_slice(&32u32.to_le_bytes()); // doubled biHeight → 16
+        dib[12..14].copy_from_slice(&1u16.to_le_bytes()); // biPlanes = 1
+                                                          // biBitCount left at 0 (unspecified).
+        let entry = IconEntryRaw {
+            width: 16,
+            height: 16,
+            // wBitCount = 32 in the directory.
+            bit_depth: 32,
+            sub_format: IconSubFormat::Bmp,
+            hotspot: None,
+            data: dib,
+        };
+        let bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
+        let (_, got) = read_ico_raw(&bytes).unwrap();
+        assert_eq!(got.len(), 1);
+    }
+
+    /// CUR path carve-out: the directory WORD at offset 6 is the
+    /// hotspot Y for cursor files, NOT a `wBitCount` assertion. The
+    /// new dir-vs-body bit-depth check must NOT apply to CUR — a
+    /// cursor with hotspot Y = 8 and a body whose `biBitCount = 32`
+    /// is perfectly legal, and the parser must accept it.
+    #[test]
+    fn read_accepts_cur_hotspot_overlapping_bit_count_field() {
+        let mut dib = vec![0u8; 18];
+        dib[0..4].copy_from_slice(&40u32.to_le_bytes()); // biSize = 40
+        dib[4..8].copy_from_slice(&16u32.to_le_bytes()); // biWidth = 16
+        dib[8..12].copy_from_slice(&32u32.to_le_bytes()); // doubled biHeight → 16
+        dib[12..14].copy_from_slice(&1u16.to_le_bytes()); // biPlanes = 1
+        dib[14..16].copy_from_slice(&32u16.to_le_bytes()); // biBitCount = 32
+        let entry = IconEntryRaw {
+            width: 16,
+            height: 16,
+            bit_depth: 32,
+            sub_format: IconSubFormat::Bmp,
+            // CUR hotspot — Y = 8, which would coincidentally
+            // collide with a `wBitCount = 8` interpretation if the
+            // dir-vs-body check were applied unconditionally.
+            hotspot: Some(HotSpot { x: 4, y: 8 }),
+            data: dib,
+        };
+        let bytes = write_ico_raw(IconType::Cur, std::slice::from_ref(&entry)).unwrap();
+        let (_, got) = read_ico_raw(&bytes).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].hotspot, Some(HotSpot { x: 4, y: 8 }));
+    }
+
+    /// PNG body path: PNG entries don't carry a `biBitCount` field,
+    /// so the dir-vs-body cross-check must skip them and let the
+    /// directory `wBitCount` round-trip whatever value the producer
+    /// chose. A PNG body with `wBitCount = 32` in the directory
+    /// passes through cleanly.
+    #[test]
+    fn read_accepts_png_body_with_any_directory_bit_count() {
+        let mut png = Vec::with_capacity(24);
+        png.extend_from_slice(&PNG_MAGIC);
+        png.extend_from_slice(&[0; 8]);
+        png.extend_from_slice(&16u32.to_be_bytes());
+        png.extend_from_slice(&16u32.to_be_bytes());
+        let entry = IconEntryRaw {
+            width: 16,
+            height: 16,
+            // wBitCount = 24, deliberately different from the
+            // "always 32 for PNG" convention sniff_bpp returns;
+            // PNG bodies bypass the BMP cross-check.
+            bit_depth: 24,
+            sub_format: IconSubFormat::Png,
+            hotspot: None,
+            data: png,
+        };
+        let bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
         let (_, got) = read_ico_raw(&bytes).unwrap();
         assert_eq!(got.len(), 1);
     }

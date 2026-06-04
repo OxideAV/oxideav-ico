@@ -170,6 +170,16 @@ sub-image decoder:
   physically encode a literal dimension other than 256, so the
   body is authoritative for that case (still subject to the
   `1..=256` body-dim range check).
+- Directory-vs-body **bit-depth** probe-vs-render (BMP path, ICO
+  type): when both the directory `wBitCount` and the BMP body's
+  `biBitCount` are non-zero, they must agree. A directory
+  advertising `wBitCount = 8` shipping a body whose `biBitCount`
+  decodes to 32 is rejected up front. Either side being `0`
+  ("unspecified — defer to the other header") makes the check
+  vacuous, mirroring the existing `wBitCount = 0` tolerance. CUR
+  files are exempt (the directory WORD at offset 6 is the
+  hotspot Y, not a bit-depth assertion), and PNG bodies are
+  exempt (no `biBitCount` field for the directory to agree with).
 
 `write_ico_raw` mirrors the CUR-hotspot and empty-payload checks so
 emitted files always round-trip through the parser.
