@@ -132,6 +132,149 @@ pub struct AniFile {
     pub frames: Vec<Vec<u8>>,
 }
 
+/// One resolved playback step from an ANI file — the merged result of
+/// the per-step `seq ` index and per-step `rate` duration, with the
+/// header-level `nSteps` / `iDispRate` defaults already applied. A
+/// playback engine that holds a `Vec<AniStep>` can drive the animation
+/// loop directly without re-deriving any defaulting rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AniStep {
+    /// Zero-based index into [`AniFile::frames`] — guaranteed to be
+    /// `< header.n_frames` (the parser already enforced this on the
+    /// raw [`AniFile::sequence`] array, and the identity fallback
+    /// only produces in-range indices by construction).
+    pub frame_index: u32,
+    /// Per-step duration in 1/60-second jiffies — `rate[i]` when the
+    /// optional `rate` chunk was present, else `header.i_disp_rate`.
+    /// Guaranteed non-zero: [`AniFile::playback_steps`] rejects any
+    /// zero-jiffy step rather than emit a value that would either
+    /// burn CPU in a poll-based renderer or divide-by-zero in a
+    /// frame-rate normaliser.
+    pub jiffies: u32,
+}
+
+impl AniFile {
+    /// Number of playback steps the file declares, with the spec's
+    /// "`nSteps = nFrames` when no `seq ` chunk" default already
+    /// applied. Returns `header.n_steps` when the field is non-zero,
+    /// else `header.n_frames`.
+    ///
+    /// Note `n_steps` and `n_frames` aren't always equal — `seq ` lets
+    /// a 2-frame file play 4 (or 100) steps by repeating frames out of
+    /// storage order. Callers driving the animation loop should size
+    /// arrays against this method, not against `frames.len()`.
+    pub fn resolved_step_count(&self) -> u32 {
+        if self.header.n_steps == 0 {
+            self.header.n_frames
+        } else {
+            self.header.n_steps
+        }
+    }
+
+    /// Resolve the file's `seq ` / `rate` chunks into the concrete
+    /// `(frame_index, jiffies)` playback table a renderer needs.
+    ///
+    /// Per the ACON spec:
+    /// * Step count is `header.n_steps` (or `header.n_frames` when the
+    ///   header field is zero — the spec's "= nFrames if no `seq`
+    ///   chunk" rule).
+    /// * Step `i`'s frame index is `sequence[i]` when the `seq ` chunk
+    ///   is present, else identity `i` (clamped to `n_frames - 1`
+    ///   would lose the playback intent — instead, identity is only
+    ///   produced when the spec guarantees `n_steps == n_frames`).
+    /// * Step `i`'s duration is `rates[i]` when the `rate` chunk is
+    ///   present, else `header.i_disp_rate`.
+    ///
+    /// Errors:
+    /// * No frames declared (`n_frames == 0` — the parser already
+    ///   rejects this at read time, so this branch only triggers on
+    ///   hand-constructed `AniFile`s).
+    /// * Identity-fallback step `i` would index past `n_frames` — only
+    ///   reachable when `n_steps > n_frames` *and* no `seq ` chunk is
+    ///   present (the spec is silent on this combination; an identity
+    ///   mapping is undefined past the frame array). The parser
+    ///   accepts the raw header (`n_steps` legitimately exceeds
+    ///   `n_frames` when paired with a `seq ` chunk), but this
+    ///   accessor refuses to fabricate identity indices that would
+    ///   panic downstream.
+    /// * Any resolved `jiffies` value is zero — neither `rate[i]` nor
+    ///   the `i_disp_rate` fallback may be `0`, since a zero-duration
+    ///   step has no defined display behaviour and would either burn
+    ///   100% CPU in a poll-based renderer (`if elapsed >= rate[i]`
+    ///   advances instantly) or divide-by-zero in a frame-rate
+    ///   normaliser.
+    pub fn playback_steps(&self) -> Result<Vec<AniStep>> {
+        if self.header.n_frames == 0 {
+            return Err(Error::invalid(
+                "ANI: playback_steps: header.n_frames = 0 (no frames to play)",
+            ));
+        }
+        let step_count = self.resolved_step_count() as usize;
+        let default_jiffies = self.header.i_disp_rate;
+        let n_frames = self.header.n_frames;
+
+        // Cross-check the optional chunks' lengths against the
+        // resolved step count. The parser already aligned them, but
+        // a caller constructing `AniFile` by hand could pass an
+        // unexpected length; the accessor catches it rather than
+        // silently truncating / panicking on out-of-bounds index.
+        if let Some(seq) = &self.sequence {
+            if seq.len() != step_count {
+                return Err(Error::invalid(format!(
+                    "ANI: playback_steps: sequence len {} != step count {step_count}",
+                    seq.len()
+                )));
+            }
+        }
+        if let Some(rates) = &self.rates {
+            if rates.len() != step_count {
+                return Err(Error::invalid(format!(
+                    "ANI: playback_steps: rates len {} != step count {step_count}",
+                    rates.len()
+                )));
+            }
+        }
+
+        let mut out = Vec::with_capacity(step_count);
+        for i in 0..step_count {
+            let frame_index = match &self.sequence {
+                Some(seq) => seq[i],
+                None => {
+                    // Identity fallback — only well-defined when
+                    // i < n_frames. The spec's "nSteps = nFrames if
+                    // no seq" default keeps this in range for the
+                    // common case; refuse when the header pairs a
+                    // larger nSteps with no seq chunk.
+                    let idx = i as u32;
+                    if idx >= n_frames {
+                        return Err(Error::invalid(format!(
+                            "ANI: playback_steps: identity step {i} \
+                             out of range (nFrames = {n_frames}) — file \
+                             declares nSteps > nFrames without a seq chunk"
+                        )));
+                    }
+                    idx
+                }
+            };
+            let jiffies = match &self.rates {
+                Some(rates) => rates[i],
+                None => default_jiffies,
+            };
+            if jiffies == 0 {
+                return Err(Error::invalid(format!(
+                    "ANI: playback_steps: step {i} resolved to 0 jiffies \
+                     (zero-duration step is undefined)"
+                )));
+            }
+            out.push(AniStep {
+                frame_index,
+                jiffies,
+            });
+        }
+        Ok(out)
+    }
+}
+
 /// Parse a Windows ANI animated-cursor file.
 ///
 /// Returns the animation header, any metadata, sequence + rate
@@ -1101,5 +1244,264 @@ mod tests {
         let bytes = build_ani_with_seq(2, 4, &[0, 1, 1, 0]);
         let parsed = read_ani_raw(&bytes).unwrap();
         assert_eq!(parsed.sequence.as_ref().unwrap(), &vec![0u32, 1, 1, 0]);
+    }
+
+    // ------------------------------------------------------------------
+    // `AniFile::playback_steps` — typed multi-step playback accessor.
+    // ------------------------------------------------------------------
+
+    /// Build an `AniFile` directly (skipping the byte parser) so the
+    /// playback-table tests can exercise corner cases the read-side
+    /// validator already rejects (zero-jiffy rates, mismatched
+    /// sequence lengths, identity-fallback past nFrames).
+    fn ani_with(
+        n_frames: u32,
+        n_steps: u32,
+        i_disp_rate: u32,
+        sequence: Option<Vec<u32>>,
+        rates: Option<Vec<u32>>,
+    ) -> AniFile {
+        AniFile {
+            header: AniHeader {
+                cb_size: 36,
+                n_frames,
+                n_steps,
+                i_width: 0,
+                i_height: 0,
+                i_bit_count: 0,
+                n_planes: 1,
+                i_disp_rate,
+                bf_attributes: AF_ICON,
+            },
+            info: AniInfo::default(),
+            sequence,
+            rates,
+            frames: (0..n_frames).map(|i| vec![b'F', i as u8]).collect(),
+        }
+    }
+
+    #[test]
+    fn resolved_step_count_falls_back_to_n_frames_when_zero() {
+        // The spec's "nSteps = nFrames if no seq chunk" default —
+        // surface it through the typed accessor.
+        let a = ani_with(3, 0, 10, None, None);
+        assert_eq!(a.resolved_step_count(), 3);
+    }
+
+    #[test]
+    fn resolved_step_count_uses_n_steps_when_non_zero() {
+        // n_steps != n_frames is legitimate when paired with a seq
+        // chunk (a 2-frame file playing 5 steps).
+        let a = ani_with(2, 5, 10, Some(vec![0, 1, 0, 1, 0]), None);
+        assert_eq!(a.resolved_step_count(), 5);
+    }
+
+    #[test]
+    fn playback_steps_identity_when_seq_absent() {
+        // 3-frame file, no seq, no rate — every step is (i, default).
+        let a = ani_with(3, 3, 7, None, None);
+        let steps = a.playback_steps().unwrap();
+        assert_eq!(
+            steps,
+            vec![
+                AniStep {
+                    frame_index: 0,
+                    jiffies: 7
+                },
+                AniStep {
+                    frame_index: 1,
+                    jiffies: 7
+                },
+                AniStep {
+                    frame_index: 2,
+                    jiffies: 7
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn playback_steps_applies_seq_then_rates() {
+        // 2 frames, 4 steps, explicit seq + rate — both override
+        // applied at their respective positions.
+        let a = ani_with(2, 4, 10, Some(vec![0, 1, 1, 0]), Some(vec![3, 4, 5, 6]));
+        let steps = a.playback_steps().unwrap();
+        assert_eq!(
+            steps,
+            vec![
+                AniStep {
+                    frame_index: 0,
+                    jiffies: 3
+                },
+                AniStep {
+                    frame_index: 1,
+                    jiffies: 4
+                },
+                AniStep {
+                    frame_index: 1,
+                    jiffies: 5
+                },
+                AniStep {
+                    frame_index: 0,
+                    jiffies: 6
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn playback_steps_seq_only_falls_back_to_disp_rate() {
+        // seq present, rate absent — every step gets the header's
+        // default jiffies.
+        let a = ani_with(2, 4, 12, Some(vec![0, 1, 1, 0]), None);
+        let steps = a.playback_steps().unwrap();
+        assert_eq!(
+            steps.iter().map(|s| s.jiffies).collect::<Vec<_>>(),
+            vec![12, 12, 12, 12]
+        );
+        assert_eq!(
+            steps.iter().map(|s| s.frame_index).collect::<Vec<_>>(),
+            vec![0, 1, 1, 0]
+        );
+    }
+
+    #[test]
+    fn playback_steps_rate_only_runs_identity_indices() {
+        // rate present, seq absent — frame_index = i (identity),
+        // jiffies = rates[i].
+        let a = ani_with(3, 3, 99, None, Some(vec![1, 2, 3]));
+        let steps = a.playback_steps().unwrap();
+        assert_eq!(
+            steps,
+            vec![
+                AniStep {
+                    frame_index: 0,
+                    jiffies: 1
+                },
+                AniStep {
+                    frame_index: 1,
+                    jiffies: 2
+                },
+                AniStep {
+                    frame_index: 2,
+                    jiffies: 3
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn playback_steps_rejects_zero_default_jiffies_no_rate_chunk() {
+        // i_disp_rate = 0 and no rate chunk — every step resolves to
+        // 0 jiffies. A poll-based renderer that does
+        // `if elapsed >= rate[i]` would advance instantly and burn
+        // 100% CPU; refuse rather than emit it.
+        let a = ani_with(2, 2, 0, None, None);
+        let err = a.playback_steps().unwrap_err();
+        match err {
+            Error::InvalidData(msg) => {
+                assert!(msg.contains("0 jiffies"), "{msg}");
+                assert!(msg.contains("step 0"), "{msg}");
+            }
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn playback_steps_rejects_zero_rate_entry() {
+        // Even when i_disp_rate is non-zero, a single zero-jiffy entry
+        // in the rate chunk poisons the table at that step.
+        let a = ani_with(2, 4, 10, None, Some(vec![5, 0, 5, 5]));
+        let err = a.playback_steps().unwrap_err();
+        match err {
+            Error::InvalidData(msg) => {
+                assert!(msg.contains("step 1"), "{msg}");
+                assert!(msg.contains("0 jiffies"), "{msg}");
+            }
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn playback_steps_rejects_identity_past_n_frames() {
+        // Hand-constructed AniFile with n_steps > n_frames and no seq
+        // chunk — identity step n_frames would index past the frame
+        // vector. (The byte parser doesn't validate this combination
+        // because the spec is silent on it; the accessor catches it
+        // up front rather than letting a downstream `frames[i]`
+        // panic.)
+        let a = ani_with(2, 4, 10, None, None);
+        let err = a.playback_steps().unwrap_err();
+        match err {
+            Error::InvalidData(msg) => {
+                assert!(msg.contains("identity step 2"), "{msg}");
+                assert!(msg.contains("nFrames = 2"), "{msg}");
+            }
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn playback_steps_rejects_mismatched_sequence_length() {
+        // Hand-constructed AniFile whose sequence array is shorter
+        // than n_steps. Parser-produced files can't trip this (the
+        // walker aligns the array to the chunk count), but a caller
+        // constructing AniFile by hand could; refuse rather than
+        // panic on out-of-bounds index.
+        let a = ani_with(2, 4, 10, Some(vec![0, 1]), None);
+        let err = a.playback_steps().unwrap_err();
+        match err {
+            Error::InvalidData(msg) => {
+                assert!(msg.contains("sequence len 2"), "{msg}");
+                assert!(msg.contains("step count 4"), "{msg}");
+            }
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn playback_steps_rejects_mismatched_rates_length() {
+        let a = ani_with(2, 4, 10, Some(vec![0, 1, 0, 1]), Some(vec![5, 6]));
+        let err = a.playback_steps().unwrap_err();
+        match err {
+            Error::InvalidData(msg) => {
+                assert!(msg.contains("rates len 2"), "{msg}");
+                assert!(msg.contains("step count 4"), "{msg}");
+            }
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn playback_steps_rejects_zero_n_frames() {
+        // Sentinel — hand-constructed AniFile with n_frames = 0
+        // would otherwise produce a zero-step table that masks the
+        // bug. (Byte parser already rejects n_frames = 0; this
+        // covers the hand-constructed path.)
+        let a = ani_with(0, 0, 10, None, None);
+        let err = a.playback_steps().unwrap_err();
+        match err {
+            Error::InvalidData(msg) => assert!(msg.contains("n_frames = 0"), "{msg}"),
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn playback_steps_via_byte_parser_round_trip() {
+        // End-to-end: real ANI bytes → read_ani_raw → playback_steps.
+        // Confirms the parser's chunk validation is sufficient to
+        // produce a typed table that requires no further per-chunk
+        // checks at accessor time.
+        let bytes = build_ani_with_seq(2, 4, &[0, 1, 1, 0]);
+        let parsed = read_ani_raw(&bytes).unwrap();
+        let steps = parsed.playback_steps().unwrap();
+        assert_eq!(steps.len(), 4);
+        assert_eq!(
+            steps.iter().map(|s| s.frame_index).collect::<Vec<_>>(),
+            vec![0, 1, 1, 0]
+        );
+        // build_ani_with_seq sets i_disp_rate = 10 and no rate chunk
+        // → every step uses 10 jiffies.
+        assert!(steps.iter().all(|s| s.jiffies == 10));
     }
 }

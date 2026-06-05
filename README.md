@@ -217,13 +217,33 @@ if ani.header.frames_are_icons() {
 
 // `seq` / `rate` are `None` when the chunk was absent — fall back
 // to identity step order / `header.i_disp_rate` respectively.
-let step_order: Vec<u32> = ani.sequence.unwrap_or_else(
+let step_order: Vec<u32> = ani.sequence.clone().unwrap_or_else(
     || (0..ani.header.n_frames).collect(),
 );
-let durations: Vec<u32> = ani.rates.unwrap_or_else(
+let durations: Vec<u32> = ani.rates.clone().unwrap_or_else(
     || vec![ani.header.i_disp_rate; step_order.len()],
 );
+
+// Or skip the per-chunk defaulting and let `playback_steps()` merge
+// `seq` / `rate` / `iDispRate` / `nSteps` into a typed table of
+// `(frame_index, jiffies)` tuples the animation loop drives directly:
+let steps = ani.playback_steps()?;
+for step in &steps {
+    let frame_bytes = &ani.frames[step.frame_index as usize];
+    println!("show {frame_bytes:p} for {} jiffies", step.jiffies);
+}
 ```
+
+`playback_steps` resolves the spec's defaulting rules — `nSteps = nFrames`
+when the field is zero; identity `i` when no `seq ` chunk is present;
+`header.i_disp_rate` when no `rate` chunk is present — and refuses any
+step whose resolved duration is `0` (a zero-jiffy step has no defined
+display behaviour and would either burn 100% CPU in a poll-based
+renderer or divide-by-zero in a frame-rate normaliser). Identity steps
+past `nFrames` are also refused (only reachable when the header pairs
+`nSteps > nFrames` with no `seq ` chunk — the spec is silent on this
+combination and the accessor refuses rather than fabricate out-of-range
+indices that would panic downstream).
 
 The parser is hardened against the usual cursor-file CVE surface:
 truncated declared RIFF size, missing or out-of-order `anih`,

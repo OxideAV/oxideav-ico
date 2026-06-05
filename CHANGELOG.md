@@ -165,6 +165,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `AniFile::playback_steps() -> Result<Vec<AniStep>>` — typed
+  multi-step playback table accessor that resolves the ACON spec's
+  `seq ` / `rate` / `iDispRate` / `nSteps` defaulting rules into a
+  flat `Vec<AniStep { frame_index, jiffies }>` ready for an
+  animation loop. Returns `header.n_steps` (or `header.n_frames`
+  when that field is zero, per the spec's "= nFrames if no seq
+  chunk" default) entries, each one merging the optional `seq[i]`
+  → frame index (identity `i` when absent) and the optional
+  `rate[i]` → jiffies (`header.i_disp_rate` when absent). The
+  accessor rejects three combinations that the byte-side
+  `read_ani_raw` walker doesn't catch: (a) any resolved `jiffies`
+  value is zero — neither the per-step `rate[i]` nor the
+  `i_disp_rate` fallback may be `0`, since a zero-duration step
+  has no defined display behaviour and would either burn 100% CPU
+  in a poll-based renderer (`if elapsed >= rate[i]` advances
+  instantly) or divide-by-zero in a frame-rate normaliser; (b) an
+  identity-fallback step `i >= n_frames` — only reachable when the
+  header pairs `nSteps > nFrames` with no `seq ` chunk (the spec
+  is silent on this combination and the accessor refuses rather
+  than fabricate out-of-range indices that would panic
+  downstream); (c) hand-constructed `AniFile`s whose `sequence` /
+  `rates` `Vec` lengths don't match the resolved step count
+  (parser-produced files can't trip this, but a caller building
+  the struct by hand could, and silent truncation would mask the
+  bug). Also exposes `AniFile::resolved_step_count()` —
+  `header.n_steps` with the `0 → n_frames` defaulting applied —
+  for callers sizing their own playback arrays. 12 new unit tests
+  cover identity-only / `seq`-only / `rate`-only / both-applied
+  positive paths, the three rejection branches, the
+  `nSteps = 0 → nFrames` default, the `nSteps != nFrames`
+  legitimate combination, and the byte-parser → accessor
+  end-to-end round-trip.
 - Standalone Windows ANI (animated cursor) RIFF/ACON parser:
   `read_ani_raw(&[u8]) -> Result<AniFile>`. Returns the 36-byte
   `anih` ANIHEADER, optional `LIST 'INFO'` title / author, optional
