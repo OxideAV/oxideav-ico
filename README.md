@@ -250,12 +250,16 @@ truncated declared RIFF size, missing or out-of-order `anih`,
 oversized `nFrames` (capped at 65_536 to bound allocator pressure),
 stray non-`icon` chunks inside `LIST 'fram'`, child chunks that
 declare a length running past their parent, `seq ` / `rate`
-appearing before `anih`, and **`seq ` step indices `>= nFrames`** —
+appearing before `anih`, **`seq ` step indices `>= nFrames`** —
 a renderer reaches `frames[seq[i]]` directly, so an out-of-range
 entry (the classic `seq[k] = 0xFFFFFFFF` adversarial value) would
-panic / out-of-bounds-read downstream. The walker rejects the file
-up front rather than emit a sequence array a caller can't safely
-index.
+panic / out-of-bounds-read downstream — and **`anih.nPlanes` outside
+`{0, 1}`**: the ACON spec fixes `nPlanes = 1` (multi-plane DIBs were
+a planar-video relic that never reached cursor animation), mirroring
+the ICO-path BMP-body `biPlanes ∈ {0, 1}` strictness; `0` is
+tolerated as the wider-ecosystem "unspecified" sentinel. The walker
+rejects the file up front rather than emit a sequence array or
+multi-plane assertion a caller can't safely act on.
 
 ## Fuzzing
 

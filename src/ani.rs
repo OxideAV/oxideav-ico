@@ -490,6 +490,33 @@ fn parse_anih(payload: &[u8]) -> Result<AniHeader> {
             header.n_steps, MAX_FRAMES_OR_STEPS
         )));
     }
+    // `nPlanes` consistency. The ACON spec fixes `nPlanes = 1` for
+    // every animated cursor (multi-plane DIBs were a planar-video
+    // relic that never reached cursor animation). Same probe-vs-render
+    // shape as the BMP body's `biPlanes ∈ {0, 1}` check on the ICO
+    // path: a probe that read the header and decided "this is a
+    // single-plane animation" must agree with the renderer that's
+    // about to walk the frame payloads. A header claiming e.g.
+    // `nPlanes = 7` would either be silently ignored (and the file
+    // round-tripped into a non-spec value) or interpreted by some
+    // future planar-mode renderer the spec doesn't describe — neither
+    // outcome is what the caller asked for.
+    //
+    // Carve-out mirrors the BMP-side strictness: `0` is tolerated
+    // ("unspecified — defer to a different field") to match the
+    // wider ecosystem's tolerance for an absent value; `1` is the
+    // canonical spec-mandated value. Any other value is a probe-vs-
+    // render mismatch up front. The `frames_are_icons()` (AF_ICON)
+    // path doesn't use `nPlanes` directly (each ICO/CUR frame
+    // carries its own planes assertion inside the inner DIB), but
+    // the raw-BMP path (`AF_ICON` clear) does — and the spec note
+    // "= 1" is unconditional, so the check applies to both.
+    if header.n_planes > 1 {
+        return Err(Error::invalid(format!(
+            "ANI: anih.nPlanes = {} (must be 0 or 1)",
+            header.n_planes
+        )));
+    }
     Ok(header)
 }
 
@@ -801,6 +828,39 @@ mod tests {
             Error::InvalidData(msg) => assert!(msg.contains("sanity cap"), "{msg}"),
             other => panic!("expected InvalidData, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rejects_anih_n_planes_above_one() {
+        // Per spec the `anih.nPlanes` field is "= 1". Mirror the
+        // BMP-body `biPlanes ∈ {0, 1}` strictness on the ICO path:
+        // accept 0 (the wider-ecosystem "unspecified" tolerance) and
+        // 1 (canonical), reject anything else as a probe-vs-render
+        // mismatch.
+        //
+        // anih.nPlanes sits at anih_payload offset 24, which is file
+        // offset (RIFF8 + ACON4 + "anih"4 + size4) + 24 = 44.
+        let mut bytes = build_minimal_ani(1, 1);
+        bytes[44..48].copy_from_slice(&7u32.to_le_bytes());
+        let err = read_ani_raw(&bytes).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => assert!(
+                msg.contains("nPlanes") && msg.contains("must be 0 or 1"),
+                "{msg}"
+            ),
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_anih_n_planes_zero_tolerance() {
+        // The wider ICO/ANI ecosystem tolerates `nPlanes = 0`
+        // ("unspecified — defer to the frame headers"). We mirror the
+        // BMP-body `biPlanes` carve-out and accept it.
+        let mut bytes = build_minimal_ani(1, 1);
+        bytes[44..48].copy_from_slice(&0u32.to_le_bytes());
+        let parsed = read_ani_raw(&bytes).unwrap();
+        assert_eq!(parsed.header.n_planes, 0);
     }
 
     #[test]

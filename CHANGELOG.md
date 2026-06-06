@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `read_ani_raw` now rejects ANI files whose `anih.nPlanes` field
+  is greater than `1`. The ACON spec fixes `nPlanes = 1` for every
+  animated cursor — multi-plane DIBs were a planar-video relic that
+  never reached cursor animation. Same probe-vs-render hardening
+  shape as the ICO-path BMP body `biPlanes ∈ {0, 1}` strictness
+  check landed earlier: a probe that read the header and decided
+  "this is a single-plane animation" must agree with the renderer
+  that's about to walk the frame payloads. A header claiming
+  e.g. `nPlanes = 7` would either be silently round-tripped into a
+  non-spec value or interpreted by some future planar-mode renderer
+  the spec doesn't describe — neither outcome is what the caller
+  asked for. The `0` carve-out mirrors the BMP-side strictness
+  (the wider ICO/ANI ecosystem produces an "unspecified — defer to
+  the frame headers" sentinel that the parser tolerates rather than
+  rejects). Two new unit tests cover the rejection of `nPlanes > 1`
+  and the explicit acceptance of the `nPlanes = 0` tolerance.
 - `read_ico_raw` now rejects ICO sub-image entries whose directory
   `wBitCount` and BMP body `biBitCount` are both non-zero and
   disagree. Both fields are already validated against the legal
