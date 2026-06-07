@@ -353,6 +353,37 @@ impl AniFile {
         }
         Ok(total)
     }
+
+    /// Total animation cycle length in wall-clock seconds — the
+    /// [`Self::total_jiffies`] result divided by the spec's 60-jiffies-per-second
+    /// conversion factor.
+    ///
+    /// The ACON spec fixes the per-step duration unit as "1/60 of a second"
+    /// (`anih.iDispRate` and per-step `rate[i]` both carry jiffies). A
+    /// renderer that needs seconds for clock-side scheduling — sleep
+    /// timers, video-clip lengths, UI labels reading "1.5 s loop" — would
+    /// currently call [`Self::total_jiffies`] and divide by `60.0` by hand;
+    /// this accessor folds that conversion into the type system so the
+    /// `60` literal can't drift across call sites and the unit is fixed in
+    /// the function name.
+    ///
+    /// The conversion is exact in `f64` for every cycle length this parser
+    /// can produce: the bounded-input cap of 65_536 steps × `u32::MAX`
+    /// jiffies sums to roughly `2.8e14`, which sits well under the `f64`
+    /// integer-precision boundary at `2^53 ≈ 9.0e15`. No precision loss is
+    /// possible on parser-accepted input.
+    ///
+    /// Errors: same conditions as [`Self::total_jiffies`] (hand-constructed
+    /// `n_frames = 0`, mismatched `rates` length, any zero-jiffy step).
+    /// The accessor is a thin wrapper that reuses that contract verbatim
+    /// rather than re-deriving the rate / step-count defaulting rules.
+    pub fn cycle_seconds(&self) -> Result<f64> {
+        // Spec: 1 second = 60 jiffies (`anih.iDispRate` units). The `as f64`
+        // widening is exact for the parser's bounded input range (see the
+        // doc-comment for the precision argument); no `try_from` / fallible
+        // conversion is appropriate here.
+        Ok(self.total_jiffies()? as f64 / 60.0)
+    }
 }
 
 /// Parse a Windows ANI animated-cursor file.
@@ -1934,5 +1965,129 @@ mod tests {
         let bytes = build_ani_with_seq(2, 4, &[0, 1, 1, 0]);
         let parsed = read_ani_raw(&bytes).unwrap();
         assert_eq!(parsed.total_jiffies().unwrap(), 40u64);
+    }
+
+    // ------------------------------------------------------------------
+    // `AniFile::cycle_seconds` — wall-clock typed accessor.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn cycle_seconds_uses_default_when_rate_absent() {
+        // 6 jiffies × 60 = 360, divided by 60.0 = 6.0 s — a clean
+        // 1-second-per-step file (i_disp_rate = 60 jiffies = 1 s).
+        let a = ani_with(3, 3, 60, None, None);
+        // 3 steps × 60 jiffies / 60 = 3.0 s.
+        assert_eq!(a.cycle_seconds().unwrap(), 3.0);
+    }
+
+    #[test]
+    fn cycle_seconds_sums_rate_chunk_when_present() {
+        // 30 + 60 + 90 + 120 = 300 jiffies → 5.0 s wall-clock.
+        let a = ani_with(
+            2,
+            4,
+            99,
+            Some(vec![0, 1, 1, 0]),
+            Some(vec![30, 60, 90, 120]),
+        );
+        assert_eq!(a.cycle_seconds().unwrap(), 5.0);
+    }
+
+    #[test]
+    fn cycle_seconds_matches_total_jiffies_div_60() {
+        // Invariant under future maintenance: the wall-clock accessor must
+        // equal total_jiffies / 60.0 by construction. The non-integer
+        // jiffy counts here (3+4+5+6 = 18 jiffies → 0.3 s) catch the case
+        // where one accessor drifts from the other.
+        let a = ani_with(2, 4, 10, None, Some(vec![3, 4, 5, 6]));
+        let jiffies = a.total_jiffies().unwrap();
+        let seconds = a.cycle_seconds().unwrap();
+        assert_eq!(seconds, jiffies as f64 / 60.0);
+        assert_eq!(seconds, 0.3);
+    }
+
+    #[test]
+    fn cycle_seconds_non_integer_jiffies_result() {
+        // 7 jiffies / 60 = 0.11666... — surface the case where the
+        // jiffy total isn't a clean multiple of 60. The f64 result is
+        // the exact rational `7/60`, which round-trips back through
+        // multiplication.
+        let a = ani_with(1, 1, 7, None, None);
+        let seconds = a.cycle_seconds().unwrap();
+        assert_eq!(seconds, 7.0 / 60.0);
+        // And one full second = 60 jiffies.
+        let one_sec = ani_with(1, 1, 60, None, None);
+        assert_eq!(one_sec.cycle_seconds().unwrap(), 1.0);
+    }
+
+    #[test]
+    fn cycle_seconds_widens_exactly_within_f64_precision() {
+        // Same widening-bound argument as total_jiffies: 4 × u32::MAX is
+        // ~1.7e10, well under 2^53 ≈ 9.0e15. The cycle_seconds f64 must
+        // therefore exactly equal `total_jiffies as f64 / 60.0` with no
+        // precision loss surfacing at this scale.
+        let big = u32::MAX;
+        let a = ani_with(4, 4, 0, None, Some(vec![big, big, big, big]));
+        let jiffies = a.total_jiffies().unwrap();
+        let seconds = a.cycle_seconds().unwrap();
+        assert_eq!(seconds, jiffies as f64 / 60.0);
+        // And the multiplication round-trip is exact (no surprise rounding):
+        // assert that `(seconds * 60.0) as u64` recovers the jiffy total.
+        // Cast through u64 since jiffies fits comfortably in the f64
+        // integer-precision range.
+        assert_eq!((seconds * 60.0) as u64, jiffies);
+    }
+
+    #[test]
+    fn cycle_seconds_rejects_zero_default_no_rate_chunk() {
+        // Reuses total_jiffies' zero-jiffy rejection contract — surface
+        // it through the wall-clock accessor so a caller wrapping the
+        // file in a renderer can rely on the same up-front guarantee.
+        let a = ani_with(2, 2, 0, None, None);
+        let err = a.cycle_seconds().unwrap_err();
+        match err {
+            Error::InvalidData(msg) => {
+                assert!(msg.contains("0 jiffies"), "{msg}");
+                assert!(msg.contains("total_jiffies"), "{msg}");
+            }
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cycle_seconds_rejects_zero_rate_entry() {
+        // Same zero-rate-step rejection as total_jiffies — a renderer
+        // building "seconds until next cycle" math against a zero step
+        // would either spin or divide-by-zero.
+        let a = ani_with(2, 4, 10, None, Some(vec![5, 0, 5, 5]));
+        let err = a.cycle_seconds().unwrap_err();
+        match err {
+            Error::InvalidData(msg) => {
+                assert!(msg.contains("step 1"), "{msg}");
+                assert!(msg.contains("0 jiffies"), "{msg}");
+            }
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cycle_seconds_rejects_zero_n_frames() {
+        // Sentinel branch: hand-constructed AniFile with no frames.
+        let a = ani_with(0, 0, 10, None, None);
+        let err = a.cycle_seconds().unwrap_err();
+        match err {
+            Error::InvalidData(msg) => assert!(msg.contains("n_frames = 0"), "{msg}"),
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cycle_seconds_via_byte_parser_round_trip() {
+        // End-to-end: real ANI bytes → read_ani_raw → cycle_seconds.
+        // build_ani_with_seq sets i_disp_rate = 10 and no rate chunk →
+        // total = 4 × 10 = 40 jiffies → 40 / 60 = 2/3 s.
+        let bytes = build_ani_with_seq(2, 4, &[0, 1, 1, 0]);
+        let parsed = read_ani_raw(&bytes).unwrap();
+        assert_eq!(parsed.cycle_seconds().unwrap(), 40.0 / 60.0);
     }
 }

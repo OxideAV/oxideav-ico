@@ -203,6 +203,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `AniFile::cycle_seconds() -> Result<f64>` — wall-clock typed
+  accessor returning the full animation cycle length in seconds,
+  folding the ACON spec's "1/60 of a second per jiffy" conversion
+  into the type system so the `60` literal can't drift across call
+  sites and the unit is fixed in the function name. A renderer
+  building clock-side scheduling (sleep timers, video-clip lengths,
+  UI labels reading "1.5 s loop") that previously had to call
+  `total_jiffies()` and divide by `60.0` by hand now gets a single
+  typed call. The conversion is exact in `f64` for every cycle
+  length the parser can produce: the 65_536-step × `u32::MAX` worst
+  case sums to roughly `2.8e14` jiffies, which sits well under the
+  `f64` integer-precision boundary at `2^53 ≈ 9.0e15`, so no
+  precision loss is possible on parser-accepted input. Reuses
+  `total_jiffies()`'s error contract verbatim (`n_frames = 0`,
+  mismatched `rates` length, any zero-jiffy step) rather than
+  re-deriving the rate / step-count defaulting rules — the rejection
+  paths the byte parser doesn't catch on hand-constructed `AniFile`s
+  still surface through this accessor. 9 new unit tests cover the
+  rate-absent / rate-present / non-integer / `f64` widening positive
+  paths, the three rejection branches (zero default, zero rate
+  entry, zero `n_frames`), a `total_jiffies / 60.0` cross-check
+  invariant (catches accessor drift under future maintenance), and
+  an end-to-end byte-parser → accessor round-trip.
 - `AniFile::total_jiffies() -> Result<u64>` — typed cycle-length
   accessor returning the sum of every step's resolved duration in
   1/60-second jiffies. Folds the ACON spec's `rate` / `iDispRate` /

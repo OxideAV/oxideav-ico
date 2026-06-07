@@ -236,9 +236,15 @@ for step in &steps {
 // One full animation cycle's length, in 1/60-second jiffies. Returns a
 // u64 so the sum can't overflow on adversarial input (65_536 steps ×
 // u32::MAX rate ≈ 2.8e14, which fits a u64 with room to spare).
-// Divide by 60 for wall-clock seconds.
 let cycle_jiffies = ani.total_jiffies()?;
-let cycle_seconds = cycle_jiffies as f64 / 60.0;
+
+// Or, the same cycle in wall-clock seconds, folding the spec's
+// "1/60 of a second per jiffy" conversion into the type system so
+// the `60` literal doesn't drift across call sites and the unit is
+// fixed in the function name. Exact in f64 for every parser-accepted
+// input (worst case ~2.8e14 jiffies, well under f64's 2^53 integer
+// boundary).
+let cycle_seconds = ani.cycle_seconds()?;
 ```
 
 `playback_steps` resolves the spec's defaulting rules — `nSteps = nFrames`
@@ -264,6 +270,19 @@ deliberately does not consult the `seq ` chunk: per-step duration in
 the ACON spec depends only on the step index, not on which frame
 the step picks, so two files with the same rate table and different
 sequences yield the same total.
+
+`cycle_seconds` is the wall-clock counterpart — the same total, divided
+by the spec's 60-jiffies-per-second conversion factor, returned as an
+`f64`. A renderer wiring the result into clock-side scheduling (sleep
+timers, video-clip lengths, "1.5 s loop" UI labels) gets the unit
+fixed in the function name rather than carrying the `60.0` literal
+across call sites. The conversion is exact for every cycle length
+the parser can produce: the 65_536-step × `u32::MAX` worst case sums
+to roughly `2.8e14` jiffies, well under `f64`'s `2^53 ≈ 9.0e15`
+integer-precision boundary. The accessor reuses `total_jiffies`'s
+error contract verbatim (`n_frames = 0`, mismatched `rates` length,
+any zero-jiffy step), so hand-constructed `AniFile`s that the byte
+parser can't reach still surface the same rejection paths.
 
 The parser is hardened against the usual cursor-file CVE surface:
 truncated declared RIFF size, missing or out-of-order `anih`,
