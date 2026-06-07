@@ -232,6 +232,13 @@ for step in &steps {
     let frame_bytes = &ani.frames[step.frame_index as usize];
     println!("show {frame_bytes:p} for {} jiffies", step.jiffies);
 }
+
+// One full animation cycle's length, in 1/60-second jiffies. Returns a
+// u64 so the sum can't overflow on adversarial input (65_536 steps ×
+// u32::MAX rate ≈ 2.8e14, which fits a u64 with room to spare).
+// Divide by 60 for wall-clock seconds.
+let cycle_jiffies = ani.total_jiffies()?;
+let cycle_seconds = cycle_jiffies as f64 / 60.0;
 ```
 
 `playback_steps` resolves the spec's defaulting rules — `nSteps = nFrames`
@@ -244,6 +251,19 @@ past `nFrames` are also refused (only reachable when the header pairs
 `nSteps > nFrames` with no `seq ` chunk — the spec is silent on this
 combination and the accessor refuses rather than fabricate out-of-range
 indices that would panic downstream).
+
+`total_jiffies` returns one full animation cycle's length as a `u64`,
+folding the same `rate` / `iDispRate` / `nSteps` / `nFrames` defaulting
+rules into a single number. The `u32 → u64` widening is load-bearing:
+a worst-case file (the 65_536-step cap × `u32::MAX` per-step rate)
+sums to roughly `2.8e14`, which exceeds `u32::MAX` by a factor of
+65_536. The accessor mirrors `playback_steps`'s zero-jiffy rejection
+contract (the cycle length of a malformed file is meaningless, and
+returning a smaller-than-real total would mask the bug). The accessor
+deliberately does not consult the `seq ` chunk: per-step duration in
+the ACON spec depends only on the step index, not on which frame
+the step picks, so two files with the same rate table and different
+sequences yield the same total.
 
 The parser is hardened against the usual cursor-file CVE surface:
 truncated declared RIFF size, missing or out-of-order `anih`,

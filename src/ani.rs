@@ -273,6 +273,86 @@ impl AniFile {
         }
         Ok(out)
     }
+
+    /// Total animation cycle length in 1/60-second jiffies — the sum of
+    /// every step's resolved duration.
+    ///
+    /// The ACON spec's playback rule is "for each step `i`, show frame
+    /// `seq[i]` for `rate[i]` jiffies; loop". A renderer that needs to
+    /// know how long one full pass takes (e.g. to schedule the next
+    /// wake-up, to convert to wall-clock seconds via `total / 60`, or to
+    /// pre-size a frame-cycle buffer) currently has to call
+    /// [`Self::playback_steps`] and sum the result by hand. This typed
+    /// accessor folds that sum into one call and returns a `u64` so the
+    /// arithmetic can't overflow on adversarial input: a file with the
+    /// 65_536-step cap and every per-step rate at `u32::MAX` sums to
+    /// roughly `2.8e14`, which fits a `u64` comfortably but overflows a
+    /// `u32` by a factor of 65_536.
+    ///
+    /// Defaulting rules match [`Self::playback_steps`]:
+    /// * Step count is `header.n_steps` (or `header.n_frames` when the
+    ///   header field is zero — the spec's "= nFrames if no `seq` chunk"
+    ///   rule, surfaced through [`Self::resolved_step_count`]).
+    /// * Step `i`'s duration is `rates[i]` when the `rate` chunk is
+    ///   present, else `header.i_disp_rate`.
+    ///
+    /// Errors:
+    /// * No frames declared (`n_frames == 0`) — the byte parser already
+    ///   rejects this, so this branch only triggers on hand-constructed
+    ///   `AniFile`s.
+    /// * The optional `rates` `Vec` length disagrees with the resolved
+    ///   step count (same hand-constructed-only branch
+    ///   [`Self::playback_steps`] guards).
+    /// * Any per-step duration resolves to `0` — same reasoning as
+    ///   [`Self::playback_steps`]: a zero-jiffy step has no defined
+    ///   display behaviour, and folding it into the total would mask
+    ///   the bug.
+    ///
+    /// Note this accessor does not need to consult the `sequence`
+    /// chunk: the spec's per-step duration depends only on the step
+    /// index, not on the frame the step picks. A 2-frame file with a
+    /// 4-step `seq ` runs through `rate[0..4]` (or four copies of
+    /// `i_disp_rate`) regardless of which frame each step lands on.
+    /// The accessor still surfaces a `sequence` / step-count mismatch
+    /// indirectly via [`Self::playback_steps`]'s contract — call that
+    /// first if you need the per-step frame indices alongside the
+    /// total.
+    pub fn total_jiffies(&self) -> Result<u64> {
+        if self.header.n_frames == 0 {
+            return Err(Error::invalid(
+                "ANI: total_jiffies: header.n_frames = 0 (no frames to play)",
+            ));
+        }
+        let step_count = self.resolved_step_count() as usize;
+        if let Some(rates) = &self.rates {
+            if rates.len() != step_count {
+                return Err(Error::invalid(format!(
+                    "ANI: total_jiffies: rates len {} != step count {step_count}",
+                    rates.len()
+                )));
+            }
+        }
+        let default_jiffies = self.header.i_disp_rate;
+        let mut total: u64 = 0;
+        for i in 0..step_count {
+            let jiffies = match &self.rates {
+                Some(rates) => rates[i],
+                None => default_jiffies,
+            };
+            if jiffies == 0 {
+                return Err(Error::invalid(format!(
+                    "ANI: total_jiffies: step {i} resolved to 0 jiffies \
+                     (zero-duration step is undefined)"
+                )));
+            }
+            // u32 → u64 widening: the per-step jiffies value is at most
+            // u32::MAX, and step_count is bounded by MAX_FRAMES_OR_STEPS
+            // (65_536). The sum therefore fits a u64 by 14+ bits of
+            // headroom, with no `checked_add` needed.
+            total += jiffies as u64;
+        }
+        Ok(total)
+    }
 }
 
 /// Parse a Windows ANI animated-cursor file.
@@ -1563,5 +1643,138 @@ mod tests {
         // build_ani_with_seq sets i_disp_rate = 10 and no rate chunk
         // → every step uses 10 jiffies.
         assert!(steps.iter().all(|s| s.jiffies == 10));
+    }
+
+    // ------------------------------------------------------------------
+    // `AniFile::total_jiffies` — cycle-length typed accessor.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn total_jiffies_uses_default_when_rate_absent() {
+        // 3 steps × 7 jiffies/default = 21.
+        let a = ani_with(3, 3, 7, None, None);
+        assert_eq!(a.total_jiffies().unwrap(), 21u64);
+    }
+
+    #[test]
+    fn total_jiffies_sums_rate_chunk_when_present() {
+        // 3 + 4 + 5 + 6 = 18; i_disp_rate is ignored when rate is set.
+        let a = ani_with(2, 4, 99, Some(vec![0, 1, 1, 0]), Some(vec![3, 4, 5, 6]));
+        assert_eq!(a.total_jiffies().unwrap(), 18u64);
+    }
+
+    #[test]
+    fn total_jiffies_n_steps_from_n_frames_default() {
+        // header.n_steps = 0 → resolved step count = n_frames = 4.
+        // 4 × 10 = 40.
+        let a = ani_with(4, 0, 10, None, None);
+        assert_eq!(a.total_jiffies().unwrap(), 40u64);
+    }
+
+    #[test]
+    fn total_jiffies_widens_to_u64_without_overflow() {
+        // Worst-case headroom: 65_536 steps × u32::MAX jiffies each
+        // overflows a u32 by 16+ bits; the u64 sum holds it.
+        // Use 4 steps × u32::MAX to keep the test allocation cheap
+        // while still asserting the widening (4 × 0xFFFF_FFFF
+        // = 0x3_FFFF_FFFC, which exceeds u32::MAX).
+        let big = u32::MAX;
+        let a = ani_with(4, 4, 0, None, Some(vec![big, big, big, big]));
+        let expected = (big as u64) * 4;
+        assert_eq!(a.total_jiffies().unwrap(), expected);
+        assert!(expected > u32::MAX as u64, "expected exceeds u32 range");
+    }
+
+    #[test]
+    fn total_jiffies_rejects_zero_default_no_rate_chunk() {
+        // i_disp_rate = 0 and no rate chunk → every step is 0 jiffies.
+        // Matches the playback_steps zero-jiffy rejection contract.
+        let a = ani_with(2, 2, 0, None, None);
+        let err = a.total_jiffies().unwrap_err();
+        match err {
+            Error::InvalidData(msg) => {
+                assert!(msg.contains("0 jiffies"), "{msg}");
+                assert!(msg.contains("step 0"), "{msg}");
+            }
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn total_jiffies_rejects_zero_rate_entry() {
+        // A single zero-jiffy step in an otherwise-valid rate chunk
+        // poisons the cycle: the renderer would either spin or
+        // divide-by-zero at that step, and folding the entry into a
+        // smaller-than-real total would mask the bug.
+        let a = ani_with(2, 4, 10, None, Some(vec![5, 0, 5, 5]));
+        let err = a.total_jiffies().unwrap_err();
+        match err {
+            Error::InvalidData(msg) => {
+                assert!(msg.contains("step 1"), "{msg}");
+                assert!(msg.contains("0 jiffies"), "{msg}");
+            }
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn total_jiffies_rejects_mismatched_rates_length() {
+        // Hand-constructed AniFile whose rates array is shorter than
+        // the resolved step count. Parser-produced files can't trip
+        // this (the walker aligns the array to n_steps), but a caller
+        // building the struct by hand could.
+        let a = ani_with(2, 4, 10, Some(vec![0, 1, 0, 1]), Some(vec![5, 6]));
+        let err = a.total_jiffies().unwrap_err();
+        match err {
+            Error::InvalidData(msg) => {
+                assert!(msg.contains("rates len 2"), "{msg}");
+                assert!(msg.contains("step count 4"), "{msg}");
+            }
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn total_jiffies_rejects_zero_n_frames() {
+        // Sentinel: hand-constructed AniFile with n_frames = 0.
+        let a = ani_with(0, 0, 10, None, None);
+        let err = a.total_jiffies().unwrap_err();
+        match err {
+            Error::InvalidData(msg) => assert!(msg.contains("n_frames = 0"), "{msg}"),
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn total_jiffies_ignores_sequence_chunk() {
+        // The per-step duration depends only on the step index, not on
+        // the frame the step picks. Two files with the same rate /
+        // default / step_count but different sequence arrays must yield
+        // the same total — surface this invariant.
+        let a = ani_with(3, 5, 7, Some(vec![0, 1, 2, 0, 1]), None);
+        let b = ani_with(3, 5, 7, Some(vec![2, 2, 2, 2, 2]), None);
+        assert_eq!(a.total_jiffies().unwrap(), 35);
+        assert_eq!(b.total_jiffies().unwrap(), 35);
+    }
+
+    #[test]
+    fn total_jiffies_matches_playback_steps_sum() {
+        // Cross-check: the total returned here must equal the per-step
+        // sum derived from playback_steps(). Catches the case where one
+        // accessor drifts away from the other under future maintenance.
+        let a = ani_with(2, 4, 10, Some(vec![0, 1, 1, 0]), Some(vec![3, 4, 5, 6]));
+        let steps = a.playback_steps().unwrap();
+        let by_hand: u64 = steps.iter().map(|s| s.jiffies as u64).sum();
+        assert_eq!(a.total_jiffies().unwrap(), by_hand);
+    }
+
+    #[test]
+    fn total_jiffies_via_byte_parser_round_trip() {
+        // End-to-end: real ANI bytes → read_ani_raw → total_jiffies.
+        // build_ani_with_seq sets i_disp_rate = 10 and no rate chunk →
+        // total = 4 steps × 10 = 40.
+        let bytes = build_ani_with_seq(2, 4, &[0, 1, 1, 0]);
+        let parsed = read_ani_raw(&bytes).unwrap();
+        assert_eq!(parsed.total_jiffies().unwrap(), 40u64);
     }
 }

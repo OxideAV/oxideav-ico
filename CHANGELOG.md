@@ -181,6 +181,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `AniFile::total_jiffies() -> Result<u64>` — typed cycle-length
+  accessor returning the sum of every step's resolved duration in
+  1/60-second jiffies. Folds the ACON spec's `rate` / `iDispRate` /
+  `nSteps` / `nFrames` defaulting rules into a single `u64` so a
+  renderer can schedule the next-cycle wake-up, convert to wall-clock
+  seconds (`total / 60`), or size a frame-cycle buffer without
+  re-summing the `playback_steps` result by hand. The `u32 → u64`
+  widening is load-bearing: a worst-case file (the 65_536-step
+  allocator cap × `u32::MAX` per-step rate) sums to roughly `2.8e14`,
+  which exceeds `u32::MAX` by a factor of 65_536; the u64 holds it
+  with 14+ bits of headroom and no `checked_add` is needed. Rejects
+  the same hand-constructed-only branches `playback_steps` already
+  guards: `n_frames = 0`, mismatched `rates` `Vec` length vs the
+  resolved step count, and any per-step duration resolving to `0`
+  (a zero-duration step has no defined display behaviour, and folding
+  it into the total would mask the bug). The accessor deliberately
+  does not consult the `seq ` chunk — per-step duration in the ACON
+  spec depends only on the step index, not on the frame the step
+  picks; the test suite asserts this invariant by comparing two
+  hand-built files with identical rate tables and different sequence
+  arrays. 11 new unit tests cover the rate-absent / rate-present /
+  `n_steps = 0 → n_frames` / `u32 → u64` widening positive paths,
+  the three rejection branches (zero default, zero rate entry,
+  mismatched length), the sentinel `n_frames = 0` path, the
+  sequence-invariance check, a cross-check that the total equals the
+  hand-summed `playback_steps` output (catches accessor drift under
+  future maintenance), and an end-to-end byte-parser → accessor
+  round-trip.
 - `AniFile::playback_steps() -> Result<Vec<AniStep>>` — typed
   multi-step playback table accessor that resolves the ACON spec's
   `seq ` / `rate` / `iDispRate` / `nSteps` defaulting rules into a
