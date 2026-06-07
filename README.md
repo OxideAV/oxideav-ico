@@ -281,6 +281,17 @@ tolerated as the wider-ecosystem "unspecified" sentinel. The walker
 rejects the file up front rather than emit a sequence array or
 multi-plane assertion a caller can't safely act on.
 
+The advisory `anih.iWidth` / `iHeight` / `iBitCount` fields are
+also range-checked: dimensions must be in `1..=256` (the ICO/CUR
+sub-image limit — a value of `0` retains its spec-mandated "take
+from frame" sentinel), and bit-depth must be in
+`{0, 1, 4, 8, 16, 24, 32}` (the BMP/ICO sub-image bit-depth set;
+`0` again carries the "take from frame" meaning). An
+adversarial `iWidth = 0xFFFF_FFFF` is the classic "size pulled
+from user-controlled bytes" smuggling shape that would size a
+raw-BMP-path renderer allocation past anything real; an
+`iBitCount = 7` doesn't correspond to any renderable DIB layout.
+
 ## Fuzzing
 
 The `fuzz/` crate ships two complementary cargo-fuzz targets:

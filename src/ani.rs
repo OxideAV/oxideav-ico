@@ -597,6 +597,48 @@ fn parse_anih(payload: &[u8]) -> Result<AniHeader> {
             header.n_planes
         )));
     }
+    // `iWidth` / `iHeight` range. Per spec these are "Width / Height in
+    // pixels (0 = take from frame)" — they describe a cursor pixel
+    // dimension, which the ICO/CUR layer constrains to `1..=256` (the
+    // directory's `bWidth` / `bHeight` byte fields physically can't
+    // describe anything outside that range, with the `0 == 256`
+    // convention pinning the upper bound). Same probe-vs-render shape
+    // as the BMP-body dim range check on the ICO path: a probe that
+    // read the header and decided "frames are 32×32" must agree with
+    // anything a renderer later does with the value. `0` is the
+    // spec-mandated "unspecified — take from frame" sentinel and is
+    // tolerated; non-zero values outside `1..=256` are a probe-vs-
+    // render mismatch that no real cursor file produces (and that an
+    // adversarial file might use to smuggle a 4-billion-pixel width
+    // into a downstream allocator).
+    if header.i_width > 256 {
+        return Err(Error::invalid(format!(
+            "ANI: anih.iWidth = {} (must be 0 or 1..=256)",
+            header.i_width
+        )));
+    }
+    if header.i_height > 256 {
+        return Err(Error::invalid(format!(
+            "ANI: anih.iHeight = {} (must be 0 or 1..=256)",
+            header.i_height
+        )));
+    }
+    // `iBitCount` value set. Per spec "Bits per pixel (color depth =
+    // 2^iBitCount; 0 = frame)". The ICO/CUR sub-image bit-depth set is
+    // `{0, 1, 4, 8, 16, 24, 32}` — same set the directory `wBitCount`
+    // field is constrained to on the ICO path. `0` here means "take
+    // from frame" (spec-mandated sentinel); anything outside that set
+    // doesn't match a renderable DIB layout and is rejected up front
+    // rather than letting a raw-BMP-path decoder choke on an
+    // un-decodable `2 bpp` / `7 bpp` claim.
+    match header.i_bit_count {
+        0 | 1 | 4 | 8 | 16 | 24 | 32 => {}
+        n => {
+            return Err(Error::invalid(format!(
+                "ANI: anih.iBitCount = {n} (must be one of {{0, 1, 4, 8, 16, 24, 32}})"
+            )))
+        }
+    }
     Ok(header)
 }
 
@@ -941,6 +983,122 @@ mod tests {
         bytes[44..48].copy_from_slice(&0u32.to_le_bytes());
         let parsed = read_ani_raw(&bytes).unwrap();
         assert_eq!(parsed.header.n_planes, 0);
+    }
+
+    #[test]
+    fn rejects_anih_i_width_above_256() {
+        // ICO/CUR sub-images are bounded to 1..=256 in either axis; an
+        // `anih.iWidth` outside that range would either be silently
+        // ignored or sized a renderer allocation past anything real.
+        // anih.iWidth sits at anih_payload offset 12 → file offset
+        // (RIFF8 + ACON4 + "anih"4 + size4) + 12 = 32.
+        let mut bytes = build_minimal_ani(1, 1);
+        bytes[32..36].copy_from_slice(&257u32.to_le_bytes());
+        let err = read_ani_raw(&bytes).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => {
+                assert!(msg.contains("iWidth") && msg.contains("1..=256"), "{msg}")
+            }
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_anih_i_width_pathological_u32() {
+        // Adversarial `0xFFFF_FFFF` is the classic "size pulled from
+        // user-controlled bytes" smuggling shape — make sure we catch
+        // it at parse time.
+        let mut bytes = build_minimal_ani(1, 1);
+        bytes[32..36].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        let err = read_ani_raw(&bytes).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => assert!(msg.contains("iWidth"), "{msg}"),
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_anih_i_height_above_256() {
+        // anih.iHeight sits at anih_payload offset 16 → file offset
+        // 8 + 4 + 4 + 4 + 16 = 36.
+        let mut bytes = build_minimal_ani(1, 1);
+        bytes[36..40].copy_from_slice(&512u32.to_le_bytes());
+        let err = read_ani_raw(&bytes).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => {
+                assert!(msg.contains("iHeight") && msg.contains("1..=256"), "{msg}")
+            }
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_anih_i_width_height_zero_tolerance() {
+        // Spec's "0 = take from frame" sentinel — must be accepted as
+        // the absent-value case (and is the default in the minimal
+        // builder, but we re-assert it here to lock down the contract
+        // against future drift of the validator).
+        let mut bytes = build_minimal_ani(1, 1);
+        bytes[32..36].copy_from_slice(&0u32.to_le_bytes());
+        bytes[36..40].copy_from_slice(&0u32.to_le_bytes());
+        let parsed = read_ani_raw(&bytes).unwrap();
+        assert_eq!(parsed.header.i_width, 0);
+        assert_eq!(parsed.header.i_height, 0);
+    }
+
+    #[test]
+    fn accepts_anih_i_width_height_at_256_boundary() {
+        // 256 is the spec maximum — assert the boundary is inclusive
+        // rather than exclusive (an off-by-one in the validator would
+        // reject the canonical large-cursor case).
+        let mut bytes = build_minimal_ani(1, 1);
+        bytes[32..36].copy_from_slice(&256u32.to_le_bytes());
+        bytes[36..40].copy_from_slice(&256u32.to_le_bytes());
+        let parsed = read_ani_raw(&bytes).unwrap();
+        assert_eq!(parsed.header.i_width, 256);
+        assert_eq!(parsed.header.i_height, 256);
+    }
+
+    #[test]
+    fn rejects_anih_i_bit_count_outside_canonical_set() {
+        // anih.iBitCount sits at anih_payload offset 20 → file offset
+        // 8 + 4 + 4 + 4 + 20 = 40. The ICO/CUR sub-image bit-depth set
+        // is `{0, 1, 4, 8, 16, 24, 32}`; `7 bpp` doesn't correspond to
+        // any renderable DIB layout.
+        let mut bytes = build_minimal_ani(1, 1);
+        bytes[40..44].copy_from_slice(&7u32.to_le_bytes());
+        let err = read_ani_raw(&bytes).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => assert!(
+                msg.contains("iBitCount") && msg.contains("must be one of"),
+                "{msg}"
+            ),
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_anih_i_bit_count_64() {
+        // 64-bpp doesn't exist in the ICO/CUR family — make sure a
+        // high-but-plausible-looking value is still rejected.
+        let mut bytes = build_minimal_ani(1, 1);
+        bytes[40..44].copy_from_slice(&64u32.to_le_bytes());
+        let err = read_ani_raw(&bytes).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => assert!(msg.contains("iBitCount"), "{msg}"),
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_anih_i_bit_count_canonical_values() {
+        // Every canonical bit-depth must round-trip the parser.
+        for bpp in [0u32, 1, 4, 8, 16, 24, 32] {
+            let mut bytes = build_minimal_ani(1, 1);
+            bytes[40..44].copy_from_slice(&bpp.to_le_bytes());
+            let parsed = read_ani_raw(&bytes).expect("canonical bpp must parse");
+            assert_eq!(parsed.header.i_bit_count, bpp);
+        }
     }
 
     #[test]

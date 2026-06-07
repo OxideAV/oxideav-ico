@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `read_ani_raw` now validates the `anih.iWidth` / `iHeight` /
+  `iBitCount` advisory fields against the same value sets the
+  ICO/CUR layer enforces on directory entries: dimensions in
+  `1..=256` (with `0` retained as the spec-mandated "take from
+  frame" sentinel), bit-depth in `{0, 1, 4, 8, 16, 24, 32}`
+  (with `0` retained as the same "take from frame" sentinel).
+  The ACON spec describes these as cursor pixel dimensions and
+  bits-per-pixel — the bit-depth interpretation matches the
+  BMP/ICO sub-image bit-depth set, and a renderer that consults
+  `anih.iWidth` (the raw-BMP path when `AF_ICON` is clear) must
+  agree with the ICO/CUR layer's `1..=256` invariant. Same
+  probe-vs-render hardening shape as the existing
+  directory-vs-body dim / bit-depth cross-check on the ICO
+  path: an adversarial `iWidth = 0xFFFF_FFFF` is the classic
+  "size pulled from user-controlled bytes" smuggling shape that
+  would size a renderer allocation past anything real; an
+  `iBitCount = 7` doesn't correspond to any renderable DIB
+  layout. Six new unit tests cover the rejection paths (above
+  256, pathological `0xFFFF_FFFF`, height beyond 256, bpp
+  outside the canonical set, bpp = 64) and the explicit
+  acceptance paths (`0` sentinel, 256 boundary, every canonical
+  bit-depth round-trip).
 - `read_ani_raw` now rejects ANI files whose `anih.nPlanes` field
   is greater than `1`. The ACON spec fixes `nPlanes = 1` for every
   animated cursor — multi-plane DIBs were a planar-video relic that
