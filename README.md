@@ -245,6 +245,14 @@ let cycle_jiffies = ani.total_jiffies()?;
 // input (worst case ~2.8e14 jiffies, well under f64's 2^53 integer
 // boundary).
 let cycle_seconds = ani.cycle_seconds()?;
+
+// Wall-clock → step inverse: given a jiffy offset into one cycle,
+// locate the active playback step. A renderer driven by a
+// wall-clock-like elapsed counter typically does `elapsed % total`
+// and feeds the result here to find "what step is on screen now?".
+let elapsed_jiffies: u64 = 17 % cycle_jiffies;
+let active_step = ani.step_at_jiffy(elapsed_jiffies)?;
+let frame_bytes = &ani.frames[steps[active_step].frame_index as usize];
 ```
 
 `playback_steps` resolves the spec's defaulting rules — `nSteps = nFrames`
@@ -283,6 +291,28 @@ integer-precision boundary. The accessor reuses `total_jiffies`'s
 error contract verbatim (`n_frames = 0`, mismatched `rates` length,
 any zero-jiffy step), so hand-constructed `AniFile`s that the byte
 parser can't reach still surface the same rejection paths.
+
+`step_at_jiffy` is the inverse mapping a wall-clock-driven renderer
+actually needs at every frame: given a jiffy offset into one cycle,
+return the step index that's currently active. Step `i` claims the
+half-open interval `[start_i, start_i + step.jiffies)` where `start_i`
+is the cumulative sum of every preceding step's duration, so step `0`
+spans `[0, step_0.jiffies)`, step `1` spans `[step_0.jiffies,
+step_0.jiffies + step_1.jiffies)`, and so on. A `jiffy` exactly equal
+to a step boundary lands on the next step (matching the spec's "show
+frame, then advance" edge semantics); a `jiffy >= total_jiffies` is
+rejected up front so a renderer with a buggy wall-clock counter (one
+that wrapped past cycle end or never reset) sees a deterministic error
+rather than getting silently stuck on the last frame forever. The
+caller is responsible for applying `jiffy % total_jiffies` before the
+lookup — looping is a renderer-level concern, not the accessor's.
+Parameter type is `u64` to match `total_jiffies`'s return type (a
+cycle whose total exceeds `u32::MAX` can produce a per-cycle elapsed
+offset that doesn't fit a `u32`, so the accessor doesn't force the
+caller to pre-truncate). The accessor delegates to `playback_steps`
+up front so a malformed file (zero-jiffy step, identity-fallback past
+nFrames, mismatched-length sequence / rates) surfaces a single
+deterministic error rather than an ambiguous "active step = ?" answer.
 
 The parser is hardened against the usual cursor-file CVE surface:
 truncated declared RIFF size, missing or out-of-order `anih`,

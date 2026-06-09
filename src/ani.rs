@@ -384,6 +384,87 @@ impl AniFile {
         // conversion is appropriate here.
         Ok(self.total_jiffies()? as f64 / 60.0)
     }
+
+    /// Locate the playback step that is **active** at a given jiffy offset
+    /// into one animation cycle. Returns the step index, suitable as a
+    /// subscript into the [`Self::playback_steps`] table.
+    ///
+    /// The ACON spec's playback rule is "for each step `i`, show frame
+    /// `seq[i]` for `rate[i]` jiffies; loop". A renderer driven by a
+    /// wall-clock-like jiffy counter (`elapsed = now - start_of_cycle`)
+    /// needs the inverse mapping — given an elapsed-jiffy value, which step
+    /// is currently on screen? This accessor folds that lookup into one
+    /// call instead of forcing every renderer to re-derive a cumulative-sum
+    /// walk over the rate table.
+    ///
+    /// Semantics:
+    ///
+    /// * Step `i` spans the half-open jiffy interval
+    ///   `[start_i, start_i + step.jiffies)`, where `start_i` is the sum of
+    ///   `step.jiffies` for every preceding step.
+    /// * Step `0` is therefore active for `jiffy ∈ [0, step_0.jiffies)`,
+    ///   step `1` for `jiffy ∈ [step_0.jiffies, step_0.jiffies + step_1.jiffies)`,
+    ///   and so on.
+    /// * `jiffy` is expected to be the elapsed offset **inside one cycle**.
+    ///   The caller is responsible for `jiffy %= total_jiffies` before
+    ///   calling — looping is a renderer-level concern, not the accessor's.
+    /// * The `u64` parameter type matches [`Self::total_jiffies`]'s return
+    ///   type — a cycle whose total exceeds `u32::MAX` can produce a
+    ///   per-cycle elapsed offset that doesn't fit a `u32`, so the
+    ///   accessor parameterises on `u64` to avoid forcing the caller to
+    ///   pre-truncate.
+    ///
+    /// Errors:
+    ///
+    /// * Same conditions as [`Self::playback_steps`] (`n_frames = 0`,
+    ///   mismatched `sequence` / `rates` length, any zero-jiffy step,
+    ///   identity-fallback past `n_frames`). The accessor delegates to
+    ///   [`Self::playback_steps`] up front so a malformed file produces a
+    ///   single deterministic error rather than an ambiguous "active step
+    ///   = ?" answer.
+    /// * `jiffy >= total_jiffies` — the elapsed offset has wrapped past
+    ///   the end of one cycle. The caller forgot to modulo. Reporting an
+    ///   error rather than silently clamping catches the renderer bug at
+    ///   the source: a wrap-past-cycle-end value either means the
+    ///   wall-clock counter has drifted (timer bug) or the cycle length
+    ///   has changed under the renderer (file swap during playback);
+    ///   both deserve a deliberate caller fix-up rather than a silent
+    ///   "you're seeing the last frame forever" outcome.
+    pub fn step_at_jiffy(&self, jiffy: u64) -> Result<usize> {
+        // Resolve the full step table first — this also surfaces every
+        // zero-jiffy / mismatched-length / identity-past-nframes rejection
+        // path before any lookup arithmetic runs, so the caller sees the
+        // same error contract `playback_steps` documents.
+        let steps = self.playback_steps()?;
+        // `steps` is non-empty by construction: `playback_steps` rejects
+        // `n_frames = 0` up front and the resolved-step-count never falls
+        // below 1 once `n_frames >= 1`.
+        debug_assert!(!steps.is_empty(), "playback_steps must be non-empty");
+
+        // Walk the cumulative-jiffy boundaries. We compare against `end`
+        // (exclusive upper bound for step `i`) so step `i` claims the
+        // half-open interval `[start, end)`; `jiffy == end` flips to step
+        // `i+1` cleanly, matching the spec's "show frame, then advance"
+        // edge semantics. `u64` accumulation can't overflow on
+        // parser-accepted input — the precision argument from
+        // `total_jiffies` (worst case ~2.8e14) applies verbatim.
+        let mut cumulative: u64 = 0;
+        for (i, step) in steps.iter().enumerate() {
+            cumulative += step.jiffies as u64;
+            if jiffy < cumulative {
+                return Ok(i);
+            }
+        }
+
+        // Fell off the end — `jiffy >= total_jiffies`. The caller forgot
+        // to modulo by the cycle length. `cumulative` at this point is
+        // the total cycle length, so it's the natural value to surface in
+        // the error message (and avoids a second `total_jiffies` call).
+        Err(Error::invalid(format!(
+            "ANI: step_at_jiffy: jiffy {jiffy} >= total cycle length {cumulative} \
+             (caller must apply modulo `jiffy % total_jiffies` before lookup)"
+        )))
+    }
 }
 
 /// Parse a Windows ANI animated-cursor file.
@@ -2089,5 +2170,204 @@ mod tests {
         let bytes = build_ani_with_seq(2, 4, &[0, 1, 1, 0]);
         let parsed = read_ani_raw(&bytes).unwrap();
         assert_eq!(parsed.cycle_seconds().unwrap(), 40.0 / 60.0);
+    }
+
+    // ------------------------------------------------------------------
+    // `AniFile::step_at_jiffy` — wall-clock-to-step typed lookup.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn step_at_jiffy_uniform_rate_buckets_evenly() {
+        // 4 steps × 10 jiffies each = 40-jiffy cycle. Boundaries land at
+        // 0, 10, 20, 30, with step `i` covering `[10*i, 10*(i+1))`.
+        let a = ani_with(4, 4, 10, None, None);
+        assert_eq!(a.step_at_jiffy(0).unwrap(), 0);
+        assert_eq!(a.step_at_jiffy(9).unwrap(), 0);
+        assert_eq!(a.step_at_jiffy(10).unwrap(), 1);
+        assert_eq!(a.step_at_jiffy(19).unwrap(), 1);
+        assert_eq!(a.step_at_jiffy(20).unwrap(), 2);
+        assert_eq!(a.step_at_jiffy(29).unwrap(), 2);
+        assert_eq!(a.step_at_jiffy(30).unwrap(), 3);
+        assert_eq!(a.step_at_jiffy(39).unwrap(), 3);
+    }
+
+    #[test]
+    fn step_at_jiffy_variable_rate_buckets_per_step() {
+        // 4 steps with rates 3, 4, 5, 6 — cumulative boundaries at
+        // 3, 7, 12, 18. Step 0 covers [0,3), step 1 [3,7), step 2 [7,12),
+        // step 3 [12,18).
+        let a = ani_with(2, 4, 99, Some(vec![0, 1, 1, 0]), Some(vec![3, 4, 5, 6]));
+        assert_eq!(a.step_at_jiffy(0).unwrap(), 0);
+        assert_eq!(a.step_at_jiffy(2).unwrap(), 0);
+        assert_eq!(a.step_at_jiffy(3).unwrap(), 1);
+        assert_eq!(a.step_at_jiffy(6).unwrap(), 1);
+        assert_eq!(a.step_at_jiffy(7).unwrap(), 2);
+        assert_eq!(a.step_at_jiffy(11).unwrap(), 2);
+        assert_eq!(a.step_at_jiffy(12).unwrap(), 3);
+        assert_eq!(a.step_at_jiffy(17).unwrap(), 3);
+    }
+
+    #[test]
+    fn step_at_jiffy_boundary_jiffy_value_flips_to_next_step() {
+        // The half-open `[start, end)` interval contract: a jiffy value
+        // exactly equal to step 0's duration must land on step 1, not
+        // step 0. This is the edge that catches an off-by-one
+        // `jiffy <= cumulative` check.
+        let a = ani_with(3, 3, 5, None, None);
+        assert_eq!(a.step_at_jiffy(4).unwrap(), 0);
+        assert_eq!(a.step_at_jiffy(5).unwrap(), 1);
+        assert_eq!(a.step_at_jiffy(10).unwrap(), 2);
+    }
+
+    #[test]
+    fn step_at_jiffy_zero_is_step_zero() {
+        // Sanity: jiffy = 0 is always step 0 (the cycle just started).
+        let a = ani_with(5, 5, 12, None, None);
+        assert_eq!(a.step_at_jiffy(0).unwrap(), 0);
+    }
+
+    #[test]
+    fn step_at_jiffy_rejects_jiffy_equal_to_total() {
+        // jiffy == total_jiffies is exactly the wrap-past-cycle-end
+        // boundary. The caller forgot to modulo; reporting an error
+        // catches the bug at the source rather than silently clamping
+        // to the last step (which would leave the renderer "stuck" on
+        // the last frame forever).
+        let a = ani_with(3, 3, 10, None, None);
+        // total = 30; jiffy = 30 must fail.
+        let err = a.step_at_jiffy(30).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => {
+                assert!(msg.contains("30 >= total cycle length 30"), "{msg}");
+                assert!(msg.contains("modulo"), "{msg}");
+            }
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn step_at_jiffy_rejects_jiffy_far_past_total() {
+        // Pathological adversarial value — `u64::MAX` is the classic
+        // "elapsed counter wrapped or never reset" smuggling shape.
+        // Must produce a deterministic error rather than a silent
+        // last-step answer.
+        let a = ani_with(2, 2, 5, None, None);
+        let err = a.step_at_jiffy(u64::MAX).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => assert!(msg.contains("total cycle length 10"), "{msg}"),
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn step_at_jiffy_handles_u64_range_jiffy() {
+        // The cycle length can exceed u32::MAX (~2.8e14 worst case in the
+        // bounded-input precision argument). A jiffy value above u32::MAX
+        // but below the total must still resolve cleanly — this catches a
+        // hypothetical implementation that internally truncated to u32.
+        let big = u32::MAX;
+        let a = ani_with(4, 4, 0, None, Some(vec![big, big, big, big]));
+        // Cumulative boundaries at big, 2*big, 3*big, 4*big.
+        // Step 1 spans [u32::MAX, 2 * u32::MAX) — pick a jiffy inside that
+        // span that doesn't fit a u32.
+        let probe = big as u64 + 1;
+        assert!(probe > u32::MAX as u64);
+        assert_eq!(a.step_at_jiffy(probe).unwrap(), 1);
+        // And a probe inside step 3's range (well past u32 reach).
+        let probe = 3u64 * big as u64 + 7;
+        assert_eq!(a.step_at_jiffy(probe).unwrap(), 3);
+    }
+
+    #[test]
+    fn step_at_jiffy_inherits_zero_jiffy_rejection() {
+        // The accessor delegates to playback_steps up front — a
+        // zero-jiffy step poisons the table and the lookup must fail
+        // with the same playback_steps error rather than silently
+        // collapsing the zero-duration interval.
+        let a = ani_with(2, 4, 10, None, Some(vec![5, 0, 5, 5]));
+        let err = a.step_at_jiffy(7).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => {
+                assert!(msg.contains("step 1"), "{msg}");
+                assert!(msg.contains("0 jiffies"), "{msg}");
+            }
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn step_at_jiffy_inherits_identity_past_n_frames_rejection() {
+        // n_steps > n_frames without a seq chunk — playback_steps
+        // refuses to fabricate identity indices past nFrames. The
+        // step_at_jiffy lookup must surface that error rather than
+        // claim a step it can't validate.
+        let a = ani_with(2, 4, 10, None, None);
+        let err = a.step_at_jiffy(5).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => {
+                assert!(msg.contains("identity step 2"), "{msg}");
+            }
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn step_at_jiffy_inherits_zero_n_frames_rejection() {
+        // Sentinel: hand-constructed AniFile with no frames. Reuses the
+        // playback_steps n_frames = 0 rejection.
+        let a = ani_with(0, 0, 10, None, None);
+        let err = a.step_at_jiffy(0).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => assert!(msg.contains("n_frames = 0"), "{msg}"),
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn step_at_jiffy_matches_playback_steps_cumulative_walk() {
+        // Cross-check invariant: for every jiffy in the cycle, the result
+        // must match a hand-rolled cumulative walk over playback_steps.
+        // Catches the case where the accessor drifts away from
+        // playback_steps' semantics under future maintenance.
+        let a = ani_with(
+            3,
+            5,
+            7,
+            Some(vec![0, 1, 2, 1, 0]),
+            Some(vec![4, 7, 2, 9, 11]),
+        );
+        let steps = a.playback_steps().unwrap();
+        let total = a.total_jiffies().unwrap();
+        // Walk every jiffy and assert the accessor agrees with the by-hand lookup.
+        let mut expected = 0usize;
+        let mut cumulative: u64 = steps[0].jiffies as u64;
+        for j in 0..total {
+            while j >= cumulative {
+                expected += 1;
+                cumulative += steps[expected].jiffies as u64;
+            }
+            assert_eq!(
+                a.step_at_jiffy(j).unwrap(),
+                expected,
+                "mismatch at jiffy {j}"
+            );
+        }
+    }
+
+    #[test]
+    fn step_at_jiffy_via_byte_parser_round_trip() {
+        // End-to-end: real ANI bytes → read_ani_raw → step_at_jiffy.
+        // build_ani_with_seq: i_disp_rate = 10, no rate chunk, 4 steps.
+        // Cumulative boundaries at 10, 20, 30, 40 — step `i` covers
+        // `[10*i, 10*(i+1))`.
+        let bytes = build_ani_with_seq(2, 4, &[0, 1, 1, 0]);
+        let parsed = read_ani_raw(&bytes).unwrap();
+        assert_eq!(parsed.step_at_jiffy(0).unwrap(), 0);
+        assert_eq!(parsed.step_at_jiffy(9).unwrap(), 0);
+        assert_eq!(parsed.step_at_jiffy(10).unwrap(), 1);
+        assert_eq!(parsed.step_at_jiffy(25).unwrap(), 2);
+        assert_eq!(parsed.step_at_jiffy(39).unwrap(), 3);
+        // And the wrap-past-cycle boundary still rejects.
+        assert!(parsed.step_at_jiffy(40).is_err());
     }
 }

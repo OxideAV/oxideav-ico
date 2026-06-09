@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `AniFile::step_at_jiffy(jiffy: u64) -> Result<usize>` — the
+  wall-clock-to-step inverse a renderer driven by an elapsed-jiffy
+  counter actually needs at every frame. Step `i` claims the
+  half-open interval `[start_i, start_i + step.jiffies)` where
+  `start_i` is the cumulative sum of every preceding step's
+  duration; a `jiffy` exactly equal to a step boundary flips to the
+  next step (matching the spec's "show frame, then advance" edge
+  semantics). The accessor delegates to `playback_steps` up front
+  so a malformed file (zero-jiffy step, identity-fallback past
+  nFrames, mismatched-length sequence / rates) surfaces a single
+  deterministic error rather than an ambiguous "active step = ?"
+  answer; `jiffy >= total_jiffies` is also rejected up front so a
+  renderer with a buggy wall-clock counter (wrapped past cycle end
+  or never reset) sees a deterministic error rather than getting
+  silently stuck on the last frame forever (the caller is
+  responsible for applying `jiffy % total_jiffies` before the
+  lookup — looping is a renderer-level concern). Parameter type is
+  `u64` to match `total_jiffies`'s return type (a cycle whose total
+  exceeds `u32::MAX` can produce a per-cycle elapsed offset that
+  doesn't fit a `u32`, so the accessor doesn't force the caller to
+  pre-truncate). Twelve new unit tests cover uniform / variable
+  rate bucketing, the half-open boundary contract, jiffy = 0,
+  jiffy = total / past total rejection, u64-range probes (jiffy
+  inside step intervals that don't fit a u32), inherited
+  zero-jiffy / identity-past-nFrames / zero-n_frames rejections,
+  the cumulative-walk cross-check invariant against
+  `playback_steps`, and the byte-parser round-trip end-to-end.
+
 ### Fixed
 
 - `read_ani_raw` now validates the `anih.iWidth` / `iHeight` /
