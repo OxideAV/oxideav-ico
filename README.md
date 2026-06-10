@@ -253,6 +253,13 @@ let cycle_seconds = ani.cycle_seconds()?;
 let elapsed_jiffies: u64 = 17 % cycle_jiffies;
 let active_step = ani.step_at_jiffy(elapsed_jiffies)?;
 let frame_bytes = &ani.frames[steps[active_step].frame_index as usize];
+
+// Or drive the same lookup from a seconds-based wall clock — the
+// seconds-domain counterpart of `step_at_jiffy`, folding the spec's
+// 60-jiffies-per-second conversion in so the `60` literal stays out of
+// the call site (loop with `seconds % cycle_seconds`).
+let elapsed_seconds: f64 = 0.28 % cycle_seconds;
+let active_step = ani.step_at_second(elapsed_seconds)?;
 ```
 
 `playback_steps` resolves the spec's defaulting rules — `nSteps = nFrames`
@@ -313,6 +320,27 @@ caller to pre-truncate). The accessor delegates to `playback_steps`
 up front so a malformed file (zero-jiffy step, identity-fallback past
 nFrames, mismatched-length sequence / rates) surfaces a single
 deterministic error rather than an ambiguous "active step = ?" answer.
+
+`step_at_second` is the seconds-domain counterpart of `step_at_jiffy`,
+standing in the same relation to it as `cycle_seconds` stands to
+`total_jiffies`. A renderer driving playback from a seconds-based wall
+clock (clock-side schedulers, video-clip timelines, UI that thinks in
+seconds rather than 1/60-second jiffies) gets the active step directly
+instead of re-deriving the spec's 60-jiffies-per-second conversion and
+handing off to `step_at_jiffy` by hand — the `60` literal is fixed in
+the function name so it can't drift across call sites. The conversion
+is `floor(seconds * 60)` jiffies: the floor is the correct rounding
+direction for the half-open `[start, end)` step intervals, since a
+fractional jiffy offset has not yet crossed into the next whole-jiffy
+bucket, so a wall-clock instant resolves to the step whose interval
+contains its whole-jiffy floor. A non-finite or negative `seconds` is
+rejected up front (a wall-clock offset is physically non-negative and
+finite; NaN especially must be caught, since every `<` jiffy-boundary
+comparison against a NaN-derived value is false and would otherwise
+misreport as a "past total" error), as is a `seconds` so large that
+`floor(seconds * 60)` exceeds `u64::MAX` (caught before the `as u64`
+cast, which would otherwise saturate silently). Otherwise it delegates
+to `step_at_jiffy`, inheriting its full error contract verbatim.
 
 The parser is hardened against the usual cursor-file CVE surface:
 truncated declared RIFF size, missing or out-of-order `anih`,

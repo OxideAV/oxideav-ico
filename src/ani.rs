@@ -465,6 +465,81 @@ impl AniFile {
              (caller must apply modulo `jiffy % total_jiffies` before lookup)"
         )))
     }
+
+    /// Locate the playback step active at a given **wall-clock seconds**
+    /// offset into one animation cycle. The seconds-domain counterpart of
+    /// [`Self::step_at_jiffy`], standing in the same relation to it as
+    /// [`Self::cycle_seconds`] stands to [`Self::total_jiffies`].
+    ///
+    /// A renderer driving playback from a seconds-based wall clock (the
+    /// common case for clock-side schedulers, video-clip timelines, and UI
+    /// that thinks in seconds rather than 1/60-second jiffies) computes an
+    /// elapsed-seconds offset into the cycle and needs the active step.
+    /// Rather than force every such caller to re-derive the spec's
+    /// 60-jiffies-per-second conversion and hand off to
+    /// [`Self::step_at_jiffy`], this accessor folds the conversion in and
+    /// fixes the unit in the function name so the `60` literal can't drift
+    /// across call sites.
+    ///
+    /// Conversion: the ACON spec fixes one jiffy as 1/60 of a second, so
+    /// `seconds` maps to `floor(seconds * 60)` jiffies. The floor is the
+    /// correct rounding direction for the half-open `[start, end)` step
+    /// intervals [`Self::step_at_jiffy`] uses — a wall-clock instant lands
+    /// on the step whose jiffy interval *contains* it, and a fractional
+    /// jiffy offset has not yet crossed into the next whole-jiffy bucket.
+    ///
+    /// `seconds` is expected to be the elapsed offset **inside one cycle**
+    /// (`0.0 ..= cycle_seconds`, exclusive at the top). As with
+    /// [`Self::step_at_jiffy`], looping (`seconds % cycle_seconds`) is the
+    /// renderer's concern, not the accessor's.
+    ///
+    /// Errors:
+    ///
+    /// * `seconds` is negative, NaN, or infinite — a wall-clock offset is
+    ///   physically non-negative and finite; the floor-to-jiffy conversion
+    ///   is undefined otherwise, so the accessor rejects rather than coerce
+    ///   a nonsense value into an arbitrary step. (A NaN comparison would
+    ///   otherwise silently fall through every `<` boundary check and
+    ///   misreport the last step.)
+    /// * `floor(seconds * 60)` exceeds `u64::MAX` — the seconds value is so
+    ///   large the jiffy offset can't be represented; the same
+    ///   "wrapped / never reset" caller bug [`Self::step_at_jiffy`]'s
+    ///   past-total rejection catches, surfaced one conversion earlier.
+    /// * Every condition [`Self::step_at_jiffy`] rejects (the resolved jiffy
+    ///   offset `>= total_jiffies`, plus the inherited
+    ///   [`Self::playback_steps`] rejections: `n_frames = 0`, mismatched
+    ///   `sequence` / `rates` length, any zero-jiffy step, identity-fallback
+    ///   past `n_frames`).
+    pub fn step_at_second(&self, seconds: f64) -> Result<usize> {
+        // A wall-clock offset must be a finite, non-negative real. NaN in
+        // particular is load-bearing to reject up front: every `<` boundary
+        // comparison against a NaN jiffy in `step_at_jiffy` would be false,
+        // so a NaN would silently walk off the end and surface as a
+        // "past total" error that misattributes the caller's bug.
+        if !seconds.is_finite() || seconds < 0.0 {
+            return Err(Error::invalid(format!(
+                "ANI: step_at_second: seconds {seconds} is not a finite, \
+                 non-negative wall-clock offset"
+            )));
+        }
+        // Spec: 1 second = 60 jiffies. Floor is the correct direction for
+        // the half-open `[start, end)` step intervals — a fractional jiffy
+        // offset has not yet crossed into the next whole-jiffy bucket, so a
+        // wall-clock instant resolves to the step whose interval contains
+        // its whole-jiffy floor.
+        let jiffies_f = (seconds * 60.0).floor();
+        // After the floor, `jiffies_f` is an exact non-negative integer in
+        // f64; reject the case where it exceeds the u64 range before the
+        // `as u64` cast (which would otherwise saturate silently).
+        if jiffies_f > u64::MAX as f64 {
+            return Err(Error::invalid(format!(
+                "ANI: step_at_second: seconds {seconds} converts to a jiffy \
+                 offset beyond u64 range"
+            )));
+        }
+        let jiffy = jiffies_f as u64;
+        self.step_at_jiffy(jiffy)
+    }
 }
 
 /// Parse a Windows ANI animated-cursor file.
@@ -2369,5 +2444,174 @@ mod tests {
         assert_eq!(parsed.step_at_jiffy(39).unwrap(), 3);
         // And the wrap-past-cycle boundary still rejects.
         assert!(parsed.step_at_jiffy(40).is_err());
+    }
+
+    #[test]
+    fn step_at_second_converts_seconds_to_jiffy_buckets() {
+        // 4 steps × 60 jiffies each = 240-jiffy / 4-second cycle. Each step
+        // spans 1 wall-clock second: step `i` covers `[i, i+1)` seconds.
+        let a = ani_with(4, 4, 60, None, None);
+        assert_eq!(a.step_at_second(0.0).unwrap(), 0);
+        assert_eq!(a.step_at_second(0.5).unwrap(), 0);
+        assert_eq!(a.step_at_second(0.99).unwrap(), 0);
+        assert_eq!(a.step_at_second(1.0).unwrap(), 1);
+        assert_eq!(a.step_at_second(2.0).unwrap(), 2);
+        assert_eq!(a.step_at_second(3.5).unwrap(), 3);
+    }
+
+    #[test]
+    fn step_at_second_floors_fractional_jiffy() {
+        // 3 steps × 1 jiffy each = 3-jiffy cycle (= 0.05 s). One jiffy is
+        // 1/60 s; a seconds offset inside a single jiffy must floor to that
+        // jiffy, not round up into the next step. 0.4/60 s sits inside
+        // jiffy 0; 1.4/60 s inside jiffy 1; 2.4/60 s inside jiffy 2.
+        let a = ani_with(3, 3, 1, None, None);
+        assert_eq!(a.step_at_second(0.4 / 60.0).unwrap(), 0);
+        assert_eq!(a.step_at_second(1.0 / 60.0).unwrap(), 1);
+        assert_eq!(a.step_at_second(1.4 / 60.0).unwrap(), 1);
+        assert_eq!(a.step_at_second(2.0 / 60.0).unwrap(), 2);
+        assert_eq!(a.step_at_second(2.4 / 60.0).unwrap(), 2);
+    }
+
+    #[test]
+    fn step_at_second_zero_is_step_zero() {
+        // The cycle just started — 0.0 s is always step 0.
+        let a = ani_with(5, 5, 12, None, None);
+        assert_eq!(a.step_at_second(0.0).unwrap(), 0);
+    }
+
+    #[test]
+    fn step_at_second_rejects_negative_seconds() {
+        // A wall-clock offset is physically non-negative; a negative value
+        // is a caller bug, not a step to coerce.
+        let a = ani_with(3, 3, 10, None, None);
+        let err = a.step_at_second(-0.5).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => {
+                assert!(msg.contains("not a finite, non-negative"), "{msg}");
+            }
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn step_at_second_rejects_nan() {
+        // NaN must be rejected up front — every `<` jiffy-boundary
+        // comparison against a NaN-derived value is false, so a NaN would
+        // otherwise walk off the end and misreport as a "past total" error
+        // that hides the real caller bug.
+        let a = ani_with(3, 3, 10, None, None);
+        let err = a.step_at_second(f64::NAN).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => {
+                assert!(msg.contains("not a finite, non-negative"), "{msg}");
+            }
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn step_at_second_rejects_infinity() {
+        // +inf is neither a representable jiffy offset nor a real
+        // wall-clock value — same rejection branch as NaN / negative.
+        let a = ani_with(3, 3, 10, None, None);
+        let err = a.step_at_second(f64::INFINITY).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => {
+                assert!(msg.contains("not a finite, non-negative"), "{msg}");
+            }
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn step_at_second_rejects_seconds_at_or_past_cycle_end() {
+        // 3 steps × 10 jiffies = 30-jiffy / 0.5-second cycle. A seconds
+        // offset that floors to jiffy >= 30 is the wrap-past-cycle-end
+        // boundary `step_at_jiffy` rejects — the caller forgot to modulo.
+        let a = ani_with(3, 3, 10, None, None);
+        // 0.5 s = 30 jiffies exactly — the exclusive top of the cycle.
+        let err = a.step_at_second(0.5).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => {
+                assert!(msg.contains("total cycle length 30"), "{msg}");
+            }
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+        // And a value well past the end still rejects.
+        assert!(a.step_at_second(100.0).is_err());
+    }
+
+    #[test]
+    fn step_at_second_rejects_seconds_beyond_u64_jiffy_range() {
+        // A seconds value so large that `floor(seconds * 60)` exceeds
+        // u64::MAX must be rejected before the `as u64` cast (which would
+        // otherwise saturate silently). 1e30 s × 60 ≈ 6e31 >> u64::MAX.
+        let a = ani_with(3, 3, 10, None, None);
+        let err = a.step_at_second(1.0e30).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => {
+                assert!(msg.contains("beyond u64 range"), "{msg}");
+            }
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn step_at_second_inherits_zero_jiffy_rejection() {
+        // Delegates to step_at_jiffy → playback_steps; a zero-jiffy step
+        // poisons the table and the lookup must surface the same error.
+        let a = ani_with(2, 4, 10, None, Some(vec![5, 0, 5, 5]));
+        let err = a.step_at_second(0.1).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => {
+                assert!(msg.contains("step 1"), "{msg}");
+                assert!(msg.contains("0 jiffies"), "{msg}");
+            }
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn step_at_second_matches_step_at_jiffy_under_conversion() {
+        // Cross-check invariant: step_at_second(s) must equal
+        // step_at_jiffy(floor(s * 60)) for every in-cycle seconds offset.
+        // Catches accessor drift if the conversion ever changes shape.
+        let a = ani_with(
+            3,
+            5,
+            7,
+            Some(vec![0, 1, 2, 1, 0]),
+            Some(vec![4, 7, 2, 9, 11]),
+        );
+        let total = a.total_jiffies().unwrap();
+        // Probe a fine grid of seconds offsets across the whole cycle.
+        let mut j = 0u64;
+        while j < total {
+            let seconds = j as f64 / 60.0;
+            assert_eq!(
+                a.step_at_second(seconds).unwrap(),
+                a.step_at_jiffy(j).unwrap(),
+                "mismatch at jiffy {j} (seconds {seconds})"
+            );
+            j += 1;
+        }
+    }
+
+    #[test]
+    fn step_at_second_via_byte_parser_round_trip() {
+        // End-to-end: real ANI bytes → read_ani_raw → step_at_second.
+        // build_ani_with_seq: i_disp_rate = 10, no rate chunk, 4 steps.
+        // 4 steps × 10 jiffies = 40-jiffy cycle; step `i` covers
+        // `[10*i, 10*(i+1))` jiffies = `[i/6, (i+1)/6)` seconds.
+        let bytes = build_ani_with_seq(2, 4, &[0, 1, 1, 0]);
+        let parsed = read_ani_raw(&bytes).unwrap();
+        assert_eq!(parsed.step_at_second(0.0).unwrap(), 0);
+        assert_eq!(parsed.step_at_second(9.0 / 60.0).unwrap(), 0);
+        assert_eq!(parsed.step_at_second(10.0 / 60.0).unwrap(), 1);
+        assert_eq!(parsed.step_at_second(25.0 / 60.0).unwrap(), 2);
+        assert_eq!(parsed.step_at_second(39.0 / 60.0).unwrap(), 3);
+        // 40 jiffies = the exclusive cycle top — must reject.
+        assert!(parsed.step_at_second(40.0 / 60.0).is_err());
     }
 }

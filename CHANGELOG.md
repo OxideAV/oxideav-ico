@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `AniFile::step_at_second(seconds: f64) -> Result<usize>` — the
+  seconds-domain counterpart of `step_at_jiffy`, standing in the same
+  relation to it as `cycle_seconds` stands to `total_jiffies`. A
+  renderer driving playback from a seconds-based wall clock (clock-side
+  schedulers, video-clip timelines, UI that thinks in seconds rather
+  than 1/60-second jiffies) computes an elapsed-seconds offset into the
+  cycle and gets the active step directly, instead of re-deriving the
+  spec's 60-jiffies-per-second conversion and handing off to
+  `step_at_jiffy` by hand — the `60` literal is fixed in the function
+  name so it can't drift across call sites. Conversion is
+  `floor(seconds * 60)` jiffies: the floor is the correct rounding
+  direction for the half-open `[start, end)` step intervals
+  `step_at_jiffy` uses, since a fractional jiffy offset has not yet
+  crossed into the next whole-jiffy bucket, so a wall-clock instant
+  resolves to the step whose interval contains its whole-jiffy floor.
+  Rejects a non-finite or negative `seconds` (a wall-clock offset is
+  physically non-negative and finite; NaN in particular is load-bearing
+  to reject up front, since every `<` jiffy-boundary comparison against
+  a NaN-derived value is false and would otherwise misreport as a "past
+  total" error that hides the real caller bug), and a `seconds` so
+  large that `floor(seconds * 60)` exceeds `u64::MAX` (caught before the
+  `as u64` cast, which would otherwise saturate silently). Otherwise
+  delegates to `step_at_jiffy`, inheriting its full error contract (the
+  resolved jiffy offset `>= total_jiffies`, plus the `playback_steps`
+  rejections: `n_frames = 0`, mismatched `sequence` / `rates` length,
+  any zero-jiffy step, identity-fallback past `n_frames`). Eleven new
+  unit tests cover whole-second and sub-jiffy fractional bucketing, the
+  floor direction, `seconds = 0`, negative / NaN / +inf rejection, the
+  at-or-past-cycle-end rejection, the beyond-u64-jiffy-range rejection,
+  the inherited zero-jiffy rejection, a `step_at_second(s)` vs
+  `step_at_jiffy(floor(s * 60))` cross-check invariant over a fine grid,
+  and the byte-parser round-trip end-to-end.
 - `AniFile::step_at_jiffy(jiffy: u64) -> Result<usize>` — the
   wall-clock-to-step inverse a renderer driven by an elapsed-jiffy
   counter actually needs at every frame. Step `i` claims the
