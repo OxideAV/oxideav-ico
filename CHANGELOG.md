@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `AniInfo::title_str()` / `AniInfo::author_str()` — convenience
+  accessors that decode the raw `LIST 'INFO'` `INAM` / `IART` payload
+  bytes into a `String`. The bytes are interpreted as Latin-1 (every
+  byte `0x00..=0xFF` maps to `U+0000..=U+00FF`, so the decode is total
+  and can't fail on any input — Latin-1 is the lossless lower half of
+  the Windows-1252 charset these legacy cursor tools wrote). The
+  trailing NUL terminator plus any even-length padding NUL is trimmed
+  (`b"My Cursor\0"` → `"My Cursor"`), while interior NULs are preserved
+  as `U+0000` so a deliberately embedded NUL doesn't C-string-truncate
+  the value. A field that's absent returns `None`; a present-but-empty
+  (or all-NUL) field returns `Some("")` — the chunk *was* present, it
+  just carried no visible text. The raw `AniInfo::title` / `author`
+  `Option<Vec<u8>>` fields stay available for callers needing
+  byte-exact access or a different decoder (e.g. byte-exact
+  Windows-1252 punctuation). Seven new unit tests cover the
+  terminator / double-NUL-padding trim, the no-terminator-kept-verbatim
+  case, the empty-and-all-NUL → `Some("")` case, high-Latin-1 byte
+  decoding (`0xE9` → `é`, `0xFF` → `ÿ`), interior-NUL preservation, the
+  absent → `None` case, and the end-to-end byte-parser round-trip.
+
 - `AniFile::step_at_second(seconds: f64) -> Result<usize>` — the
   seconds-domain counterpart of `step_at_jiffy`, standing in the same
   relation to it as `cycle_seconds` stands to `total_jiffies`. A

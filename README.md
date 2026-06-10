@@ -194,6 +194,34 @@ and per-step jiffy durations), and a `LIST 'fram'` containing N
 `bfAttributes & AF_ICON` is set (the common case), or a raw
 headerless BMP otherwise.
 
+The `LIST 'INFO'` metadata is surfaced both raw and decoded. The
+`AniInfo::title` / `author` fields hold the verbatim `INAM` / `IART`
+payload bytes (terminator and padding included); `AniInfo::title_str()`
+/ `author_str()` decode those bytes to a `String` for the common case:
+
+```rust
+use oxideav_ico::read_ani_raw;
+
+let ani = read_ani_raw(&std::fs::read("cursor.ani")?)?;
+if let Some(title) = ani.info.title_str() {
+    println!("title: {title}");
+}
+if let Some(author) = ani.info.author_str() {
+    println!("author: {author}");
+}
+```
+
+The accessors interpret the payload as Latin-1 (every byte
+`0x00..=0xFF` maps to `U+0000..=U+00FF`, so the decode is total and
+never fails) and trim the trailing NUL terminator plus any even-length
+padding NUL these legacy cursor tools append — `b"My Cursor\0"` becomes
+`"My Cursor"`. Interior NULs are preserved (no C-string truncation at
+the first NUL), and a present-but-empty field decodes to `Some("")`
+rather than `None` (the chunk *was* there). Latin-1 is the lossless
+lower half of the Windows-1252 charset these tools actually wrote;
+callers needing byte-exact Windows-1252 punctuation keep the raw
+`Vec<u8>` field and run their own table.
+
 ```rust
 use oxideav_ico::{read_ani_raw, read_ico_raw};
 

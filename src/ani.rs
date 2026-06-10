@@ -110,6 +110,60 @@ pub struct AniInfo {
     pub author: Option<Vec<u8>>,
 }
 
+/// Decode a raw RIFF `INFO` string payload into a `String`.
+///
+/// The `INAM` / `IART` payloads are stored verbatim by the parser
+/// (including any trailing NUL the writer appended — RIFF `INFO`
+/// strings are conventionally NUL-terminated ZSTR, and several ANI
+/// encoders pad the value to an even length with a second NUL). The
+/// byte slice is interpreted as **Latin-1** (ISO-8859-1): every byte
+/// `0x00..=0xFF` maps to the identically-numbered Unicode scalar
+/// `U+0000..=U+00FF`. That mapping is total (it never fails on any
+/// input) and is the lossless lower half of Windows-1252, which is the
+/// charset these legacy cursor tools actually wrote — the only bytes
+/// where Windows-1252 and Latin-1 disagree are `0x80..=0x9F`, a range
+/// these short title / author strings effectively never use. Callers
+/// that need byte-exact Windows-1252 punctuation (smart quotes, the
+/// euro sign) keep the raw `Option<Vec<u8>>` field and run their own
+/// table; this accessor is the common-case convenience that turns a
+/// `b"My Cursor\0"` payload into a clean `"My Cursor"`.
+///
+/// Trailing NUL bytes are trimmed (a single terminator, plus any
+/// even-length padding NUL); interior NULs are preserved as `U+0000`
+/// so a deliberately embedded NUL isn't silently used to truncate the
+/// string. Returns `None` when the field was absent.
+fn decode_info_latin1(raw: Option<&Vec<u8>>) -> Option<String> {
+    raw.map(|bytes| {
+        // Strip trailing NUL terminator + padding only; keep interior
+        // NULs intact (don't C-string-truncate on the first NUL).
+        let end = bytes
+            .iter()
+            .rposition(|&b| b != 0)
+            .map_or(0, |last| last + 1);
+        bytes[..end].iter().map(|&b| b as char).collect()
+    })
+}
+
+impl AniInfo {
+    /// The animation title (`INAM`) decoded to a `String`, or `None`
+    /// when the chunk was absent.
+    ///
+    /// Decodes the raw bytes as Latin-1 and trims the trailing NUL
+    /// terminator / padding — see [`decode_info_latin1`] for the exact
+    /// charset rationale. The raw [`Self::title`] field stays available
+    /// for callers that need byte-exact access or a different decoder.
+    pub fn title_str(&self) -> Option<String> {
+        decode_info_latin1(self.title.as_ref())
+    }
+
+    /// The author (`IART`) decoded to a `String`, or `None` when the
+    /// chunk was absent. Same Latin-1 + trailing-NUL-trim semantics as
+    /// [`Self::title_str`].
+    pub fn author_str(&self) -> Option<String> {
+        decode_info_latin1(self.author.as_ref())
+    }
+}
+
 /// Parsed ANI file: header + optional metadata + frame payloads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AniFile {
@@ -1402,6 +1456,80 @@ mod tests {
         let parsed = read_ani_raw(&base).unwrap();
         assert_eq!(parsed.info.title.as_deref(), Some(inam_payload.as_slice()));
         assert_eq!(parsed.info.author.as_deref(), Some(iart_payload.as_slice()));
+        // The string accessors decode Latin-1 + trim the trailing NUL
+        // terminator the writer appended.
+        assert_eq!(parsed.info.title_str().as_deref(), Some("Title"));
+        assert_eq!(parsed.info.author_str().as_deref(), Some("Author"));
+    }
+
+    #[test]
+    fn info_str_accessors_none_when_absent() {
+        let info = AniInfo::default();
+        assert_eq!(info.title_str(), None);
+        assert_eq!(info.author_str(), None);
+    }
+
+    #[test]
+    fn info_str_trims_trailing_nul_terminator_and_padding() {
+        // A single terminator …
+        let one = AniInfo {
+            title: Some(b"Hi\0".to_vec()),
+            author: None,
+        };
+        assert_eq!(one.title_str().as_deref(), Some("Hi"));
+        // … and an even-length-pad double NUL both trim away.
+        let two = AniInfo {
+            title: Some(b"Hi\0\0".to_vec()),
+            author: None,
+        };
+        assert_eq!(two.title_str().as_deref(), Some("Hi"));
+    }
+
+    #[test]
+    fn info_str_no_terminator_is_kept_verbatim() {
+        // A payload with no trailing NUL is decoded as-is.
+        let info = AniInfo {
+            title: Some(b"NoNul".to_vec()),
+            author: None,
+        };
+        assert_eq!(info.title_str().as_deref(), Some("NoNul"));
+    }
+
+    #[test]
+    fn info_str_empty_payload_decodes_to_empty_string() {
+        // A present-but-empty field, or one that's all-NUL, decodes to
+        // the empty string (Some(""), not None — the chunk *was*
+        // present, it just carried no visible text).
+        let empty = AniInfo {
+            title: Some(Vec::new()),
+            author: Some(b"\0\0".to_vec()),
+        };
+        assert_eq!(empty.title_str().as_deref(), Some(""));
+        assert_eq!(empty.author_str().as_deref(), Some(""));
+    }
+
+    #[test]
+    fn info_str_decodes_high_latin1_bytes() {
+        // 0xE9 = 'é' in Latin-1 (U+00E9); 0xFF = 'ÿ' (U+00FF). The
+        // mapping is total — no byte can make the accessor fail.
+        let info = AniInfo {
+            title: Some(vec![b'c', b'a', b'f', 0xE9, 0]),
+            author: Some(vec![0xFF]),
+        };
+        assert_eq!(info.title_str().as_deref(), Some("caf\u{00E9}"));
+        assert_eq!(info.author_str().as_deref(), Some("\u{00FF}"));
+    }
+
+    #[test]
+    fn info_str_preserves_interior_nul() {
+        // An interior NUL is NOT a terminator — only trailing NULs are
+        // trimmed. The accessor must not C-string-truncate at the
+        // first NUL.
+        let info = AniInfo {
+            title: Some(b"a\0b\0".to_vec()),
+            author: None,
+        };
+        assert_eq!(info.title_str().as_deref(), Some("a\u{0000}b"));
     }
 
     #[test]
