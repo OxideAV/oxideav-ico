@@ -737,6 +737,219 @@ pub fn read_ani_raw(input: &[u8]) -> Result<AniFile> {
     })
 }
 
+/// Serialise an [`AniFile`] back into a RIFF/`ACON` byte stream that
+/// [`read_ani_raw`] parses back to an equal value.
+///
+/// This is the symmetric encoder counterpart to [`read_ani_raw`],
+/// standing in the same relation to it as [`crate::write_ico_raw`]
+/// does to [`crate::read_ico_raw`]: it emits the canonical chunk tree
+/// and mirrors the reader's strictness up front so a caller can never
+/// produce a file the reader would later reject. The output chunk order
+/// is the spec's canonical one — `anih`, then the optional `LIST 'INFO'`
+/// / `seq ` / `rate`, then `LIST 'fram'` — and odd-length payloads are
+/// RIFF-padded with one zero byte exactly as [`read_chunk`] expects.
+///
+/// The frame payload bytes ([`AniFile::frames`]) are written verbatim:
+/// this encoder does not look inside them, so a caller round-tripping a
+/// file parsed by [`read_ani_raw`] gets byte-identical `icon` bodies
+/// back. (Building the inner ICO/CUR resource is [`crate::write_ico_raw`]'s
+/// job; an ANI author assembles those frames first, then hands the
+/// `Vec<Vec<u8>>` here.)
+///
+/// Validation (rejects rather than emit an unreadable file):
+///
+/// * `header.n_frames` must equal `frames.len()` and be in
+///   `1..=`[`MAX_FRAMES_OR_STEPS`] — the `LIST 'fram'` carries exactly
+///   `n_frames` `icon` chunks, and a mismatch would fail the reader's
+///   frame-count cross-check.
+/// * `header.n_steps` must be `<=`[`MAX_FRAMES_OR_STEPS`].
+/// * `header.n_planes` ∈ `{0, 1}`; `i_width` / `i_height` ∈
+///   `{0} ∪ 1..=256`; `i_bit_count` ∈ `{0, 1, 4, 8, 16, 24, 32}` —
+///   the exact ranges [`parse_anih`] enforces.
+/// * Every frame payload is non-empty (a zero-length `icon` chunk
+///   carries no resource).
+/// * When `sequence` is `Some`, its length must equal the resolved
+///   step count (`n_steps`, or `n_frames` when `n_steps == 0`) and
+///   every index must be `< n_frames` — the reader bounds-checks both.
+/// * When `rates` is `Some`, its length must equal the resolved step
+///   count.
+pub fn write_ani_raw(ani: &AniFile) -> Result<Vec<u8>> {
+    let header = &ani.header;
+
+    // --- header field ranges (mirror parse_anih) -----------------------
+    if header.n_frames == 0 {
+        return Err(Error::invalid(
+            "ANI: write: header.n_frames = 0 (need at least one frame)",
+        ));
+    }
+    if header.n_frames > MAX_FRAMES_OR_STEPS {
+        return Err(Error::invalid(format!(
+            "ANI: write: header.n_frames {} exceeds sanity cap {}",
+            header.n_frames, MAX_FRAMES_OR_STEPS
+        )));
+    }
+    if header.n_steps > MAX_FRAMES_OR_STEPS {
+        return Err(Error::invalid(format!(
+            "ANI: write: header.n_steps {} exceeds sanity cap {}",
+            header.n_steps, MAX_FRAMES_OR_STEPS
+        )));
+    }
+    if header.n_planes > 1 {
+        return Err(Error::invalid(format!(
+            "ANI: write: header.n_planes = {} (must be 0 or 1)",
+            header.n_planes
+        )));
+    }
+    if header.i_width > 256 {
+        return Err(Error::invalid(format!(
+            "ANI: write: header.i_width = {} (must be 0 or 1..=256)",
+            header.i_width
+        )));
+    }
+    if header.i_height > 256 {
+        return Err(Error::invalid(format!(
+            "ANI: write: header.i_height = {} (must be 0 or 1..=256)",
+            header.i_height
+        )));
+    }
+    match header.i_bit_count {
+        0 | 1 | 4 | 8 | 16 | 24 | 32 => {}
+        n => {
+            return Err(Error::invalid(format!(
+                "ANI: write: header.i_bit_count = {n} (must be one of {{0, 1, 4, 8, 16, 24, 32}})"
+            )))
+        }
+    }
+
+    // --- frame count / payload sanity ----------------------------------
+    if ani.frames.len() != header.n_frames as usize {
+        return Err(Error::invalid(format!(
+            "ANI: write: frames.len() {} != header.n_frames {}",
+            ani.frames.len(),
+            header.n_frames
+        )));
+    }
+    for (i, frame) in ani.frames.iter().enumerate() {
+        if frame.is_empty() {
+            return Err(Error::invalid(format!(
+                "ANI: write: frame {i} payload is empty"
+            )));
+        }
+    }
+
+    // --- seq / rate length + range -------------------------------------
+    let step_count = ani.resolved_step_count() as usize;
+    if let Some(seq) = &ani.sequence {
+        if seq.len() != step_count {
+            return Err(Error::invalid(format!(
+                "ANI: write: sequence len {} != resolved step count {step_count}",
+                seq.len()
+            )));
+        }
+        for (i, &idx) in seq.iter().enumerate() {
+            if idx >= header.n_frames {
+                return Err(Error::invalid(format!(
+                    "ANI: write: seq[{i}] = {idx} out of range (n_frames = {})",
+                    header.n_frames
+                )));
+            }
+        }
+    }
+    if let Some(rates) = &ani.rates {
+        if rates.len() != step_count {
+            return Err(Error::invalid(format!(
+                "ANI: write: rates len {} != resolved step count {step_count}",
+                rates.len()
+            )));
+        }
+    }
+
+    // --- serialise -----------------------------------------------------
+    // The RIFF body: form-type 'ACON' followed by the child chunks.
+    let mut body: Vec<u8> = Vec::new();
+    body.extend_from_slice(b"ACON");
+
+    // anih — 36-byte fixed payload.
+    let mut anih_payload = [0u8; 36];
+    let put = |buf: &mut [u8; 36], o: usize, v: u32| {
+        buf[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    };
+    put(&mut anih_payload, 0, header.cb_size);
+    put(&mut anih_payload, 4, header.n_frames);
+    put(&mut anih_payload, 8, header.n_steps);
+    put(&mut anih_payload, 12, header.i_width);
+    put(&mut anih_payload, 16, header.i_height);
+    put(&mut anih_payload, 20, header.i_bit_count);
+    put(&mut anih_payload, 24, header.n_planes);
+    put(&mut anih_payload, 28, header.i_disp_rate);
+    put(&mut anih_payload, 32, header.bf_attributes);
+    push_chunk(&mut body, b"anih", &anih_payload);
+
+    // LIST 'INFO' — only when at least one of title / author is present.
+    if ani.info.title.is_some() || ani.info.author.is_some() {
+        let mut info_body: Vec<u8> = Vec::new();
+        info_body.extend_from_slice(b"INFO");
+        if let Some(title) = &ani.info.title {
+            push_chunk(&mut info_body, b"INAM", title);
+        }
+        if let Some(author) = &ani.info.author {
+            push_chunk(&mut info_body, b"IART", author);
+        }
+        push_chunk(&mut body, b"LIST", &info_body);
+    }
+
+    // seq ' (trailing space) — only when present.
+    if let Some(seq) = &ani.sequence {
+        let mut seq_payload = Vec::with_capacity(seq.len() * 4);
+        for &v in seq {
+            seq_payload.extend_from_slice(&v.to_le_bytes());
+        }
+        push_chunk(&mut body, b"seq ", &seq_payload);
+    }
+
+    // rate — only when present.
+    if let Some(rates) = &ani.rates {
+        let mut rate_payload = Vec::with_capacity(rates.len() * 4);
+        for &v in rates {
+            rate_payload.extend_from_slice(&v.to_le_bytes());
+        }
+        push_chunk(&mut body, b"rate", &rate_payload);
+    }
+
+    // LIST 'fram' { icon[0], … icon[n-1] }.
+    let mut fram_body: Vec<u8> = Vec::new();
+    fram_body.extend_from_slice(b"fram");
+    for frame in &ani.frames {
+        push_chunk(&mut fram_body, b"icon", frame);
+    }
+    push_chunk(&mut body, b"LIST", &fram_body);
+
+    // Outer RIFF wrapper. The declared size covers the form-type +
+    // child chunks (everything in `body`), matching read_ani_raw's
+    // `body_end = 8 + declared`.
+    let declared: u32 = body
+        .len()
+        .try_into()
+        .map_err(|_| Error::invalid("ANI: write: RIFF body exceeds u32 size"))?;
+    let mut out = Vec::with_capacity(8 + body.len());
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&declared.to_le_bytes());
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
+/// Append one RIFF chunk (`tag` + LE-`u32` length + `payload`, padded
+/// to even length with a single zero byte) to `buf`. Mirrors the
+/// padding rule [`read_chunk`] decodes on the way back in.
+fn push_chunk(buf: &mut Vec<u8>, tag: &[u8; 4], payload: &[u8]) {
+    buf.extend_from_slice(tag);
+    buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    buf.extend_from_slice(payload);
+    if payload.len() % 2 == 1 {
+        buf.push(0);
+    }
+}
+
 /// Read one RIFF chunk at `pos` (inside `[..end]`) — returns
 /// `(tag, payload, next_pos)` where `next_pos` already includes the
 /// padding byte that follows an odd-length payload.
@@ -2741,5 +2954,191 @@ mod tests {
         assert_eq!(parsed.step_at_second(39.0 / 60.0).unwrap(), 3);
         // 40 jiffies = the exclusive cycle top — must reject.
         assert!(parsed.step_at_second(40.0 / 60.0).is_err());
+    }
+
+    // -- write_ani_raw -----------------------------------------------------
+
+    #[test]
+    fn write_minimal_ani_round_trips() {
+        let original = build_minimal_ani(3, 3);
+        let parsed = read_ani_raw(&original).unwrap();
+        let written = write_ani_raw(&parsed).unwrap();
+        // Re-parse the encoder output — it must be an equal AniFile.
+        let reparsed = read_ani_raw(&written).unwrap();
+        assert_eq!(parsed, reparsed);
+        assert_eq!(reparsed.header.n_frames, 3);
+        assert_eq!(reparsed.frames.len(), 3);
+        // And the encoder output starts with a well-formed RIFF/ACON
+        // wrapper whose declared size matches the body length.
+        assert_eq!(&written[..4], b"RIFF");
+        assert_eq!(&written[8..12], b"ACON");
+        let declared =
+            u32::from_le_bytes([written[4], written[5], written[6], written[7]]) as usize;
+        assert_eq!(declared, written.len() - 8);
+    }
+
+    #[test]
+    fn write_ani_with_seq_round_trips() {
+        // build_ani_with_seq sets AF_ICON | AF_SEQUENCE and a `seq `
+        // chunk; round-tripping must preserve the out-of-order sequence.
+        let original = build_ani_with_seq(2, 4, &[0, 1, 1, 0]);
+        let parsed = read_ani_raw(&original).unwrap();
+        assert_eq!(parsed.sequence.as_deref(), Some(&[0u32, 1, 1, 0][..]));
+        let written = write_ani_raw(&parsed).unwrap();
+        let reparsed = read_ani_raw(&written).unwrap();
+        assert_eq!(parsed, reparsed);
+        assert_eq!(reparsed.sequence.as_deref(), Some(&[0u32, 1, 1, 0][..]));
+    }
+
+    #[test]
+    fn write_ani_preserves_info_seq_rate() {
+        // Hand-build an AniFile exercising every optional chunk, then
+        // assert a write → read cycle is value-stable.
+        let ani = AniFile {
+            header: AniHeader {
+                cb_size: 36,
+                n_frames: 2,
+                n_steps: 3,
+                i_width: 32,
+                i_height: 32,
+                i_bit_count: 32,
+                n_planes: 1,
+                i_disp_rate: 6,
+                bf_attributes: AF_ICON | AF_SEQUENCE,
+            },
+            info: AniInfo {
+                title: Some(b"My Cursor\0".to_vec()),
+                author: Some(b"OxideAV\0".to_vec()),
+            },
+            sequence: Some(vec![0, 1, 0]),
+            rates: Some(vec![5, 10, 15]),
+            frames: vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8, 9]],
+        };
+        let written = write_ani_raw(&ani).unwrap();
+        let reparsed = read_ani_raw(&written).unwrap();
+        assert_eq!(ani, reparsed);
+        // Sanity: the decoded INFO accessors survive the trip.
+        assert_eq!(reparsed.info.title_str().as_deref(), Some("My Cursor"));
+        assert_eq!(reparsed.info.author_str().as_deref(), Some("OxideAV"));
+        assert_eq!(reparsed.rates.as_deref(), Some(&[5u32, 10, 15][..]));
+    }
+
+    #[test]
+    fn write_pads_odd_length_frame_payload() {
+        // A 5-byte (odd) frame payload must be RIFF-padded with one
+        // zero byte; read_ani_raw strips it and yields the 5 bytes back.
+        let ani = AniFile {
+            header: AniHeader {
+                cb_size: 36,
+                n_frames: 1,
+                n_steps: 1,
+                i_width: 0,
+                i_height: 0,
+                i_bit_count: 0,
+                n_planes: 1,
+                i_disp_rate: 10,
+                bf_attributes: AF_ICON,
+            },
+            info: AniInfo::default(),
+            sequence: None,
+            rates: None,
+            frames: vec![vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE]],
+        };
+        let written = write_ani_raw(&ani).unwrap();
+        // Total length is even (RIFF body padded), and the file re-parses.
+        let reparsed = read_ani_raw(&written).unwrap();
+        assert_eq!(reparsed.frames, vec![vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE]]);
+    }
+
+    #[test]
+    fn write_omits_absent_optional_chunks() {
+        // No INFO / seq / rate present → those chunks must not appear in
+        // the output. We detect their absence by scanning the FOURCCs.
+        let parsed = read_ani_raw(&build_minimal_ani(2, 2)).unwrap();
+        assert!(parsed.info.title.is_none());
+        assert!(parsed.sequence.is_none());
+        assert!(parsed.rates.is_none());
+        let written = write_ani_raw(&parsed).unwrap();
+        // The only LIST is 'fram'; no INFO list-type, no seq /rate tags.
+        assert!(!contains_subslice(&written, b"INFO"));
+        assert!(!contains_subslice(&written, b"seq "));
+        assert!(!contains_subslice(&written, b"rate"));
+        assert!(contains_subslice(&written, b"fram"));
+    }
+
+    fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[test]
+    fn write_rejects_frame_count_mismatch() {
+        let mut parsed = read_ani_raw(&build_minimal_ani(3, 3)).unwrap();
+        // Drop a frame without updating the header → mismatch.
+        parsed.frames.pop();
+        let err = write_ani_raw(&parsed).unwrap_err();
+        assert!(err.to_string().contains("!= header.n_frames"));
+    }
+
+    #[test]
+    fn write_rejects_empty_frame_payload() {
+        let mut parsed = read_ani_raw(&build_minimal_ani(1, 1)).unwrap();
+        parsed.frames[0].clear();
+        let err = write_ani_raw(&parsed).unwrap_err();
+        assert!(err.to_string().contains("payload is empty"));
+    }
+
+    #[test]
+    fn write_rejects_out_of_range_seq_index() {
+        let mut parsed = read_ani_raw(&build_ani_with_seq(2, 4, &[0, 1, 1, 0])).unwrap();
+        // Point a step at a non-existent frame 5 (n_frames = 2).
+        parsed.sequence.as_mut().unwrap()[2] = 5;
+        let err = write_ani_raw(&parsed).unwrap_err();
+        assert!(err.to_string().contains("out of range"));
+    }
+
+    #[test]
+    fn write_rejects_seq_length_mismatch() {
+        let mut parsed = read_ani_raw(&build_ani_with_seq(2, 4, &[0, 1, 1, 0])).unwrap();
+        // n_steps = 4 but only 3 sequence entries.
+        parsed.sequence = Some(vec![0, 1, 0]);
+        let err = write_ani_raw(&parsed).unwrap_err();
+        assert!(err.to_string().contains("sequence len"));
+    }
+
+    #[test]
+    fn write_rejects_rate_length_mismatch() {
+        let mut parsed = read_ani_raw(&build_minimal_ani(2, 2)).unwrap();
+        parsed.rates = Some(vec![5, 10, 15]); // 3 != resolved step count 2
+        let err = write_ani_raw(&parsed).unwrap_err();
+        assert!(err.to_string().contains("rates len"));
+    }
+
+    #[test]
+    fn write_rejects_bad_header_ranges() {
+        let base = read_ani_raw(&build_minimal_ani(1, 1)).unwrap();
+
+        let mut planes = base.clone();
+        planes.header.n_planes = 2;
+        assert!(write_ani_raw(&planes).is_err());
+
+        let mut width = base.clone();
+        width.header.i_width = 300;
+        assert!(write_ani_raw(&width).is_err());
+
+        let mut depth = base;
+        depth.header.i_bit_count = 7;
+        assert!(write_ani_raw(&depth).is_err());
+    }
+
+    #[test]
+    fn write_resolved_step_count_uses_n_frames_when_n_steps_zero() {
+        // n_steps = 0 → resolved step count falls back to n_frames (2).
+        // A 2-entry rate table must therefore be accepted.
+        let mut parsed = read_ani_raw(&build_minimal_ani(2, 0)).unwrap();
+        assert_eq!(parsed.resolved_step_count(), 2);
+        parsed.rates = Some(vec![7, 9]);
+        let written = write_ani_raw(&parsed).unwrap();
+        let reparsed = read_ani_raw(&written).unwrap();
+        assert_eq!(reparsed.rates.as_deref(), Some(&[7u32, 9][..]));
     }
 }

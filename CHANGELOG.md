@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `write_ani_raw(&AniFile) -> Result<Vec<u8>>` — the symmetric ANI
+  encoder, the container-level counterpart to `write_ico_raw`. Serialises
+  an `AniFile` back into a RIFF/`ACON` byte stream that `read_ani_raw`
+  parses to an equal value: emits the spec's canonical chunk order
+  (`anih`, then optional `LIST 'INFO'` / `seq ` / `rate`, then
+  `LIST 'fram'`), RIFF-pads odd-length payloads with one zero byte, and
+  writes each frame's `icon` body verbatim (this layer never looks inside
+  a frame payload — the caller builds each inner ICO/CUR resource with
+  `write_ico_raw` first). Mirrors the reader's strictness up front so the
+  output can never be a file the reader would reject: `header.n_frames`
+  must equal `frames.len()` and sit in `1..=65_536`; `n_steps <= 65_536`;
+  `n_planes ∈ {0, 1}`; `i_width` / `i_height ∈ {0} ∪ 1..=256`;
+  `i_bit_count ∈ {0, 1, 4, 8, 16, 24, 32}`; every frame payload non-empty;
+  a present `sequence` / `rates` array must match the resolved step count
+  (`n_steps`, or `n_frames` when `n_steps == 0`) and every `sequence`
+  index must be `< n_frames`. Absent optional chunks are omitted entirely
+  (no empty `LIST 'INFO'` / `seq ` / `rate`). Exported from the always-on
+  standalone surface (no `registry` feature needed). Thirteen new unit
+  tests cover the minimal / seq / full-INFO+seq+rate round-trips, odd
+  payload padding, absent-chunk omission, the `n_steps == 0` step-count
+  fallback, and each rejection path (frame-count mismatch, empty frame,
+  out-of-range / mismatched-length `seq `, mismatched-length `rate`, and
+  bad `n_planes` / `i_width` / `i_bit_count` header ranges).
+
 - `AniInfo::title_str()` / `AniInfo::author_str()` — convenience
   accessors that decode the raw `LIST 'INFO'` `INAM` / `IART` payload
   bytes into a `String`. The bytes are interpreted as Latin-1 (every

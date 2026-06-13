@@ -370,6 +370,31 @@ misreport as a "past total" error), as is a `seconds` so large that
 cast, which would otherwise saturate silently). Otherwise it delegates
 to `step_at_jiffy`, inheriting its full error contract verbatim.
 
+`write_ani_raw` is the symmetric encoder — the ANI-side counterpart
+to `write_ico_raw`. It serialises an `AniFile` back into a RIFF/`ACON`
+byte stream that `read_ani_raw` parses to an equal value, emitting the
+spec's canonical chunk order (`anih`, then optional `LIST 'INFO'` /
+`seq ` / `rate`, then `LIST 'fram'`) and RIFF-padding odd-length
+payloads with one zero byte. Frame payload bytes are written verbatim
+(this layer never looks inside an `icon` body — the caller assembles
+each ICO/CUR resource with `write_ico_raw` first). It mirrors the
+reader's strictness up front so a caller can never produce a file the
+reader would later reject: `n_frames` must equal `frames.len()` and
+sit in `1..=65_536`; `n_planes ∈ {0, 1}`; `i_width` / `i_height ∈
+{0} ∪ 1..=256`; `i_bit_count ∈ {0, 1, 4, 8, 16, 24, 32}`; every frame
+payload non-empty; and a present `seq ` / `rate` array must match the
+resolved step count (`n_steps`, or `n_frames` when `n_steps == 0`)
+with every `seq ` index `< n_frames`. Absent optional chunks are
+omitted entirely (no empty `LIST 'INFO'` / `seq ` / `rate`).
+
+```rust
+use oxideav_ico::{read_ani_raw, write_ani_raw};
+
+let ani = read_ani_raw(&std::fs::read("cursor.ani")?)?;
+let bytes = write_ani_raw(&ani)?;        // value-stable round-trip
+assert_eq!(read_ani_raw(&bytes)?, ani);
+```
+
 The parser is hardened against the usual cursor-file CVE surface:
 truncated declared RIFF size, missing or out-of-order `anih`,
 oversized `nFrames` (capped at 65_536 to bound allocator pressure),
