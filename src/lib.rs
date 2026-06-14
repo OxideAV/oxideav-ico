@@ -73,7 +73,7 @@ pub use types::{
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "registry")]
-pub use reader::read_ico;
+pub use reader::{read_ani, read_ico, AniAnimation, AniFrame};
 #[cfg(feature = "registry")]
 pub use registry::{register, register_codecs, register_containers};
 #[cfg(feature = "registry")]

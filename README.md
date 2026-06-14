@@ -194,6 +194,45 @@ and per-step jiffy durations), and a `LIST 'fram'` containing N
 `bfAttributes & AF_ICON` is set (the common case), or a raw
 headerless BMP otherwise.
 
+### Decoded playback (`read_ani`)
+
+`read_ani` is the ANI-side counterpart of `read_ico`: where `read_ico`
+decodes one icon resource's sub-images to RGBA, `read_ani` decodes a
+whole animation — every stored frame's sub-images **and** the resolved
+playback timeline — in one call.
+
+```rust
+use oxideav_ico::read_ani;
+
+let anim = read_ani(&std::fs::read("cursor.ani")?)?;
+if let Some(title) = anim.info.title_str() {
+    println!("title: {title}");
+}
+// Drive the animation loop straight off the resolved step table.
+for step in &anim.steps {
+    let frame = &anim.frames[step.frame_index as usize];
+    let largest = &frame.images[frame.images.len() - 1];
+    println!(
+        "show {}x{} ({:?}) for {} jiffies",
+        largest.width, largest.height, frame.icon_type, step.jiffies
+    );
+}
+```
+
+It walks the RIFF/`ACON` tree (via `read_ani_raw`), decodes each
+`LIST 'fram'` `icon` frame to RGBA (via `read_ico` — each frame is a
+complete ICO/CUR resource, so it may itself carry several resolutions,
+grouped per frame in `AniFrame { icon_type, images }`), and resolves
+the `seq ` / `rate` chunks into the same flat `Vec<AniStep>` timeline
+`AniFile::playback_steps` produces — every `frame_index` guaranteed in
+range for `AniAnimation::frames`. The timeline is resolved *before* the
+frame decode, so the seq/rate validation surfaces ahead of any pixel
+work. Only the common `AF_ICON`-set path is decodable here (each frame
+carries its own ICO directory); an `AF_ICON`-clear file (headerless raw
+BMP frames) is rejected with an error pointing at `raw_bmp_descriptor`
++ a BMP-DIB decoder — that path has no ICO directory to walk. Gated
+behind the default-on `registry` feature, alongside `read_ico`.
+
 The `LIST 'INFO'` metadata is surfaced both raw and decoded. The
 `AniInfo::title` / `author` fields hold the verbatim `INAM` / `IART`
 payload bytes (terminator and padding included); `AniInfo::title_str()`

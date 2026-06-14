@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `read_ani(&[u8]) -> Result<AniAnimation>` — fully decode an ANI animated
+  cursor: every stored frame's sub-images decoded to RGBA *and* the
+  `seq ` / `rate` timeline resolved into a flat playback step table. This
+  is the ANI-side counterpart of `read_ico` (which decodes one icon
+  resource's sub-images). It walks the RIFF/`ACON` tree via
+  `read_ani_raw`, decodes each `LIST 'fram'` `icon` frame via `read_ico`
+  (each frame is a complete ICO/CUR resource, so it may carry several
+  resolutions — grouped per frame in the new `AniFrame { icon_type,
+  images }`), and resolves timing via `AniFile::playback_steps`. The
+  returned `AniAnimation { info, frames, steps }` exposes the INFO
+  metadata, the decoded frames, and the resolved `Vec<AniStep>` whose
+  every `frame_index` is guaranteed in range for `frames`. Only the
+  common `AF_ICON`-set path is decodable (each frame has its own ICO
+  directory); an `AF_ICON`-clear file (headerless raw BMP frames) is
+  rejected with an error directing the caller to
+  `AniFile::raw_bmp_descriptor` + a BMP-DIB decoder. Exported behind the
+  default-on `registry` feature alongside `read_ico` (it reuses the same
+  BMP/PNG sub-image decode path). Truth from
+  `docs/image/ico/ani-acon-format.md`. Four new unit tests cover the
+  identity timeline, the `seq ` + `rate` + INFO path, `AF_ICON`-clear
+  rejection, and non-ANI input rejection.
+
 - `AniFile::raw_bmp_descriptor() -> Result<Option<RawBmpDescriptor>>` —
   resolves the spec's `AF_ICON`-clear (raw-image) ANI path. When
   `bfAttributes & AF_ICON` is clear, each `LIST 'fram'` `icon` chunk holds
