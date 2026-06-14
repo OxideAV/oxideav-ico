@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/OxideAV/oxideav-ico/compare/v0.0.6...v0.0.7) - 2026-06-14
+
+### Other
+
+- AniAnimation wall-clock accessors (total_jiffies/cycle_seconds/step_at_*)
+- add read_ani decoded-animation path (frames→RGBA + resolved seq/rate timeline)
+- AniFile::raw_bmp_descriptor for AF_ICON-clear (headerless-BMP) frames
+- add write_ani_raw — symmetric RIFF/ACON encoder
+- add AniInfo::title_str / author_str Latin-1 INFO decoders
+- typed step_at_second() seconds-domain step lookup
+- typed step_at_jiffy() wall-clock-to-step lookup
+- typed cycle_seconds() wall-clock accessor
+- range-check anih.iWidth / iHeight / iBitCount advisory fields
+- drop release-plz.toml — use release-plz defaults across the workspace
+- typed total_jiffies() cycle-length accessor
+- reject anih.nPlanes > 1 per ACON spec
+- typed playback_steps() accessor — resolved seq/rate/iDispRate table
+- cross-check directory wBitCount vs body biBitCount (ICO+BMP)
+- reject BMP body biSize outside {40, 108, 124}
+- reject BMP body biCompression outside {BI_RGB, BI_BITFIELDS}
+- reject BMP body biPlanes outside {0,1}
+- reject directory-vs-body sub-image dim mismatch
+- bounds-check seq[] step indices against nFrames
+- reject BMP body biBitCount outside {0,1,4,8,16,24,32}
+- standalone read_ani_raw RIFF/ACON parser + 19 unit tests
+
 ### Added
 
 - `AniAnimation::total_jiffies()` / `cycle_seconds()` / `step_at_jiffy(u64)` /
