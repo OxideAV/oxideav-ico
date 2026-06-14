@@ -227,7 +227,21 @@ the `seq ` / `rate` chunks into the same flat `Vec<AniStep>` timeline
 `AniFile::playback_steps` produces — every `frame_index` guaranteed in
 range for `AniAnimation::frames`. The timeline is resolved *before* the
 frame decode, so the seq/rate validation surfaces ahead of any pixel
-work. Only the common `AF_ICON`-set path is decodable here (each frame
+work.
+
+`AniAnimation` also carries the same wall-clock helpers `AniFile` does,
+computed straight off its already-resolved `steps` table (no re-running
+the defaulting rules): `total_jiffies()` (cycle length in 1/60-second
+jiffies), `cycle_seconds()` (the same in wall-clock seconds),
+`step_at_jiffy(jiffy)` and `step_at_second(seconds)` (the inverse
+lookup — "which step is on screen at this offset into the cycle?"). A
+renderer driving the decoded RGBA frames gets cycle length and the
+active step without going back to the raw `AniFile`. Interval semantics
+match `AniFile::step_at_jiffy` exactly: step `i` owns the half-open
+`[start_i, start_i + jiffies)` interval, a boundary jiffy lands on the
+next step, and a `jiffy >= total` (or non-finite / negative `seconds`)
+is rejected rather than silently clamped — the caller applies
+`offset % cycle` before the lookup. Only the common `AF_ICON`-set path is decodable here (each frame
 carries its own ICO directory); an `AF_ICON`-clear file (headerless raw
 BMP frames) is rejected with an error pointing at `raw_bmp_descriptor`
 + a BMP-DIB decoder — that path has no ICO directory to walk. Gated

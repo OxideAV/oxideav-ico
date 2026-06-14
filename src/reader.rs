@@ -112,6 +112,153 @@ pub struct AniAnimation {
     pub steps: Vec<AniStep>,
 }
 
+impl AniAnimation {
+    /// Total animation cycle length in 1/60-second jiffies — the sum of
+    /// every resolved step's `jiffies`.
+    ///
+    /// This is the decoded-animation counterpart of
+    /// [`crate::AniFile::total_jiffies`]. The difference: an
+    /// [`AniAnimation`] already holds a fully-resolved [`Self::steps`]
+    /// table (the `seq ` / `rate` / `iDispRate` defaulting was applied
+    /// when [`read_ani`] built it, and every step's `jiffies` is
+    /// guaranteed non-zero by that resolution), so this accessor is a
+    /// straight sum over `steps` rather than a re-derivation of the
+    /// defaulting rules. A renderer driving the decoded RGBA frames gets
+    /// the cycle length without going back to the raw [`crate::AniFile`].
+    ///
+    /// The `u32 → u64` widening matches [`crate::AniFile::total_jiffies`]:
+    /// a worst-case file (the 65_536-step cap × `u32::MAX` per-step rate)
+    /// sums to roughly `2.8e14`, which exceeds `u32::MAX` by a factor of
+    /// 65_536. `steps` is non-empty for any animation [`read_ani`]
+    /// produces (the parser rejects a zero-frame file), so the sum is
+    /// always `>= 1`.
+    pub fn total_jiffies(&self) -> u64 {
+        // Each `step.jiffies` is at most u32::MAX and the step count is
+        // bounded by the parser's 65_536 cap, so the u64 sum has 14+ bits
+        // of headroom — no `checked_add` needed.
+        self.steps.iter().map(|s| s.jiffies as u64).sum()
+    }
+
+    /// Total animation cycle length in wall-clock seconds — the
+    /// [`Self::total_jiffies`] result divided by the spec's
+    /// 60-jiffies-per-second conversion factor.
+    ///
+    /// The decoded-animation counterpart of
+    /// [`crate::AniFile::cycle_seconds`]: it folds the spec's "1 jiffy =
+    /// 1/60 of a second" conversion into the type system so a renderer
+    /// wiring the cycle length into clock-side scheduling (sleep timers,
+    /// video-clip lengths, "1.5 s loop" UI labels) keeps the `60` literal
+    /// out of its own call sites.
+    ///
+    /// Exact in `f64` for every animation [`read_ani`] can produce: the
+    /// worst-case ~`2.8e14` jiffies (see [`Self::total_jiffies`]) sits
+    /// well under `f64`'s `2^53 ≈ 9.0e15` integer-precision boundary.
+    pub fn cycle_seconds(&self) -> f64 {
+        // Spec: 1 second = 60 jiffies. The `as f64` widening is exact for
+        // the parser's bounded input range (see the precision argument on
+        // `total_jiffies`).
+        self.total_jiffies() as f64 / 60.0
+    }
+
+    /// Locate the playback step active at a given jiffy offset into one
+    /// animation cycle. Returns the step index, suitable as a subscript
+    /// into [`Self::steps`].
+    ///
+    /// The decoded-animation counterpart of
+    /// [`crate::AniFile::step_at_jiffy`], with identical interval
+    /// semantics: step `i` claims the half-open jiffy interval
+    /// `[start_i, start_i + step.jiffies)` where `start_i` is the
+    /// cumulative sum of every preceding step's duration. A `jiffy`
+    /// exactly equal to a step boundary lands on the next step (the
+    /// spec's "show frame, then advance" edge rule).
+    ///
+    /// `jiffy` is expected to be the elapsed offset **inside one cycle**;
+    /// the caller applies `jiffy % total_jiffies` before the lookup
+    /// (looping is a renderer concern, not the accessor's). The `u64`
+    /// parameter type matches [`Self::total_jiffies`]'s return type so a
+    /// cycle longer than `u32::MAX` jiffies needs no caller pre-truncation.
+    ///
+    /// Errors when `jiffy >= total_jiffies` — the elapsed offset has
+    /// wrapped past the end of one cycle (the caller forgot to modulo, or
+    /// a wall-clock counter drifted). Surfacing an error rather than
+    /// silently clamping to the last step catches the renderer bug at its
+    /// source, matching [`crate::AniFile::step_at_jiffy`].
+    pub fn step_at_jiffy(&self, jiffy: u64) -> Result<usize> {
+        // `steps` is non-empty for any AniAnimation read_ani produces:
+        // the parser rejects a zero-frame file and the resolved step
+        // count never falls below 1 once there is at least one frame.
+        let mut cumulative: u64 = 0;
+        for (i, step) in self.steps.iter().enumerate() {
+            // Compare against the exclusive upper bound so step `i` owns
+            // `[start, end)` and `jiffy == end` flips cleanly to step
+            // `i+1`. u64 accumulation can't overflow on parser-accepted
+            // input (worst case ~2.8e14; see `total_jiffies`).
+            cumulative += step.jiffies as u64;
+            if jiffy < cumulative {
+                return Ok(i);
+            }
+        }
+        // Fell off the end — `jiffy >= total_jiffies`. `cumulative` is now
+        // the full cycle length, so reuse it in the message (no second
+        // `total_jiffies` pass).
+        Err(Error::invalid(format!(
+            "ANI: step_at_jiffy: jiffy {jiffy} >= total cycle length {cumulative} \
+             (caller must apply modulo `jiffy % total_jiffies` before lookup)"
+        )))
+    }
+
+    /// Locate the playback step active at a given wall-clock **seconds**
+    /// offset into one animation cycle — the seconds-domain counterpart
+    /// of [`Self::step_at_jiffy`], standing in the same relation to it as
+    /// [`Self::cycle_seconds`] stands to [`Self::total_jiffies`].
+    ///
+    /// The decoded-animation counterpart of
+    /// [`crate::AniFile::step_at_second`]. A renderer driving playback
+    /// from a seconds-based wall clock gets the active step directly
+    /// instead of re-deriving the spec's 60-jiffies-per-second conversion
+    /// and handing off to [`Self::step_at_jiffy`] by hand — the `60`
+    /// literal is fixed in the function name so it can't drift across
+    /// call sites.
+    ///
+    /// Conversion is `floor(seconds * 60)` jiffies: the floor is the
+    /// correct direction for the half-open `[start, end)` step intervals,
+    /// since a fractional jiffy offset has not yet crossed into the next
+    /// whole-jiffy bucket.
+    ///
+    /// Errors:
+    ///
+    /// * `seconds` is negative, NaN, or infinite — a wall-clock offset is
+    ///   physically non-negative and finite (NaN especially must be
+    ///   caught: every `<` boundary comparison against a NaN-derived jiffy
+    ///   is false, so it would otherwise walk off the end and misreport as
+    ///   a "past total" error).
+    /// * `floor(seconds * 60)` exceeds `u64::MAX` — caught before the
+    ///   `as u64` cast, which would otherwise saturate silently.
+    /// * Everything [`Self::step_at_jiffy`] rejects (resolved jiffy offset
+    ///   `>= total_jiffies`).
+    pub fn step_at_second(&self, seconds: f64) -> Result<usize> {
+        // A wall-clock offset must be finite and non-negative. NaN is
+        // load-bearing to reject up front (see `step_at_jiffy`'s `<`
+        // comparison behaviour against a NaN-derived jiffy).
+        if !seconds.is_finite() || seconds < 0.0 {
+            return Err(Error::invalid(format!(
+                "ANI: step_at_second: seconds {seconds} is not a finite, \
+                 non-negative wall-clock offset"
+            )));
+        }
+        // Spec: 1 second = 60 jiffies. Floor maps a wall-clock instant to
+        // the step whose interval contains its whole-jiffy floor.
+        let jiffies_f = (seconds * 60.0).floor();
+        if jiffies_f > u64::MAX as f64 {
+            return Err(Error::invalid(format!(
+                "ANI: step_at_second: seconds {seconds} converts to a jiffy \
+                 offset beyond u64 range"
+            )));
+        }
+        self.step_at_jiffy(jiffies_f as u64)
+    }
+}
+
 /// Parse and fully decode an ANI animated-cursor byte stream.
 ///
 /// Walks the RIFF/`ACON` tree (via [`read_ani_raw`]), decodes every
@@ -337,5 +484,91 @@ mod tests {
         // A plain ICO file is not a RIFF/ACON stream.
         let ico = ico_frame(8, [9, 9, 9, 255]);
         assert!(read_ani(&ico).is_err());
+    }
+
+    #[test]
+    fn animation_total_and_cycle_seconds_from_resolved_steps() {
+        let a = ico_frame(8, [1, 2, 3, 255]);
+        let b = ico_frame(8, [4, 5, 6, 255]);
+        // 4 steps, durations 5,6,7,8 → 26 jiffies total, 26/60 s.
+        let ani = build_ani(
+            &[a, b],
+            4,
+            10,
+            Some(&[0, 1, 1, 0]),
+            Some(&[5, 6, 7, 8]),
+            None,
+        );
+        let anim = read_ani(&ani).unwrap();
+        assert_eq!(anim.total_jiffies(), 26);
+        assert!((anim.cycle_seconds() - 26.0 / 60.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn animation_identity_timeline_total() {
+        let red = ico_frame(8, [200, 10, 10, 255]);
+        let green = ico_frame(8, [10, 200, 10, 255]);
+        // No seq / rate → identity timeline, iDispRate (12) per step.
+        let ani = build_ani(&[red, green], 0, 12, None, None, None);
+        let anim = read_ani(&ani).unwrap();
+        assert_eq!(anim.total_jiffies(), 24);
+        assert!((anim.cycle_seconds() - 24.0 / 60.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn animation_step_at_jiffy_interval_boundaries() {
+        let a = ico_frame(8, [1, 2, 3, 255]);
+        let b = ico_frame(8, [4, 5, 6, 255]);
+        // Durations 5,6,7,8 → cumulative boundaries 5,11,18,26.
+        let ani = build_ani(
+            &[a, b],
+            4,
+            10,
+            Some(&[0, 1, 1, 0]),
+            Some(&[5, 6, 7, 8]),
+            None,
+        );
+        let anim = read_ani(&ani).unwrap();
+        // Step 0 owns [0,5), step 1 [5,11), step 2 [11,18), step 3 [18,26).
+        assert_eq!(anim.step_at_jiffy(0).unwrap(), 0);
+        assert_eq!(anim.step_at_jiffy(4).unwrap(), 0);
+        // Boundary lands on the next step ("show frame, then advance").
+        assert_eq!(anim.step_at_jiffy(5).unwrap(), 1);
+        assert_eq!(anim.step_at_jiffy(10).unwrap(), 1);
+        assert_eq!(anim.step_at_jiffy(11).unwrap(), 2);
+        assert_eq!(anim.step_at_jiffy(17).unwrap(), 2);
+        assert_eq!(anim.step_at_jiffy(18).unwrap(), 3);
+        assert_eq!(anim.step_at_jiffy(25).unwrap(), 3);
+        // jiffy == total and beyond are rejected (caller forgot modulo).
+        let err = anim.step_at_jiffy(26).unwrap_err().to_string();
+        assert!(err.contains("total cycle length 26"), "{err}");
+        assert!(anim.step_at_jiffy(1000).is_err());
+    }
+
+    #[test]
+    fn animation_step_at_second_floor_and_rejections() {
+        let a = ico_frame(8, [1, 2, 3, 255]);
+        let b = ico_frame(8, [4, 5, 6, 255]);
+        let ani = build_ani(
+            &[a, b],
+            4,
+            10,
+            Some(&[0, 1, 1, 0]),
+            Some(&[5, 6, 7, 8]),
+            None,
+        );
+        let anim = read_ani(&ani).unwrap();
+        // floor(0.0*60)=0 → step 0; floor(5/60*60)=5 → step 1 (boundary);
+        // floor(4.9/60*60)=4 → step 0.
+        assert_eq!(anim.step_at_second(0.0).unwrap(), 0);
+        assert_eq!(anim.step_at_second(5.0 / 60.0).unwrap(), 1);
+        assert_eq!(anim.step_at_second(4.9 / 60.0).unwrap(), 0);
+        assert_eq!(anim.step_at_second(18.0 / 60.0).unwrap(), 3);
+        // Non-finite / negative are rejected.
+        assert!(anim.step_at_second(-0.1).is_err());
+        assert!(anim.step_at_second(f64::NAN).is_err());
+        assert!(anim.step_at_second(f64::INFINITY).is_err());
+        // Past the cycle end delegates to step_at_jiffy's rejection.
+        assert!(anim.step_at_second(26.0 / 60.0).is_err());
     }
 }

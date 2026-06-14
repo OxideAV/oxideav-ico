@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `AniAnimation::total_jiffies()` / `cycle_seconds()` / `step_at_jiffy(u64)` /
+  `step_at_second(f64)` — the decoded-animation counterparts of the existing
+  `AniFile` timeline accessors. An `AniAnimation` already holds a fully
+  resolved `steps: Vec<AniStep>` table (the `seq ` / `rate` / `iDispRate`
+  defaulting was applied when `read_ani` built it, and every step's `jiffies`
+  is guaranteed non-zero), so these are a straight sum / cumulative-interval
+  walk over `steps` rather than a re-derivation of the defaulting rules — a
+  renderer driving the decoded RGBA frames gets cycle length and
+  wall-clock→step lookup without going back to the raw `AniFile`. Interval
+  semantics match `AniFile::step_at_jiffy` exactly (half-open
+  `[start, start + jiffies)`, boundary lands on the next step;
+  `jiffy >= total` and non-finite / negative `seconds` rejected). Truth from
+  `docs/image/ico/ani-acon-format.md` (1 jiffy = 1/60 s). Four new unit tests
+  cover the identity-timeline total, the `seq ` + `rate` total / seconds,
+  step-interval boundaries, and the `step_at_second` floor + rejection paths.
+
 - `read_ani(&[u8]) -> Result<AniAnimation>` — fully decode an ANI animated
   cursor: every stored frame's sub-images decoded to RGBA *and* the
   `seq ` / `rate` timeline resolved into a flat playback step table. This
