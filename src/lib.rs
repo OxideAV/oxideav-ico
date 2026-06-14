@@ -58,7 +58,8 @@ pub const CODEC_ID_STR: &str = "ico";
 // ---------------------------------------------------------------------------
 
 pub use ani::{
-    read_ani_raw, write_ani_raw, AniFile, AniHeader, AniInfo, AniStep, AF_ICON, AF_SEQUENCE,
+    read_ani_raw, write_ani_raw, AniFile, AniHeader, AniInfo, AniStep, RawBmpDescriptor, AF_ICON,
+    AF_SEQUENCE,
 };
 pub use error::{IcoError, Result};
 pub use raw::{read_ico_raw, write_ico_raw, IconEntryRaw};

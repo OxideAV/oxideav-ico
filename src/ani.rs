@@ -207,7 +207,103 @@ pub struct AniStep {
     pub jiffies: u32,
 }
 
+/// The per-frame BMP descriptor for the `AF_ICON`-clear (raw-image)
+/// ANI path — the four `anih` fields a caller needs to decode the
+/// headerless BMP bytes stored in each `LIST 'fram'` `icon` chunk.
+///
+/// When `bfAttributes & AF_ICON` is **clear**, the spec
+/// (`docs/image/ico/ani-acon-format.md` §bfAttributes; the daubnet
+/// ACON reference) defines each frame as a raw BMP **stored without its
+/// header**, decoded using the animation-header `iWidth` / `iHeight` /
+/// `iBitCount` / `nPlanes`. There is no per-frame `BITMAPINFOHEADER`
+/// to read those dimensions from — the frame bytes are pure pixel data
+/// — so the `anih` fields are the *only* source of the geometry, and a
+/// caller cannot interpret a raw frame without them. This descriptor
+/// surfaces exactly those fields, already validated to be usable.
+///
+/// The icon/cursor path (`AF_ICON` set, the common case) does not use
+/// this: each frame there is a complete ICO/CUR resource whose own
+/// `ICONDIRENTRY` + DIB header carry the geometry, so
+/// [`AniFile::raw_bmp_descriptor`] returns `None` for that case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawBmpDescriptor {
+    /// `anih.iWidth` — pixel width of every raw frame. Guaranteed
+    /// non-zero (the spec's `0` = "take from frame" sentinel is
+    /// meaningless here — there is no frame header to take it from).
+    pub width: u32,
+    /// `anih.iHeight` — pixel height of every raw frame. Guaranteed
+    /// non-zero, same rationale as `width`.
+    pub height: u32,
+    /// `anih.iBitCount` — bits per pixel of every raw frame.
+    /// Guaranteed non-zero and one of `{1, 4, 8, 16, 24, 32}`.
+    pub bit_count: u32,
+    /// `anih.nPlanes` — colour-plane count. Guaranteed `1` (the
+    /// canonical BMP value; the parser tolerates `0` in the header as
+    /// the wider-ecosystem "unspecified" sentinel and this accessor
+    /// normalises it to `1`).
+    pub planes: u32,
+}
+
 impl AniFile {
+    /// The raw-BMP frame geometry for the `AF_ICON`-clear path, or
+    /// `None` when frames are ICO/CUR resources (`AF_ICON` set).
+    ///
+    /// Per the ACON spec, an `AF_ICON`-clear file stores each frame as
+    /// a headerless BMP whose width / height / bit-depth / plane count
+    /// live in `anih` (not in the frame bytes, which are pure pixel
+    /// data). A caller decoding such frames needs those four fields up
+    /// front; this accessor returns them as a validated
+    /// [`RawBmpDescriptor`].
+    ///
+    /// Returns `Ok(None)` when [`AniHeader::frames_are_icons`] is
+    /// `true` — that path's geometry comes from each frame's own
+    /// ICO/CUR + DIB headers, so the `anih` advisory fields are not
+    /// authoritative and this descriptor would be misleading.
+    ///
+    /// Errors (only on the `AF_ICON`-clear path):
+    /// * `iWidth` or `iHeight` is `0`. The spec's `0` = "take from
+    ///   frame" sentinel has no meaning for raw frames: there is no
+    ///   per-frame header to take the dimension from, so a `0` here
+    ///   leaves the geometry undefined. (The byte parser accepts `0`
+    ///   in the header because it is legal for the icon/cursor path;
+    ///   the contradiction only surfaces when the raw path actually
+    ///   needs the value.)
+    /// * `iBitCount` is `0`. Same sentinel reasoning — a raw frame's
+    ///   bit-depth cannot be deferred to a non-existent frame header.
+    ///
+    /// `nPlanes` is normalised to `1`: the byte parser already rejects
+    /// any value `> 1`, and `0` is the ecosystem "unspecified"
+    /// sentinel the parser tolerates, so the only reachable values are
+    /// `{0, 1}` and both mean the single-plane BMP layout.
+    pub fn raw_bmp_descriptor(&self) -> Result<Option<RawBmpDescriptor>> {
+        if self.header.frames_are_icons() {
+            return Ok(None);
+        }
+        let h = &self.header;
+        if h.i_width == 0 || h.i_height == 0 {
+            return Err(Error::invalid(format!(
+                "ANI: raw_bmp_descriptor: AF_ICON clear but anih dimensions are \
+                 unset (iWidth = {}, iHeight = {}) — a headerless BMP frame has \
+                 no per-frame dimensions to fall back on",
+                h.i_width, h.i_height
+            )));
+        }
+        if h.i_bit_count == 0 {
+            return Err(Error::invalid(
+                "ANI: raw_bmp_descriptor: AF_ICON clear but anih iBitCount = 0 — \
+                 a headerless BMP frame has no per-frame bit-depth to fall back on",
+            ));
+        }
+        Ok(Some(RawBmpDescriptor {
+            width: h.i_width,
+            height: h.i_height,
+            bit_count: h.i_bit_count,
+            // Parser guarantees n_planes ∈ {0, 1}; both denote the
+            // single-plane BMP layout, so normalise 0 → 1.
+            planes: 1,
+        }))
+    }
+
     /// Number of playback steps the file declares, with the spec's
     /// "`nSteps = nFrames` when no `seq ` chunk" default already
     /// applied. Returns `header.n_steps` when the field is non-zero,
@@ -3140,5 +3236,107 @@ mod tests {
         let written = write_ani_raw(&parsed).unwrap();
         let reparsed = read_ani_raw(&written).unwrap();
         assert_eq!(reparsed.rates.as_deref(), Some(&[7u32, 9][..]));
+    }
+
+    /// Build an `AF_ICON`-clear (raw-BMP) `AniFile` directly, with the
+    /// `anih` geometry fields a raw-frame decoder needs.
+    fn raw_ani(i_width: u32, i_height: u32, i_bit_count: u32, n_planes: u32) -> AniFile {
+        AniFile {
+            header: AniHeader {
+                cb_size: 36,
+                n_frames: 1,
+                n_steps: 1,
+                i_width,
+                i_height,
+                i_bit_count,
+                n_planes,
+                i_disp_rate: 10,
+                // AF_ICON deliberately clear — raw-BMP path.
+                bf_attributes: 0,
+            },
+            info: AniInfo::default(),
+            sequence: None,
+            rates: None,
+            frames: vec![vec![0u8; 4]],
+        }
+    }
+
+    #[test]
+    fn raw_bmp_descriptor_none_for_icon_frames() {
+        // AF_ICON set → frames are full ICO/CUR resources; the anih
+        // advisory geometry is not authoritative, so the accessor
+        // returns None rather than a misleading descriptor.
+        let a = ani_with(2, 2, 10, None, None);
+        assert!(a.header.frames_are_icons());
+        assert_eq!(a.raw_bmp_descriptor().unwrap(), None);
+    }
+
+    #[test]
+    fn raw_bmp_descriptor_surfaces_anih_geometry() {
+        // AF_ICON clear → the headerless-BMP geometry comes from anih.
+        let a = raw_ani(32, 32, 8, 1);
+        let d = a.raw_bmp_descriptor().unwrap().unwrap();
+        assert_eq!(
+            d,
+            RawBmpDescriptor {
+                width: 32,
+                height: 32,
+                bit_count: 8,
+                planes: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn raw_bmp_descriptor_normalises_zero_planes_to_one() {
+        // The parser tolerates n_planes = 0 as the ecosystem
+        // "unspecified" sentinel; the descriptor normalises it to the
+        // single-plane BMP value 1.
+        let a = raw_ani(16, 16, 24, 0);
+        assert_eq!(a.raw_bmp_descriptor().unwrap().unwrap().planes, 1);
+    }
+
+    #[test]
+    fn raw_bmp_descriptor_rejects_zero_width() {
+        // The spec's iWidth = 0 ("take from frame") sentinel is
+        // meaningless when there is no per-frame header to take it
+        // from — the raw path must reject it.
+        let a = raw_ani(0, 16, 8, 1);
+        assert!(a.raw_bmp_descriptor().is_err());
+    }
+
+    #[test]
+    fn raw_bmp_descriptor_rejects_zero_height() {
+        let a = raw_ani(16, 0, 8, 1);
+        assert!(a.raw_bmp_descriptor().is_err());
+    }
+
+    #[test]
+    fn raw_bmp_descriptor_rejects_zero_bit_count() {
+        // iBitCount = 0 ("take from frame") is likewise undefined for a
+        // headerless BMP frame.
+        let a = raw_ani(16, 16, 0, 1);
+        assert!(a.raw_bmp_descriptor().is_err());
+    }
+
+    #[test]
+    fn raw_bmp_descriptor_from_parsed_bytes() {
+        // End-to-end: write an AF_ICON-clear ANI, parse it back, and
+        // confirm the descriptor recovers the anih geometry. This
+        // exercises the byte parser's tolerance of an AF_ICON-clear
+        // header carrying real geometry, then the accessor on top.
+        let a = raw_ani(48, 24, 4, 1);
+        let bytes = write_ani_raw(&a).unwrap();
+        let parsed = read_ani_raw(&bytes).unwrap();
+        assert!(!parsed.header.frames_are_icons());
+        assert_eq!(
+            parsed.raw_bmp_descriptor().unwrap().unwrap(),
+            RawBmpDescriptor {
+                width: 48,
+                height: 24,
+                bit_count: 4,
+                planes: 1,
+            }
+        );
     }
 }

@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `AniFile::raw_bmp_descriptor() -> Result<Option<RawBmpDescriptor>>` —
+  resolves the spec's `AF_ICON`-clear (raw-image) ANI path. When
+  `bfAttributes & AF_ICON` is clear, each `LIST 'fram'` `icon` chunk holds
+  a **headerless** BMP whose pixel geometry lives in `anih`
+  (`iWidth` / `iHeight` / `iBitCount` / `nPlanes`), not in the frame bytes
+  (per `docs/image/ico/ani-acon-format.md` §bfAttributes; the daubnet ACON
+  reference). A caller cannot decode such a frame without those four
+  fields. The new accessor surfaces them as a validated `RawBmpDescriptor`
+  (also exported): it returns `Ok(None)` for the icon/cursor path
+  (`AF_ICON` set — geometry comes from each frame's own ICO/CUR + DIB
+  headers there) and, on the raw path, rejects an unset `iWidth` /
+  `iHeight` / `iBitCount` (the spec's `0` = "take from frame" sentinel is
+  undefined for a headerless frame, since there is no per-frame header to
+  defer to) while normalising `nPlanes ∈ {0, 1}` to the single-plane BMP
+  value `1`. Exported from the always-on standalone surface (no `registry`
+  feature needed). Seven new unit tests cover the icon-path `None`, the
+  raw-path descriptor recovery (including an end-to-end write→parse round
+  trip), zero-plane normalisation, and the zero-width / zero-height /
+  zero-bit-count rejections.
 - `write_ani_raw(&AniFile) -> Result<Vec<u8>>` — the symmetric ANI
   encoder, the container-level counterpart to `write_ico_raw`. Serialises
   an `AniFile` back into a RIFF/`ACON` byte stream that `read_ani_raw`

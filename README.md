@@ -395,6 +395,46 @@ let bytes = write_ani_raw(&ani)?;        // value-stable round-trip
 assert_eq!(read_ani_raw(&bytes)?, ani);
 ```
 
+### Raw-image (`AF_ICON`-clear) frames
+
+The common ANI carries icon/cursor frames (`bfAttributes & AF_ICON`
+set): each `LIST 'fram'` `icon` chunk is a complete ICO/CUR resource
+whose own headers describe its geometry, so it feeds straight into
+`read_ico_raw`. When `AF_ICON` is *clear*, each frame is instead a
+**headerless** BMP — pure pixel data whose width / height / bit-depth /
+plane count live in `anih`, not in the frame bytes. A caller therefore
+can't decode such a frame from its bytes alone. `raw_bmp_descriptor`
+surfaces exactly the four `anih` fields that path needs:
+
+```rust
+use oxideav_ico::read_ani_raw;
+
+let ani = read_ani_raw(&std::fs::read("raw-cursor.ani")?)?;
+match ani.raw_bmp_descriptor()? {
+    None => {
+        // AF_ICON set — each frame is a full ICO/CUR resource.
+        for frame in &ani.frames {
+            let (_ty, _entries) = oxideav_ico::read_ico_raw(frame)?;
+        }
+    }
+    Some(desc) => {
+        // AF_ICON clear — every frame is a headerless BMP of these dims.
+        for frame in &ani.frames {
+            decode_headerless_bmp(frame, desc.width, desc.height,
+                                  desc.bit_count, desc.planes);
+        }
+    }
+}
+```
+
+It returns `None` for the icon/cursor path (the `anih` advisory geometry
+isn't authoritative there) and, on the raw path, rejects an unset
+`iWidth` / `iHeight` / `iBitCount` — the spec's `0` = "take from frame"
+sentinel has no meaning when there's no per-frame header to defer to —
+while normalising `nPlanes` to the single-plane BMP value `1`. (Decoding
+the headerless BMP pixel bytes themselves is BMP-crate work; this layer
+only hands you the geometry.)
+
 The parser is hardened against the usual cursor-file CVE surface:
 truncated declared RIFF size, missing or out-of-order `anih`,
 oversized `nFrames` (capped at 65_536 to bound allocator pressure),
