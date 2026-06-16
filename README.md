@@ -448,6 +448,53 @@ let bytes = write_ani_raw(&ani)?;        // value-stable round-trip
 assert_eq!(read_ani_raw(&bytes)?, ani);
 ```
 
+### Encoded playback (`write_ani`)
+
+`write_ani` is the RGBA-side counterpart to `read_ani`: where `read_ani`
+decodes a whole `.ani` into RGBA frames plus a resolved timeline,
+`write_ani` takes RGBA frames plus the timeline and serialises a complete
+RIFF/`ACON` byte stream that `read_ani` parses back to an equivalent
+animation. Each frame is one `AniWriteFrame` (a complete ICO/CUR
+resource's worth of sub-images, mixed-resolution allowed, with its own
+`icon_type` — ICO and CUR frames may be mixed); every sub-image is encoded
+to its `icon` chunk via `write_ico`, and `AniWriteOptions` carries the
+animation-level metadata (`LIST 'INFO'` title / author), the optional
+`seq ` playback order, the optional per-step `rate` table, the default
+per-step duration (`anih.iDispRate`), and the per-sub-image PNG / BMP
+`WriteOptions`. Only the common `AF_ICON`-set path is produced (each frame
+is a full ICO/CUR resource). It rejects up front anything `read_ani` would
+later refuse: an empty frame list, a zero `default_jiffies` or zero `rate`
+entry (a zero-jiffy step has no defined display behaviour), a `seq ` index
+`>= frames.len()`, and a `rate` length that doesn't match the resolved step
+count (the `seq ` length when present, else the frame count). The `anih`
+advisory `iWidth` / `iHeight` / `iBitCount` are left at the spec's
+"take from frame" sentinel (`0`) — each frame's own headers are
+authoritative for the `AF_ICON` path; `nSteps` is left `0` for the identity
+case (the reader applies its `nSteps = nFrames` default) and set to the
+`seq ` length when a sequence is present.
+
+```rust
+use oxideav_ico::{
+    read_ani, write_ani, AniInfo, AniWriteFrame, AniWriteOptions,
+    IconImage, IconType, WriteOptions,
+};
+
+let frames = vec![
+    AniWriteFrame { icon_type: IconType::Cur, images: vec![IconImage::from_rgba(32, 32, rgba_a)] },
+    AniWriteFrame { icon_type: IconType::Cur, images: vec![IconImage::from_rgba(32, 32, rgba_b)] },
+];
+let opts = AniWriteOptions {
+    info: AniInfo { title: Some(b"Spinner\0".to_vec()), author: None },
+    sequence: Some(vec![0, 1, 0, 1]),   // play A,B,A,B
+    rates: Some(vec![6, 6, 6, 6]),      // 6 jiffies each
+    default_jiffies: 6,
+    ico: WriteOptions { png_size_threshold: None }, // all-BMP frames
+};
+let bytes = write_ani(&frames, &opts)?;
+let anim = read_ani(&bytes)?;            // decodes back to an equivalent animation
+assert_eq!(anim.steps.len(), 4);
+```
+
 ### Raw-image (`AF_ICON`-clear) frames
 
 The common ANI carries icon/cursor frames (`bfAttributes & AF_ICON`

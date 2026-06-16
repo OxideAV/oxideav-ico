@@ -77,7 +77,7 @@ pub use reader::{read_ani, read_ico, AniAnimation, AniFrame};
 #[cfg(feature = "registry")]
 pub use registry::{register, register_codecs, register_containers};
 #[cfg(feature = "registry")]
-pub use writer::write_ico;
+pub use writer::{write_ani, write_ico, AniWriteFrame, AniWriteOptions};
 
 #[cfg(test)]
 mod tests {

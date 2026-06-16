@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Other
+
+- add write_ani — RGBA-side ANI encoder (the encode counterpart to read_ani)
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-ico/compare/v0.0.6...v0.0.7) - 2026-06-14
 
 ### Other
