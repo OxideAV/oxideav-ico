@@ -437,8 +437,16 @@ sit in `1..=65_536`; `n_planes ∈ {0, 1}`; `i_width` / `i_height ∈
 {0} ∪ 1..=256`; `i_bit_count ∈ {0, 1, 4, 8, 16, 24, 32}`; every frame
 payload non-empty; and a present `seq ` / `rate` array must match the
 resolved step count (`n_steps`, or `n_frames` when `n_steps == 0`)
-with every `seq ` index `< n_frames`. Absent optional chunks are
-omitted entirely (no empty `LIST 'INFO'` / `seq ` / `rate`).
+with every `seq ` index `< n_frames`; and the `bfAttributes`
+`AF_SEQUENCE` bit must agree with whether a `seq ` chunk will be
+emitted — the spec fixes bit 1 as "file contains a `seq ` sequence
+chunk", so a flag that contradicts `sequence.is_some()` would produce a
+file whose header advertises a chunk the body lacks (or carries a
+`seq ` body the header doesn't announce). The byte parser stays lenient
+about a flag-without-chunk on *read* (it falls back to identity step
+order), but the writer has no reason to emit the inconsistency. Absent
+optional chunks are omitted entirely (no empty `LIST 'INFO'` / `seq ` /
+`rate`).
 
 ```rust
 use oxideav_ico::{read_ani_raw, write_ani_raw};

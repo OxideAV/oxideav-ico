@@ -869,6 +869,13 @@ pub fn read_ani_raw(input: &[u8]) -> Result<AniFile> {
 ///   every index must be `< n_frames` — the reader bounds-checks both.
 /// * When `rates` is `Some`, its length must equal the resolved step
 ///   count.
+/// * The `bfAttributes` `AF_SEQUENCE` bit must agree with whether a
+///   `seq ` chunk will be emitted (i.e. `sequence.is_some()`). The spec
+///   fixes bit 1 as "file contains a `seq ` sequence chunk", so the
+///   header flag and the body must not contradict each other. (The byte
+///   parser is lenient about a flag-without-chunk on read — falling back
+///   to identity order — but a writer has no reason to emit the
+///   inconsistency.)
 pub fn write_ani_raw(ani: &AniFile) -> Result<Vec<u8>> {
     let header = &ani.header;
 
@@ -958,6 +965,40 @@ pub fn write_ani_raw(ani: &AniFile) -> Result<Vec<u8>> {
                 rates.len()
             )));
         }
+    }
+
+    // --- AF_SEQUENCE flag ⇄ seq-chunk coherence ------------------------
+    // The spec (`docs/image/ico/ani-acon-format.md` §bfAttributes flags)
+    // fixes bit 1 `AF_SEQUENCE` as "1 = file contains a `seq ` sequence
+    // chunk". The serialiser below emits a `seq ` chunk exactly when
+    // `ani.sequence` is `Some`, so an `AF_SEQUENCE` bit that disagrees
+    // with `sequence.is_some()` would produce a self-contradictory file:
+    // the header advertises a chunk the body lacks, or a `seq ` body the
+    // header doesn't announce. The byte parser is deliberately *lenient*
+    // about this on read (a flag set with no chunk falls back to identity
+    // order — see `AF_SEQUENCE`'s doc-comment), but a writer has no reason
+    // to emit the inconsistency in the first place: rejecting up front
+    // mirrors the strictness `write_ani` (the RGBA path) already gets for
+    // free by deriving the flag from `opts.sequence`. Hand-built
+    // `AniFile`s — the only way to reach this layer with a mismatch, since
+    // `read_ani_raw` only ever yields coherent values from real files —
+    // are caught here rather than producing bytes a strict consumer would
+    // flag. Same probe-vs-render contract as the directory-vs-body checks
+    // on the ICO path: what the header claims and what the body carries
+    // must agree.
+    if header.has_sequence_flag() != ani.sequence.is_some() {
+        return Err(Error::invalid(format!(
+            "ANI: write: bfAttributes AF_SEQUENCE bit ({}) disagrees with the \
+             presence of a `seq ` chunk (sequence is {}) — the spec fixes bit 1 \
+             as \"file contains a seq chunk\", so set the flag iff a sequence is \
+             present",
+            header.has_sequence_flag(),
+            if ani.sequence.is_some() {
+                "Some"
+            } else {
+                "None"
+            },
+        )));
     }
 
     // --- serialise -----------------------------------------------------
@@ -3117,6 +3158,106 @@ mod tests {
         assert_eq!(reparsed.info.title_str().as_deref(), Some("My Cursor"));
         assert_eq!(reparsed.info.author_str().as_deref(), Some("OxideAV"));
         assert_eq!(reparsed.rates.as_deref(), Some(&[5u32, 10, 15][..]));
+    }
+
+    #[test]
+    fn write_rejects_seq_chunk_without_af_sequence_flag() {
+        // A sequence is present but the AF_SEQUENCE bit is clear — the
+        // header would advertise no `seq ` chunk while the body carries
+        // one. The spec fixes bit 1 as "file contains a seq chunk", so
+        // the writer rejects the contradiction rather than emit it.
+        let ani = AniFile {
+            header: AniHeader {
+                cb_size: 36,
+                n_frames: 2,
+                n_steps: 3,
+                i_width: 0,
+                i_height: 0,
+                i_bit_count: 0,
+                n_planes: 1,
+                i_disp_rate: 6,
+                bf_attributes: AF_ICON, // AF_SEQUENCE deliberately clear
+            },
+            info: AniInfo::default(),
+            sequence: Some(vec![0, 1, 0]),
+            rates: None,
+            frames: vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8]],
+        };
+        let err = write_ani_raw(&ani).unwrap_err().to_string();
+        assert!(
+            err.contains("AF_SEQUENCE"),
+            "expected an AF_SEQUENCE coherence error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn write_rejects_af_sequence_flag_without_seq_chunk() {
+        // The AF_SEQUENCE bit is set but no sequence is present — the
+        // header advertises a `seq ` chunk the serialiser won't emit.
+        // The symmetric half of the coherence check.
+        let ani = AniFile {
+            header: AniHeader {
+                cb_size: 36,
+                n_frames: 2,
+                n_steps: 2,
+                i_width: 0,
+                i_height: 0,
+                i_bit_count: 0,
+                n_planes: 1,
+                i_disp_rate: 6,
+                bf_attributes: AF_ICON | AF_SEQUENCE,
+                // ^ flag set but `sequence` is None below
+            },
+            info: AniInfo::default(),
+            sequence: None,
+            rates: None,
+            frames: vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8]],
+        };
+        let err = write_ani_raw(&ani).unwrap_err().to_string();
+        assert!(
+            err.contains("AF_SEQUENCE"),
+            "expected an AF_SEQUENCE coherence error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn write_accepts_coherent_af_sequence_states() {
+        // Both coherent states serialise cleanly: (a) flag set + seq
+        // present, (b) flag clear + seq absent. This guards against the
+        // coherence check being over-eager (rejecting a valid file).
+        let with_seq = AniFile {
+            header: AniHeader {
+                cb_size: 36,
+                n_frames: 2,
+                n_steps: 3,
+                i_width: 0,
+                i_height: 0,
+                i_bit_count: 0,
+                n_planes: 1,
+                i_disp_rate: 6,
+                bf_attributes: AF_ICON | AF_SEQUENCE,
+            },
+            info: AniInfo::default(),
+            sequence: Some(vec![0, 1, 0]),
+            rates: None,
+            frames: vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8]],
+        };
+        let bytes = write_ani_raw(&with_seq).unwrap();
+        assert_eq!(read_ani_raw(&bytes).unwrap(), with_seq);
+
+        let without_seq = AniFile {
+            header: AniHeader {
+                bf_attributes: AF_ICON,
+                n_steps: 2,
+                ..with_seq.header
+            },
+            info: AniInfo::default(),
+            sequence: None,
+            rates: None,
+            frames: with_seq.frames.clone(),
+        };
+        let bytes = write_ani_raw(&without_seq).unwrap();
+        assert_eq!(read_ani_raw(&bytes).unwrap(), without_seq);
     }
 
     #[test]

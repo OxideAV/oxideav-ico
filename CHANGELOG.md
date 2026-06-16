@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- write_ani_raw: enforce AF_SEQUENCE flag ⇄ `seq ` chunk coherence
 - add write_ani — RGBA-side ANI encoder (the encode counterpart to read_ani)
 
 ## [0.0.7](https://github.com/OxideAV/oxideav-ico/compare/v0.0.6...v0.0.7) - 2026-06-14
