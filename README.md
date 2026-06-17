@@ -559,6 +559,17 @@ tolerated as the wider-ecosystem "unspecified" sentinel. The walker
 rejects the file up front rather than emit a sequence array or
 multi-plane assertion a caller can't safely act on.
 
+`anih.bfAttributes` is likewise range-checked: only bit 0 (`AF_ICON`)
+and bit 1 (`AF_SEQUENCE`) are defined, and the ACON spec fixes bits
+31..2 as "reserved, unused = 0". A header carrying any reserved bit is
+rejected up front rather than silently round-tripped — the two
+accessors that read the field (`frames_are_icons()` /
+`has_sequence_flag()`) each mask down to their single bit, so a stray
+high bit would otherwise survive a parse → re-emit cycle as a non-spec
+value a strict consumer would later flag. `write_ani_raw` mirrors the
+same check, so a `bfAttributes` value the reader refuses to accept is
+also one the writer refuses to emit (closing the round-trip asymmetry).
+
 The advisory `anih.iWidth` / `iHeight` / `iBitCount` fields are
 also range-checked: dimensions must be in `1..=256` (the ICO/CUR
 sub-image limit — a value of `0` retains its spec-mandated "take

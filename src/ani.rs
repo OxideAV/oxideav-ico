@@ -35,6 +35,14 @@ pub const AF_ICON: u32 = 0x0000_0001;
 /// rather than rejects.
 pub const AF_SEQUENCE: u32 = 0x0000_0002;
 
+/// Mask of every defined `bfAttributes` bit ([`AF_ICON`] |
+/// [`AF_SEQUENCE`]). The spec (`docs/image/ico/ani-acon-format.md`
+/// §bfAttributes flags, and the daubnet primary source's "reserved
+/// bits 31..2 unused = 0") fixes every bit above bit 1 as reserved
+/// and zero; `bf_attributes & !AF_DEFINED_MASK` therefore isolates
+/// the bits a conforming `anih` must leave clear.
+pub const AF_DEFINED_MASK: u32 = AF_ICON | AF_SEQUENCE;
+
 /// Maximum number of frames / steps we'll accept up-front, before
 /// any per-chunk parsing. Cursor files in the wild rarely exceed a
 /// few dozen frames; pathological values (a header claiming
@@ -923,6 +931,23 @@ pub fn write_ani_raw(ani: &AniFile) -> Result<Vec<u8>> {
             )))
         }
     }
+    // `bfAttributes` reserved bits — mirror of `parse_anih`'s read-side
+    // check so a value the reader refuses to accept is also one the
+    // writer refuses to emit. Only bits 0 (`AF_ICON`) and 1
+    // (`AF_SEQUENCE`) are defined; the spec fixes bits 31..2 at 0. A
+    // hand-built `AniFile` is the only way to reach this layer with a
+    // stray reserved bit (`read_ani_raw` never yields one), and emitting
+    // it would produce a file `parse_anih` would later reject — exactly
+    // the round-trip asymmetry `write_ani_raw` exists to prevent.
+    if header.bf_attributes & !AF_DEFINED_MASK != 0 {
+        return Err(Error::invalid(format!(
+            "ANI: write: header.bf_attributes = {:#010x} sets reserved bits \
+             ({:#010x}) — only AF_ICON (bit 0) and AF_SEQUENCE (bit 1) are \
+             defined; bits 31..2 must be 0",
+            header.bf_attributes,
+            header.bf_attributes & !AF_DEFINED_MASK
+        )));
+    }
 
     // --- frame count / payload sanity ----------------------------------
     if ani.frames.len() != header.n_frames as usize {
@@ -1229,6 +1254,30 @@ fn parse_anih(payload: &[u8]) -> Result<AniHeader> {
                 "ANI: anih.iBitCount = {n} (must be one of {{0, 1, 4, 8, 16, 24, 32}})"
             )))
         }
+    }
+    // `bfAttributes` reserved bits. Per spec (the `ani-acon-format.md`
+    // §bfAttributes table and the daubnet primary source) only bits 0
+    // (`AF_ICON`) and 1 (`AF_SEQUENCE`) are defined; bits 31..2 are
+    // "reserved, unused = 0". Same probe-vs-render shape as the
+    // `nPlanes` / `iWidth` / `iBitCount` range checks above: a header
+    // carrying a stray reserved bit was either corrupted in transit or
+    // is an adversarial value trying to smuggle meaning through a field
+    // a conforming renderer ignores. The two accessors that read this
+    // field (`frames_are_icons()` / `has_sequence_flag()`) mask down to
+    // their single bit, so a stray bit would otherwise round-trip
+    // silently into a non-spec value and re-emit unchanged. Rejecting
+    // up front keeps the parser's accepted set equal to the spec's
+    // defined set (and matches `write_ani_raw`'s mirror check, so a
+    // value the writer refuses to emit is also one the reader refuses
+    // to accept).
+    if header.bf_attributes & !AF_DEFINED_MASK != 0 {
+        return Err(Error::invalid(format!(
+            "ANI: anih.bfAttributes = {:#010x} sets reserved bits \
+             ({:#010x}) — only AF_ICON (bit 0) and AF_SEQUENCE (bit 1) \
+             are defined; bits 31..2 must be 0",
+            header.bf_attributes,
+            header.bf_attributes & !AF_DEFINED_MASK
+        )));
     }
     Ok(header)
 }
@@ -1690,6 +1739,63 @@ mod tests {
             let parsed = read_ani_raw(&bytes).expect("canonical bpp must parse");
             assert_eq!(parsed.header.i_bit_count, bpp);
         }
+    }
+
+    #[test]
+    fn rejects_anih_bf_attributes_reserved_bit() {
+        // The spec defines only bit 0 (AF_ICON) and bit 1 (AF_SEQUENCE);
+        // bits 31..2 are reserved = 0. A header setting a reserved bit
+        // (here bit 2) alongside AF_ICON must be rejected up front rather
+        // than silently round-tripped — the accessors mask down to a
+        // single bit, so a stray bit would otherwise survive a parse →
+        // re-emit cycle as a non-spec value. anih.bfAttributes sits at
+        // anih_payload offset 32 → file offset
+        // (RIFF8 + ACON4 + "anih"4 + size4) + 32 = 52.
+        let mut bytes = build_minimal_ani(1, 1);
+        bytes[52..56].copy_from_slice(&(AF_ICON | 0x0000_0004).to_le_bytes());
+        let err = read_ani_raw(&bytes).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => {
+                assert!(
+                    msg.contains("bfAttributes") && msg.contains("reserved"),
+                    "{msg}"
+                )
+            }
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_anih_bf_attributes_high_reserved_bits() {
+        // The classic adversarial "all bits set" value: only AF_ICON |
+        // AF_SEQUENCE survive a conforming header, so 0xFFFF_FFFF must be
+        // rejected (and its rejection message must name the reserved bits
+        // it caught, excluding the two defined ones).
+        let mut bytes = build_minimal_ani(1, 1);
+        bytes[52..56].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        let err = read_ani_raw(&bytes).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => {
+                // 0xFFFF_FFFF & !(AF_ICON|AF_SEQUENCE) == 0xFFFF_FFFC.
+                assert!(
+                    msg.contains("bfAttributes") && msg.contains("0xfffffffc"),
+                    "{msg}"
+                )
+            }
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_anih_bf_attributes_defined_bits_only() {
+        // AF_ICON alone, and AF_ICON | AF_SEQUENCE, are the only two
+        // attribute values the minimal builder / a real file produce —
+        // both must parse. (AF_SEQUENCE alone needs a matching seq chunk
+        // to satisfy the step-count cross-check, so it's exercised via
+        // the seq/rate tests; here we lock the two AF_ICON-set cases.)
+        let mut bytes = build_minimal_ani(1, 1);
+        bytes[52..56].copy_from_slice(&AF_ICON.to_le_bytes());
+        assert!(read_ani_raw(&bytes).is_ok());
     }
 
     #[test]
@@ -3258,6 +3364,63 @@ mod tests {
         };
         let bytes = write_ani_raw(&without_seq).unwrap();
         assert_eq!(read_ani_raw(&bytes).unwrap(), without_seq);
+    }
+
+    #[test]
+    fn write_rejects_bf_attributes_reserved_bit() {
+        // Mirror of `parse_anih`'s reserved-bit rejection: a hand-built
+        // AniFile carrying a reserved bit (bit 2 here, alongside AF_ICON)
+        // must be refused by the writer too, so a value the reader would
+        // reject is never emitted. This closes the round-trip asymmetry
+        // (write a file the reader then refuses to parse).
+        let ani = AniFile {
+            header: AniHeader {
+                cb_size: 36,
+                n_frames: 1,
+                n_steps: 1,
+                i_width: 0,
+                i_height: 0,
+                i_bit_count: 0,
+                n_planes: 1,
+                i_disp_rate: 10,
+                bf_attributes: AF_ICON | 0x0000_0004,
+            },
+            info: AniInfo::default(),
+            sequence: None,
+            rates: None,
+            frames: vec![vec![1, 2, 3, 4]],
+        };
+        let err = write_ani_raw(&ani).unwrap_err().to_string();
+        assert!(
+            err.contains("bf_attributes") && err.contains("reserved"),
+            "expected a reserved-bits error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn write_then_read_rejects_no_reserved_bit_round_trip() {
+        // Positive control: a coherent AF_ICON-only header serialises and
+        // re-parses cleanly — the new reserved-bit guard doesn't reject
+        // the canonical defined-bits-only value.
+        let ani = AniFile {
+            header: AniHeader {
+                cb_size: 36,
+                n_frames: 1,
+                n_steps: 1,
+                i_width: 0,
+                i_height: 0,
+                i_bit_count: 0,
+                n_planes: 1,
+                i_disp_rate: 10,
+                bf_attributes: AF_ICON,
+            },
+            info: AniInfo::default(),
+            sequence: None,
+            rates: None,
+            frames: vec![vec![1, 2, 3, 4]],
+        };
+        let bytes = write_ani_raw(&ani).unwrap();
+        assert_eq!(read_ani_raw(&bytes).unwrap(), ani);
     }
 
     #[test]
