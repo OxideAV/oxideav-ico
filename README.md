@@ -241,11 +241,18 @@ match `AniFile::step_at_jiffy` exactly: step `i` owns the half-open
 `[start_i, start_i + jiffies)` interval, a boundary jiffy lands on the
 next step, and a `jiffy >= total` (or non-finite / negative `seconds`)
 is rejected rather than silently clamped — the caller applies
-`offset % cycle` before the lookup. Only the common `AF_ICON`-set path is decodable here (each frame
-carries its own ICO directory); an `AF_ICON`-clear file (headerless raw
-BMP frames) is rejected with an error pointing at `raw_bmp_descriptor`
-+ a BMP-DIB decoder — that path has no ICO directory to walk. Gated
-behind the default-on `registry` feature, alongside `read_ico`.
+`offset % cycle` before the lookup. Both frame layouts decode: the
+common `AF_ICON`-set path (each frame carries its own ICO directory)
+and the `AF_ICON`-clear path (each frame is a single headerless BMP
+whose geometry lives in `anih`). For the clear path `read_ani`
+synthesises a `BITMAPINFOHEADER` from `raw_bmp_descriptor` and feeds
+the raw pixel rows through the same BMP-DIB decoder, yielding one
+`Cur`-tagged sub-image per frame (no AND mask — raw frames decode
+opaque). Only the non-indexed depths `{16, 24, 32}` are decodable: at
+`iBitCount <= 8` the ACON reference leaves the raw colour-table layout
+*undefined*, so those frames are refused (the raw bytes stay reachable
+via `read_ani_raw` + `raw_bmp_descriptor`). Gated behind the
+default-on `registry` feature, alongside `read_ico`.
 
 The `LIST 'INFO'` metadata is surfaced both raw and decoded. The
 `AniInfo::title` / `author` fields hold the verbatim `INAM` / `IART`
@@ -539,9 +546,16 @@ It returns `None` for the icon/cursor path (the `anih` advisory geometry
 isn't authoritative there) and, on the raw path, rejects an unset
 `iWidth` / `iHeight` / `iBitCount` — the spec's `0` = "take from frame"
 sentinel has no meaning when there's no per-frame header to defer to —
-while normalising `nPlanes` to the single-plane BMP value `1`. (Decoding
-the headerless BMP pixel bytes themselves is BMP-crate work; this layer
-only hands you the geometry.)
+while normalising `nPlanes` to the single-plane BMP value `1`.
+
+`read_ani` uses this descriptor internally to decode the `AF_ICON`-clear
+path for the non-indexed depths `{16, 24, 32}` (it synthesises a
+`BITMAPINFOHEADER` and runs the BMP-DIB decoder), so most callers never
+touch `raw_bmp_descriptor` directly. The accessor stays public for the
+indexed (`iBitCount <= 8`) case `read_ani` refuses — there the ACON
+reference leaves the colour-table layout undefined, so a caller that
+knows its own files' palette convention can hand the raw bytes to a
+BMP-crate decoder itself.
 
 The parser is hardened against the usual cursor-file CVE surface:
 truncated declared RIFF size, missing or out-of-order `anih`,

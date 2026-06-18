@@ -262,27 +262,33 @@ impl AniAnimation {
 /// Parse and fully decode an ANI animated-cursor byte stream.
 ///
 /// Walks the RIFF/`ACON` tree (via [`read_ani_raw`]), decodes every
-/// stored frame's sub-images to RGBA (via [`read_ico`] per frame), and
-/// resolves the `seq ` / `rate` chunks into a flat playback step table
-/// (via [`crate::AniFile::playback_steps`]).
+/// stored frame's sub-images to RGBA, and resolves the `seq ` / `rate`
+/// chunks into a flat playback step table (via
+/// [`crate::AniFile::playback_steps`]).
 ///
-/// Only the common `AF_ICON`-set path is decodable here: each frame is
-/// a complete ICO/CUR resource carrying its own headers. When `AF_ICON`
-/// is *clear* the frames are headerless raw BMP data whose geometry
-/// lives only in `anih` — there is no ICO directory to walk — so this
-/// function returns an error directing the caller to
-/// [`crate::AniFile::raw_bmp_descriptor`] + a BMP-DIB decoder for that
-/// path. (`read_ani_raw` still parses such files structurally.)
+/// Two frame layouts are decoded, selected by the `anih` `AF_ICON` flag:
+///
+/// * **`AF_ICON` set** (the common case): each frame is a complete
+///   ICO/CUR resource carrying its own headers, decoded via [`read_ico`].
+///   A frame may carry several sub-images at different resolutions.
+///
+/// * **`AF_ICON` clear**: each frame is a single headerless BMP whose
+///   geometry lives only in `anih` (`iWidth` / `iHeight` / `iBitCount` /
+///   `nPlanes`) — there is no per-frame DIB header and no ICO directory.
+///   This path is decoded by synthesising a `BITMAPINFOHEADER` from the
+///   `anih` descriptor (via [`crate::AniFile::raw_bmp_descriptor`]) and
+///   feeding the raw pixel rows through the same BMP-DIB decoder the
+///   icon path uses. Per the ACON format reference the raw frames carry
+///   **no AND mask** (they are plain bottom-up DIB pixel rows padded to a
+///   4-byte boundary), so they decode opaque.
+///
+///   Only the non-indexed depths `{16, 24, 32}` are decodable: at
+///   `iBitCount <= 8` the format reference explicitly leaves it
+///   *unknown* whether the frame includes a colour table, so this
+///   function returns an error rather than guess a palette layout. Such
+///   files still parse structurally via [`read_ani_raw`].
 pub fn read_ani(input: &[u8]) -> Result<AniAnimation> {
     let ani = read_ani_raw(input).map_err(|e| Error::invalid(e.to_string()))?;
-
-    if !ani.header.frames_are_icons() {
-        return Err(Error::invalid(
-            "ANI: read_ani: AF_ICON is clear — frames are headerless raw BMP data \
-             with no ICO directory to decode. Use read_ani_raw + \
-             AniFile::raw_bmp_descriptor with a BMP-DIB decoder instead.",
-        ));
-    }
 
     // Resolve the timeline first: this re-validates the seq / rate
     // lengths and frame-index ranges, so a frame_index emitted here is
@@ -291,18 +297,125 @@ pub fn read_ani(input: &[u8]) -> Result<AniAnimation> {
         .playback_steps()
         .map_err(|e| Error::invalid(e.to_string()))?;
 
-    let mut frames = Vec::with_capacity(ani.frames.len());
-    for (i, frame_bytes) in ani.frames.iter().enumerate() {
-        let (icon_type, images) =
-            read_ico(frame_bytes).map_err(|e| Error::invalid(format!("ANI: frame {i}: {e}")))?;
-        frames.push(AniFrame { icon_type, images });
-    }
+    let frames = if ani.header.frames_are_icons() {
+        let mut frames = Vec::with_capacity(ani.frames.len());
+        for (i, frame_bytes) in ani.frames.iter().enumerate() {
+            let (icon_type, images) = read_ico(frame_bytes)
+                .map_err(|e| Error::invalid(format!("ANI: frame {i}: {e}")))?;
+            frames.push(AniFrame { icon_type, images });
+        }
+        frames
+    } else {
+        decode_raw_bmp_frames(&ani)?
+    };
 
     Ok(AniAnimation {
         info: ani.info,
         frames,
         steps,
     })
+}
+
+/// Decode the `AF_ICON`-clear path: every `LIST 'fram'` frame is a
+/// single headerless BMP whose geometry comes from `anih`. Each decoded
+/// frame becomes an [`AniFrame`] carrying exactly one [`IconImage`],
+/// tagged `Cur` (an ANI is always a cursor resource).
+fn decode_raw_bmp_frames(ani: &crate::AniFile) -> Result<Vec<AniFrame>> {
+    // `raw_bmp_descriptor` validates the geometry is fully specified
+    // (non-zero width / height / bit_count) for this path and normalises
+    // planes; it returns `None` only when AF_ICON is set, which this
+    // branch already excluded.
+    let desc = ani
+        .raw_bmp_descriptor()
+        .map_err(|e| Error::invalid(e.to_string()))?
+        .ok_or_else(|| Error::invalid("ANI: read_ani: internal: raw frame path on AF_ICON file"))?;
+
+    // The format reference (docs/image/ico/ani-acon-format.md) records
+    // that for an indexed raw frame (iBitCount <= 8) it is *unknown*
+    // whether a colour table precedes the pixels. Refuse those rather
+    // than guess a palette layout that could mis-decode every pixel.
+    if desc.bit_count <= 8 {
+        return Err(Error::invalid(format!(
+            "ANI: read_ani: AF_ICON-clear raw frame at iBitCount = {} (indexed) — the \
+             ACON format leaves the raw colour-table layout undefined for depths <= 8, \
+             so it cannot be decoded unambiguously. Use read_ani_raw + \
+             AniFile::raw_bmp_descriptor to access the raw bytes.",
+            desc.bit_count
+        )));
+    }
+
+    let mut frames = Vec::with_capacity(ani.frames.len());
+    for (i, pixels) in ani.frames.iter().enumerate() {
+        let dib = synthesize_headerless_dib(&desc, pixels)?;
+        // doubled = false: a raw ANI frame is a single image with no
+        // doubled-height AND-mask region (that is an ICO/CUR-only layout).
+        let frame = oxideav_bmp::decode_dib_videoframe(&dib, /* doubled */ false)
+            .map_err(|e| Error::invalid(format!("ANI: raw frame {i}: {e}")))?;
+        let rgba = frame_to_rgba_bytes(&frame, desc.width, desc.height)?;
+        let image = IconImage {
+            width: desc.width,
+            height: desc.height,
+            pixels: rgba,
+            bit_depth: desc.bit_count as u8,
+            sub_format: IconSubFormat::Bmp,
+            hotspot: None,
+        };
+        frames.push(AniFrame {
+            icon_type: IconType::Cur,
+            images: vec![image],
+        });
+    }
+    Ok(frames)
+}
+
+/// Build a single-image headerless DIB (`BITMAPINFOHEADER` + pixel rows)
+/// from an `anih` raw-frame [`crate::RawBmpDescriptor`] and the raw
+/// frame's pixel bytes, so the standard BMP-DIB decoder can consume it.
+///
+/// The synthesised header is a canonical 40-byte V3 `BITMAPINFOHEADER`:
+/// `biWidth = width`, `biHeight = +height` (positive = bottom-up rows,
+/// the BMP default — the raw ANI frame is *not* the doubled-height
+/// XOR+AND layout an ICO uses), `biPlanes = 1`, `biBitCount` from the
+/// descriptor, `biCompression = BI_RGB (0)`, all remaining fields zero.
+/// The descriptor already guarantees `bit_count ∈ {16, 24, 32}` here, so
+/// the decoder needs no colour table.
+fn synthesize_headerless_dib(desc: &crate::RawBmpDescriptor, pixels: &[u8]) -> Result<Vec<u8>> {
+    // 4-byte-aligned row stride for an uncompressed top-of-{16,24,32}-bpp
+    // DIB, matching the BMP pixel-array padding rule.
+    let bits_per_row = desc.width as u64 * desc.bit_count as u64;
+    let row_bytes = bits_per_row.div_ceil(8);
+    let stride = (row_bytes + 3) & !3;
+    let expected = stride
+        .checked_mul(desc.height as u64)
+        .ok_or_else(|| Error::invalid("ANI: raw frame geometry overflows"))?;
+    if (pixels.len() as u64) < expected {
+        return Err(Error::invalid(format!(
+            "ANI: raw frame is {} bytes but anih geometry ({}x{} @ {} bpp) needs {} \
+             ({}-byte stride x {} rows)",
+            pixels.len(),
+            desc.width,
+            desc.height,
+            desc.bit_count,
+            expected,
+            stride,
+            desc.height,
+        )));
+    }
+
+    let mut dib = Vec::with_capacity(40 + pixels.len());
+    dib.extend_from_slice(&40u32.to_le_bytes()); // biSize
+    dib.extend_from_slice(&(desc.width as i32).to_le_bytes()); // biWidth
+    dib.extend_from_slice(&(desc.height as i32).to_le_bytes()); // biHeight (+ = bottom-up)
+    dib.extend_from_slice(&(desc.planes as u16).to_le_bytes()); // biPlanes
+    dib.extend_from_slice(&(desc.bit_count as u16).to_le_bytes()); // biBitCount
+    dib.extend_from_slice(&0u32.to_le_bytes()); // biCompression = BI_RGB
+    dib.extend_from_slice(&0u32.to_le_bytes()); // biSizeImage (0 = derive)
+    dib.extend_from_slice(&0i32.to_le_bytes()); // biXPelsPerMeter
+    dib.extend_from_slice(&0i32.to_le_bytes()); // biYPelsPerMeter
+    dib.extend_from_slice(&0u32.to_le_bytes()); // biClrUsed
+    dib.extend_from_slice(&0u32.to_le_bytes()); // biClrImportant
+    dib.extend_from_slice(pixels);
+    Ok(dib)
 }
 
 #[cfg(test)]
@@ -446,19 +559,26 @@ mod tests {
         }
     }
 
-    #[test]
-    fn read_ani_rejects_af_icon_clear() {
-        // Build an AF_ICON-clear header (raw headerless BMP frames).
+    /// Hand-assemble an `AF_ICON`-clear ANI (raw headerless BMP frames)
+    /// from already-built raw frame pixel bodies, with geometry baked
+    /// into the `anih` header. `n_frames` is taken from `frames.len()`.
+    fn build_raw_ani(
+        frames: &[Vec<u8>],
+        width: u32,
+        height: u32,
+        bit_count: u32,
+        i_disp_rate: u32,
+    ) -> Vec<u8> {
         let mut anih = [0u8; 36];
         let put =
             |b: &mut [u8; 36], o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
         put(&mut anih, 0, 36);
-        put(&mut anih, 4, 1); // nFrames
-        put(&mut anih, 12, 8); // iWidth
-        put(&mut anih, 16, 8); // iHeight
-        put(&mut anih, 20, 32); // iBitCount
+        put(&mut anih, 4, frames.len() as u32); // nFrames
+        put(&mut anih, 12, width); // iWidth
+        put(&mut anih, 16, height); // iHeight
+        put(&mut anih, 20, bit_count); // iBitCount
         put(&mut anih, 24, 1); // nPlanes
-        put(&mut anih, 28, 10); // iDispRate
+        put(&mut anih, 28, i_disp_rate); // iDispRate
         put(&mut anih, 32, 0); // bfAttributes: AF_ICON clear
 
         let mut body = Vec::new();
@@ -466,17 +586,91 @@ mod tests {
         push_chunk(&mut body, b"anih", &anih);
         let mut fram = Vec::new();
         fram.extend_from_slice(b"fram");
-        push_chunk(&mut fram, b"icon", &vec![0u8; 8 * 8 * 4]);
+        for f in frames {
+            push_chunk(&mut fram, b"icon", f);
+        }
         push_chunk(&mut body, b"LIST", &fram);
         let mut out = Vec::new();
         out.extend_from_slice(b"RIFF");
         out.extend_from_slice(&(body.len() as u32).to_le_bytes());
         out.extend_from_slice(&body);
+        out
+    }
 
-        let err = read_ani(&out).unwrap_err();
+    /// A bottom-up 32-bpp DIB pixel array (no header) for a `w`×`h` frame
+    /// where every pixel is BGRA `(b, g, r, a)`. Stride is `w*4`, already
+    /// 4-byte aligned at 32 bpp, so no padding is needed.
+    fn raw_bgra32(w: u32, h: u32, bgra: [u8; 4]) -> Vec<u8> {
+        let mut v = Vec::with_capacity((w * h * 4) as usize);
+        for _ in 0..(w * h) {
+            v.extend_from_slice(&bgra);
+        }
+        v
+    }
+
+    #[test]
+    fn read_ani_decodes_af_icon_clear_raw_bmp_32bpp() {
+        // Two raw 4×4 32-bpp frames: BGRA in storage → RGBA on decode.
+        // Frame 0 = pure red (B=0 G=0 R=200 A=255), frame 1 = pure green.
+        let f0 = raw_bgra32(4, 4, [0, 0, 200, 255]);
+        let f1 = raw_bgra32(4, 4, [0, 200, 0, 255]);
+        let ani = build_raw_ani(&[f0, f1], 4, 4, 32, 9);
+
+        let anim = read_ani(&ani).unwrap();
+        assert_eq!(anim.frames.len(), 2);
+        // Each raw frame becomes one Cur sub-image, no hotspot.
+        for frame in &anim.frames {
+            assert_eq!(frame.icon_type, IconType::Cur);
+            assert_eq!(frame.images.len(), 1);
+            let img = &frame.images[0];
+            assert_eq!((img.width, img.height), (4, 4));
+            assert_eq!(img.sub_format, IconSubFormat::Bmp);
+            assert_eq!(img.bit_depth, 32);
+            assert!(img.hotspot.is_none());
+            assert_eq!(img.pixels.len(), 4 * 4 * 4);
+        }
+        // BGRA red stored → top-left RGBA pixel is (200, 0, 0, 255).
+        assert_eq!(&anim.frames[0].images[0].pixels[0..4], &[200, 0, 0, 255]);
+        assert_eq!(&anim.frames[1].images[0].pixels[0..4], &[0, 200, 0, 255]);
+        // Identity timeline (no seq), iDispRate per step.
+        assert_eq!(anim.steps.len(), 2);
+        assert!(anim.steps.iter().all(|s| s.jiffies == 9));
+    }
+
+    #[test]
+    fn read_ani_rejects_indexed_raw_bmp() {
+        // iBitCount <= 8: colour-table presence is undefined per the
+        // ACON reference, so the raw path must refuse rather than guess.
+        let frame = vec![0u8; 8 * 8]; // 8 bpp pixel bytes (1 byte/pixel)
+        let ani = build_raw_ani(&[frame], 8, 8, 8, 10);
+        let err = read_ani(&ani).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("AF_ICON is clear"), "{msg}");
-        assert!(msg.contains("raw_bmp_descriptor"), "{msg}");
+        assert!(msg.contains("indexed"), "{msg}");
+        assert!(msg.contains("iBitCount = 8"), "{msg}");
+    }
+
+    #[test]
+    fn read_ani_rejects_truncated_raw_bmp_frame() {
+        // anih claims 8×8 @ 32 bpp = 256 bytes, but the frame is short.
+        let frame = vec![0u8; 100];
+        let ani = build_raw_ani(&[frame], 8, 8, 32, 10);
+        let err = read_ani(&ani).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("needs"), "{msg}");
+    }
+
+    #[test]
+    fn read_ani_rejects_raw_bmp_unset_geometry() {
+        // AF_ICON clear but iWidth = 0: raw_bmp_descriptor flags the
+        // missing geometry (no per-frame header to fall back on).
+        let frame = vec![0u8; 8 * 8 * 4];
+        let ani = build_raw_ani(&[frame], 0, 8, 32, 10);
+        let err = read_ani(&ani).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.to_lowercase().contains("dimension") || msg.contains("iWidth"),
+            "{msg}"
+        );
     }
 
     #[test]

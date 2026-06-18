@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- read_ani: decode the AF_ICON-clear (headerless raw BMP) frame path for non-indexed depths {16,24,32} — synthesises a BITMAPINFOHEADER from raw_bmp_descriptor and runs the BMP-DIB decoder (one Cur sub-image per frame, no AND mask); indexed depths (<=8 bpp) stay refused since the ACON colour-table layout is undefined
 - anih.bfAttributes: reject reserved bits (31..2) on read + write — only AF_ICON / AF_SEQUENCE are defined
 - write_ani_raw: enforce AF_SEQUENCE flag ⇄ `seq ` chunk coherence
 - add write_ani — RGBA-side ANI encoder (the encode counterpart to read_ani)
