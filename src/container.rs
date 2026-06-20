@@ -26,6 +26,15 @@ pub fn register(reg: &mut ContainerRegistry) {
     reg.register_extension("ico", "ico");
     reg.register_extension("cur", "ico");
     reg.register_probe("ico", probe);
+
+    // ANI (RIFF/`ACON` animated cursor) is a distinct container — its
+    // own demuxer, probe, and `.ani` extension. Demux-only: an ANI is a
+    // playback timeline (frames + `seq `/`rate`), which the round-trip
+    // muxer surface in `ani::write_ani` already covers at the RGBA
+    // level; there is no framework `Muxer` for it.
+    reg.register_demuxer("ani", open_ani_demuxer);
+    reg.register_extension("ani", "ani");
+    reg.register_probe("ani", probe_ani);
 }
 
 /// Recognise ICO + CUR files by their 6-byte `ICONDIR` header.
@@ -275,5 +284,398 @@ fn sniff_bpp(body: &[u8]) -> u16 {
         u16::from_le_bytes([body[14], body[15]])
     } else {
         32
+    }
+}
+
+// ───────────────────────── ANI (RIFF/ACON) demuxer ─────────────────────────
+
+/// Recognise a Windows ANI animated cursor by its `RIFF`…`ACON` header.
+///
+/// Mirrors the ICO probe's two-tier scoring: an unambiguous magic match
+/// (`RIFF` at offset 0 + `ACON` form-type at offset 8) scores
+/// [`MAX_PROBE_SCORE`]; a bare `.ani` extension with no readable header
+/// scores [`PROBE_SCORE_EXTENSION`]. The ICO probe deliberately does
+/// *not* claim ANI (it inspects `idType` at offset 2, which for a RIFF
+/// header reads as the ASCII of `FF`), so the two probes never both fire
+/// at full confidence on the same input.
+fn probe_ani(data: &ProbeData) -> ProbeScore {
+    if data.buf.len() >= 12 && &data.buf[..4] == b"RIFF" && &data.buf[8..12] == b"ACON" {
+        MAX_PROBE_SCORE
+    } else if matches!(data.ext, Some("ani")) {
+        oxideav_core::PROBE_SCORE_EXTENSION
+    } else {
+        0
+    }
+}
+
+/// Open an ANI animated cursor as a framework [`Demuxer`].
+///
+/// The ANI is walked once (via [`crate::read_ani_raw`]) and its
+/// `seq `/`rate` timeline resolved (via
+/// [`crate::AniFile::playback_steps`]) into a flat playback table. The
+/// demuxer then presents the animation as a **single video stream**
+/// whose packets are the playback *steps* in display order: each packet
+/// carries the chosen frame's raw `icon` payload (a complete ICO/CUR
+/// resource on the common `AF_ICON`-set path, ready for the ICO codec or
+/// any PNG/BMP probe to decode) with a presentation timestamp and
+/// duration drawn from the jiffy timeline.
+///
+/// Timing uses the ACON-native 1/60-second jiffy as the stream time
+/// base (`TimeBase::new(1, 60)`), so a packet's `pts` is the cumulative
+/// jiffy offset of its step and `duration` is the step's own jiffy
+/// count — no lossy conversion to another rate. A step that repeats a
+/// stored frame (via `seq `) re-emits that frame's bytes, so a consumer
+/// that just plays packets in order reproduces the full animation,
+/// including out-of-storage-order and repeated frames, without
+/// consulting `seq ` itself.
+///
+/// The single-cycle timeline is emitted once (an ANI cursor loops
+/// indefinitely when shown live, but a demuxer yields one pass and lets
+/// the consumer loop). `AF_ICON`-clear (raw headerless BMP) frames are
+/// carried byte-for-byte too — the geometry needed to decode them lives
+/// in the stream's [`CodecParameters`], populated from `anih`.
+fn open_ani_demuxer(
+    mut input: Box<dyn ReadSeek>,
+    _codecs: &dyn CodecResolver,
+) -> Result<Box<dyn Demuxer>> {
+    input.seek(SeekFrom::Start(0))?;
+    let mut buf = Vec::new();
+    input.read_to_end(&mut buf)?;
+
+    let ani = crate::read_ani_raw(&buf).map_err(oxideav_core::Error::from)?;
+    let steps = ani.playback_steps().map_err(oxideav_core::Error::from)?;
+
+    // Per-frame `icon` payloads, indexed by `AniStep::frame_index`. The
+    // timeline resolver already guaranteed every index is in range.
+    let frames = &ani.frames;
+
+    // One video stream describing the animation. Width/height come from
+    // `anih` when the encoder filled them; otherwise they stay `None`
+    // (the spec's `0` = "take from frame" sentinel — the per-frame
+    // ICO/CUR directory carries the authoritative geometry on the
+    // `AF_ICON` path).
+    let mut params = CodecParameters::video(CodecId::new(crate::CODEC_ID_STR));
+    if ani.header.i_width != 0 {
+        params.width = Some(ani.header.i_width);
+    }
+    if ani.header.i_height != 0 {
+        params.height = Some(ani.header.i_height);
+    }
+    params.pixel_format = Some(PixelFormat::Rgba);
+    // The 1/60-s jiffy is the animation's native cadence; expose it as
+    // the stream's nominal frame rate (steps are not uniform, so this is
+    // the timeline tick, not a fixed fps).
+    params.frame_rate = Some(oxideav_core::Rational::new(60, 1));
+
+    // Resolve INFO metadata (title / author) into the demuxer's
+    // container-level metadata table.
+    let mut metadata = Vec::new();
+    if let Some(title) = ani.info.title_str() {
+        metadata.push(("title".to_owned(), title));
+    }
+    if let Some(author) = ani.info.author_str() {
+        metadata.push(("artist".to_owned(), author));
+    }
+
+    // Build the packet timeline: one packet per playback step, in
+    // display order, with cumulative-jiffy `pts` and per-step
+    // `duration`. `time_base` is 1/60 s so `pts`/`duration` are jiffies.
+    let tb = TimeBase::new(1, 60);
+    let mut packets = Vec::with_capacity(steps.len());
+    let mut cumulative: i64 = 0;
+    for step in &steps {
+        let body = frames
+            .get(step.frame_index as usize)
+            .ok_or_else(|| {
+                Error::invalid(format!(
+                    "ANI: step frame index {} out of range ({} frames)",
+                    step.frame_index,
+                    frames.len()
+                ))
+            })?
+            .clone();
+        let mut pkt = Packet::new(0, tb, body);
+        pkt.pts = Some(cumulative);
+        pkt.dts = Some(cumulative);
+        pkt.duration = Some(step.jiffies as i64);
+        pkt.flags.keyframe = true;
+        packets.push(pkt);
+        cumulative += step.jiffies as i64;
+    }
+
+    // Stream duration is the full single-cycle length in jiffies.
+    let total_jiffies = cumulative;
+    let stream = StreamInfo {
+        index: 0,
+        params,
+        time_base: tb,
+        start_time: Some(0),
+        duration: Some(total_jiffies),
+    };
+
+    // Container duration in microseconds: jiffies × 1_000_000 / 60.
+    let duration_micros = total_jiffies.saturating_mul(1_000_000) / 60;
+
+    Ok(Box::new(AniDemuxer {
+        streams: vec![stream],
+        pending: packets,
+        metadata,
+        duration_micros,
+    }))
+}
+
+struct AniDemuxer {
+    streams: Vec<StreamInfo>,
+    /// Remaining packets, in display order. Drained FIFO.
+    pending: Vec<Packet>,
+    /// Container-level metadata (title / artist) from the `INFO` list.
+    metadata: Vec<(String, String)>,
+    /// Single-cycle duration in microseconds.
+    duration_micros: i64,
+}
+
+impl Demuxer for AniDemuxer {
+    fn format_name(&self) -> &str {
+        "ani"
+    }
+    fn streams(&self) -> &[StreamInfo] {
+        &self.streams
+    }
+    fn next_packet(&mut self) -> Result<Packet> {
+        if self.pending.is_empty() {
+            Err(Error::Eof)
+        } else {
+            Ok(self.pending.remove(0))
+        }
+    }
+    fn metadata(&self) -> &[(String, String)] {
+        &self.metadata
+    }
+    fn duration_micros(&self) -> Option<i64> {
+        Some(self.duration_micros)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ani::{AF_ICON, AF_SEQUENCE};
+    use crate::{write_ico, IconImage, IconType, WriteOptions};
+    use oxideav_core::NullCodecResolver;
+    use std::io::Cursor;
+
+    /// A solid-colour single-sub-image ICO byte stream, forced all-BMP.
+    fn ico_frame(n: u32, rgba: [u8; 4]) -> Vec<u8> {
+        let pixels: Vec<u8> = std::iter::repeat(rgba)
+            .take((n * n) as usize)
+            .flatten()
+            .collect();
+        let img = IconImage::from_rgba(n, n, pixels);
+        write_ico(
+            IconType::Ico,
+            &[img],
+            WriteOptions {
+                png_size_threshold: None,
+            },
+        )
+        .unwrap()
+    }
+
+    fn push_chunk(buf: &mut Vec<u8>, tag: &[u8; 4], payload: &[u8]) {
+        buf.extend_from_slice(tag);
+        buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        buf.extend_from_slice(payload);
+        if payload.len() % 2 == 1 {
+            buf.push(0);
+        }
+    }
+
+    /// Hand-assemble an `AF_ICON`-set ANI from encoded ICO frame bodies.
+    fn build_ani(
+        frames: &[Vec<u8>],
+        n_steps: u32,
+        i_disp_rate: u32,
+        seq: Option<&[u32]>,
+        rate: Option<&[u32]>,
+        info: Option<(&[u8], &[u8])>,
+    ) -> Vec<u8> {
+        let mut anih = [0u8; 36];
+        let put =
+            |b: &mut [u8; 36], o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        put(&mut anih, 0, 36);
+        put(&mut anih, 4, frames.len() as u32);
+        put(&mut anih, 8, n_steps);
+        put(&mut anih, 24, 1);
+        put(&mut anih, 28, i_disp_rate);
+        let attrs = AF_ICON | if seq.is_some() { AF_SEQUENCE } else { 0 };
+        put(&mut anih, 32, attrs);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(b"ACON");
+        push_chunk(&mut body, b"anih", &anih);
+        if let Some((title, author)) = info {
+            let mut info_body = Vec::new();
+            info_body.extend_from_slice(b"INFO");
+            push_chunk(&mut info_body, b"INAM", title);
+            push_chunk(&mut info_body, b"IART", author);
+            push_chunk(&mut body, b"LIST", &info_body);
+        }
+        if let Some(seq) = seq {
+            let p: Vec<u8> = seq.iter().flat_map(|v| v.to_le_bytes()).collect();
+            push_chunk(&mut body, b"seq ", &p);
+        }
+        if let Some(rate) = rate {
+            let p: Vec<u8> = rate.iter().flat_map(|v| v.to_le_bytes()).collect();
+            push_chunk(&mut body, b"rate", &p);
+        }
+        let mut fram = Vec::new();
+        fram.extend_from_slice(b"fram");
+        for f in frames {
+            push_chunk(&mut fram, b"icon", f);
+        }
+        push_chunk(&mut body, b"LIST", &fram);
+
+        let mut out = Vec::new();
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(&body);
+        out
+    }
+
+    fn open_ani(bytes: &[u8]) -> Box<dyn Demuxer> {
+        open_ani_demuxer(Box::new(Cursor::new(bytes.to_vec())), &NullCodecResolver).unwrap()
+    }
+
+    #[test]
+    fn ani_probe_recognises_acon_magic() {
+        let red = ico_frame(8, [200, 10, 10, 255]);
+        let ani = build_ani(&[red], 0, 12, None, None, None);
+        let score = probe_ani(&ProbeData {
+            buf: &ani,
+            ext: None,
+        });
+        assert_eq!(score, MAX_PROBE_SCORE);
+    }
+
+    #[test]
+    fn ani_probe_extension_only_fallback() {
+        let score = probe_ani(&ProbeData {
+            buf: &[0u8; 4],
+            ext: Some("ani"),
+        });
+        assert_eq!(score, oxideav_core::PROBE_SCORE_EXTENSION);
+        let none = probe_ani(&ProbeData {
+            buf: &[0u8; 4],
+            ext: Some("ico"),
+        });
+        assert_eq!(none, 0);
+    }
+
+    #[test]
+    fn ico_probe_does_not_claim_ani_magic() {
+        // A RIFF/ACON header must not score full confidence on the ICO
+        // probe — the two containers stay disjoint.
+        let red = ico_frame(8, [1, 2, 3, 255]);
+        let ani = build_ani(&[red], 0, 12, None, None, None);
+        let ico_score = probe(&ProbeData {
+            buf: &ani,
+            ext: None,
+        });
+        assert_ne!(ico_score, MAX_PROBE_SCORE);
+        let ani_score = probe_ani(&ProbeData {
+            buf: &ani,
+            ext: None,
+        });
+        assert_eq!(ani_score, MAX_PROBE_SCORE);
+    }
+
+    #[test]
+    fn ani_demuxer_single_stream_identity_timeline() {
+        let red = ico_frame(8, [200, 10, 10, 255]);
+        let green = ico_frame(8, [10, 200, 10, 255]);
+        let bodies = [red.clone(), green.clone()];
+        let ani = build_ani(&bodies, 0, 12, None, None, None);
+
+        let mut dx = open_ani(&ani);
+        assert_eq!(dx.format_name(), "ani");
+        // Exactly one video stream regardless of frame/step count.
+        assert_eq!(dx.streams().len(), 1);
+        let s = &dx.streams()[0];
+        assert_eq!(s.params.media_type, MediaType::Video);
+        assert_eq!(s.time_base, TimeBase::new(1, 60));
+        // 2 identity steps × 12 jiffies = 24 jiffies of duration.
+        assert_eq!(s.duration, Some(24));
+
+        // Two packets in display order: frame 0 then frame 1, each
+        // carrying that frame's raw ICO bytes, with jiffy-domain pts.
+        let p0 = dx.next_packet().unwrap();
+        assert_eq!(p0.stream_index, 0);
+        assert_eq!(p0.pts, Some(0));
+        assert_eq!(p0.duration, Some(12));
+        assert!(p0.flags.keyframe);
+        assert_eq!(p0.data, red);
+
+        let p1 = dx.next_packet().unwrap();
+        assert_eq!(p1.pts, Some(12));
+        assert_eq!(p1.duration, Some(12));
+        assert_eq!(p1.data, green);
+
+        assert!(matches!(dx.next_packet(), Err(Error::Eof)));
+    }
+
+    #[test]
+    fn ani_demuxer_seq_rate_drive_packet_timeline() {
+        let a = ico_frame(8, [1, 2, 3, 255]);
+        let b = ico_frame(8, [4, 5, 6, 255]);
+        // 2 stored frames, 4 steps playing 0,1,1,0 with per-step rates.
+        let ani = build_ani(
+            &[a.clone(), b.clone()],
+            4,
+            10,
+            Some(&[0, 1, 1, 0]),
+            Some(&[5, 6, 7, 8]),
+            Some((b"My Cursor", b"Me")),
+        );
+
+        let mut dx = open_ani(&ani);
+        // Four packets — one per playback step, not per stored frame.
+        let pkts: Vec<Packet> = std::iter::from_fn(|| dx.next_packet().ok()).collect();
+        assert_eq!(pkts.len(), 4);
+
+        // seq drives which frame body each step carries.
+        let want_bodies = [&a, &b, &b, &a];
+        let want_durs = [5i64, 6, 7, 8];
+        let mut pts = 0i64;
+        for (i, p) in pkts.iter().enumerate() {
+            assert_eq!(&p.data, want_bodies[i], "step {i} frame body");
+            assert_eq!(p.duration, Some(want_durs[i]), "step {i} duration");
+            assert_eq!(p.pts, Some(pts), "step {i} pts");
+            pts += want_durs[i];
+        }
+        // Cumulative timeline: 5+6+7+8 = 26 jiffies total.
+        assert_eq!(pts, 26);
+    }
+
+    #[test]
+    fn ani_demuxer_surfaces_info_and_duration() {
+        let a = ico_frame(8, [1, 2, 3, 255]);
+        let ani = build_ani(&[a], 0, 30, None, None, Some((b"Spin\0", b"Artist\0")));
+        let dx = open_ani(&ani);
+        let md: Vec<(&str, &str)> = dx
+            .metadata()
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert!(md.contains(&("title", "Spin")));
+        assert!(md.contains(&("artist", "Artist")));
+        // One 30-jiffy step → 0.5 s → 500_000 µs.
+        assert_eq!(dx.duration_micros(), Some(500_000));
+    }
+
+    #[test]
+    fn ani_demuxer_rejects_non_ani_input() {
+        let ico = ico_frame(8, [9, 9, 9, 255]);
+        let err = open_ani_demuxer(Box::new(Cursor::new(ico)), &NullCodecResolver);
+        assert!(err.is_err());
     }
 }

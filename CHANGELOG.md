@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- container: register ANI (RIFF/`ACON`) as a first-class framework `Demuxer` (`"ani"`) — its own probe (RIFF+ACON magic / `.ani` extension) and a demuxer that presents the animation as a single video stream whose packets are the resolved playback timeline (one packet per `seq `/`rate` step, in display order, carrying the chosen frame's raw `icon` bytes, with jiffy-domain `pts`/`duration` on a 1/60-s time base). INFO title/author surface as container metadata; single-cycle length as `duration_micros`. The ICO demuxer continues to refuse ANI input so the two containers stay disjoint
 - read_ani: decode the AF_ICON-clear (headerless raw BMP) frame path for non-indexed depths {16,24,32} — synthesises a BITMAPINFOHEADER from raw_bmp_descriptor and runs the BMP-DIB decoder (one Cur sub-image per frame, no AND mask); indexed depths (<=8 bpp) stay refused since the ACON colour-table layout is undefined
 - anih.bfAttributes: reject reserved bits (31..2) on read + write — only AF_ICON / AF_SEQUENCE are defined
 - write_ani_raw: enforce AF_SEQUENCE flag ⇄ `seq ` chunk coherence

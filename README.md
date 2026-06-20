@@ -194,6 +194,28 @@ and per-step jiffy durations), and a `LIST 'fram'` containing N
 `bfAttributes & AF_ICON` is set (the common case), or a raw
 headerless BMP otherwise.
 
+### Framework demuxer (`"ani"` container)
+
+With the default `registry` feature, `register` wires ANI into the
+`ContainerRegistry` as a distinct container named `"ani"` (separate
+from `"ico"`): a probe that scores RIFF+`ACON` magic at full
+confidence and a bare `.ani` extension at the extension tier, plus a
+demuxer factory. The demuxer presents the animation as a **single
+video stream** whose packets are the *resolved playback timeline* —
+one `Packet` per `seq `/`rate` step, in display order, each carrying
+the chosen frame's raw `icon` bytes (a complete ICO/CUR resource on
+the `AF_ICON` path, ready for the ICO codec or a PNG/BMP probe).
+Timestamps use the ACON-native 1/60-second jiffy as the stream time
+base, so a packet's `pts` is the cumulative jiffy offset and
+`duration` is the step's jiffy count — no lossy rate conversion. A
+step that repeats a stored frame re-emits that frame's bytes, so a
+consumer that just plays packets in order reproduces the full
+animation (including out-of-order and repeated frames) without
+consulting `seq ` itself. INFO `title`/`artist` surface via
+`Demuxer::metadata`; the single-cycle length via
+`Demuxer::duration_micros`. The `"ico"` demuxer continues to refuse
+ANI input, so the two containers stay disjoint at probe time.
+
 ### Decoded playback (`read_ani`)
 
 `read_ani` is the ANI-side counterpart of `read_ico`: where `read_ico`
