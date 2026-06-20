@@ -672,6 +672,86 @@ mod tests {
         assert_eq!(dx.duration_micros(), Some(500_000));
     }
 
+    /// Hand-assemble an `AF_ICON`-clear ANI (raw headerless BMP frames)
+    /// with geometry in `anih`.
+    fn build_raw_ani(
+        frames: &[Vec<u8>],
+        width: u32,
+        height: u32,
+        bit_count: u32,
+        i_disp_rate: u32,
+    ) -> Vec<u8> {
+        let mut anih = [0u8; 36];
+        let put =
+            |b: &mut [u8; 36], o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        put(&mut anih, 0, 36);
+        put(&mut anih, 4, frames.len() as u32);
+        put(&mut anih, 12, width);
+        put(&mut anih, 16, height);
+        put(&mut anih, 20, bit_count);
+        put(&mut anih, 24, 1);
+        put(&mut anih, 28, i_disp_rate);
+        put(&mut anih, 32, 0); // AF_ICON clear
+
+        let mut body = Vec::new();
+        body.extend_from_slice(b"ACON");
+        push_chunk(&mut body, b"anih", &anih);
+        let mut fram = Vec::new();
+        fram.extend_from_slice(b"fram");
+        for f in frames {
+            push_chunk(&mut fram, b"icon", f);
+        }
+        push_chunk(&mut body, b"LIST", &fram);
+        let mut out = Vec::new();
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(&body);
+        out
+    }
+
+    #[test]
+    fn ani_demuxer_carries_af_icon_clear_raw_frames_with_anih_geometry() {
+        // AF_ICON clear: two raw 4×4 32-bpp BMP bodies (no header). The
+        // demuxer passes the raw bytes through and surfaces the anih
+        // geometry on the stream params (the raw bodies are headerless,
+        // so the geometry has nowhere else to live).
+        let f0: Vec<u8> = std::iter::repeat([0u8, 0, 200, 255])
+            .take(16)
+            .flatten()
+            .collect();
+        let f1: Vec<u8> = std::iter::repeat([0u8, 200, 0, 255])
+            .take(16)
+            .flatten()
+            .collect();
+        let ani = build_raw_ani(&[f0.clone(), f1.clone()], 4, 4, 32, 7);
+
+        let mut dx = open_ani(&ani);
+        let s = &dx.streams()[0];
+        // anih geometry is authoritative for the raw path → surfaced.
+        assert_eq!(s.params.width, Some(4));
+        assert_eq!(s.params.height, Some(4));
+
+        let p0 = dx.next_packet().unwrap();
+        assert_eq!(p0.data, f0, "raw frame 0 bytes pass through verbatim");
+        assert_eq!(p0.duration, Some(7));
+        let p1 = dx.next_packet().unwrap();
+        assert_eq!(p1.data, f1, "raw frame 1 bytes pass through verbatim");
+        assert!(matches!(dx.next_packet(), Err(Error::Eof)));
+    }
+
+    #[test]
+    fn ani_demuxer_omits_unset_anih_geometry() {
+        // AF_ICON set with anih width/height = 0 (the "take from frame"
+        // sentinel): the demuxer leaves stream width/height as None
+        // rather than claiming a bogus 0×0.
+        let a = ico_frame(8, [1, 2, 3, 255]);
+        let ani = build_ani(&[a], 0, 12, None, None, None);
+        let dx = open_ani(&ani);
+        let s = &dx.streams()[0];
+        assert_eq!(s.params.width, None);
+        assert_eq!(s.params.height, None);
+    }
+
     #[test]
     fn ani_demuxer_rejects_non_ani_input() {
         let ico = ico_frame(8, [9, 9, 9, 255]);
