@@ -64,8 +64,8 @@ pub use ani::{
 pub use error::{IcoError, Result};
 pub use raw::{read_ico_raw, write_ico_raw, IconEntryRaw};
 pub use types::{
-    select_best_fit, select_by_dimensions, select_largest, HotSpot, IconImage, IconSubFormat,
-    IconType, WriteOptions,
+    select_best_fit, select_best_fit_raw, select_by_dimensions, select_by_dimensions_raw,
+    select_largest, select_largest_raw, HotSpot, IconImage, IconSubFormat, IconType, WriteOptions,
 };
 
 // ---------------------------------------------------------------------------

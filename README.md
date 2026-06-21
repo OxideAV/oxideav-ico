@@ -114,6 +114,34 @@ let idx = select_by_dimensions(&images, 256, 256);
 `LookupIconIdFromDirectoryEx`; `select_by_dimensions` is the strict
 equality variant for callers that want a specific size or nothing.
 
+### Directory-level selection (before any decode)
+
+The three `select_*` functions above operate on a `Vec<IconImage>` —
+i.e. **after** every sub-image has been decoded to RGBA. Windows'
+`LookupIconIdFromDirectoryEx` works the other way around: it picks a
+*directory entry* from its `bWidth` / `bHeight` / `wBitCount` first,
+then decodes only the chosen body. The `select_*_raw` family mirrors
+that order, running the same heuristics over the undecoded
+`IconEntryRaw` rows from `read_ico_raw`:
+
+```rust
+use oxideav_ico::{read_ico_raw, select_best_fit_raw};
+
+let (_ty, entries) = read_ico_raw(&bytes)?;
+// Closest fit for a 32-px slot — chosen from directory metadata only,
+// no PNG / BMP body decoded yet.
+let idx = select_best_fit_raw(&entries, 32).unwrap();
+let chosen = &entries[idx];           // now decode just chosen.data
+```
+
+`select_largest_raw` and `select_by_dimensions_raw` are the directory
+counterparts of `select_largest` / `select_by_dimensions`. All three
+share the decoded family's exact tie-break rules (highest bit depth
+wins at equal size), and — like `read_ico_raw` itself — are available
+with `default-features = false` (no `oxideav-core` dependency). A
+caller that only needs one resolution from a multi-entry `.ico` saves
+N-1 sub-image decodes.
+
 ## Validation surface
 
 `read_ico_raw` rejects malformed directories before they reach a

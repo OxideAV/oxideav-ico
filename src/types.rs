@@ -95,6 +95,126 @@ impl Default for WriteOptions {
     }
 }
 
+/// The three directory-row facts the sub-image selectors compare on:
+/// pixel dimensions plus advertised bit depth. Both [`IconImage`]
+/// (decoded RGBA) and [`IconEntryRaw`] (undecoded directory row +
+/// payload bytes) expose these, so the selection heuristics work over
+/// either without forcing the caller to decode every body just to pick
+/// one. The free `select_*` functions take `&[IconImage]`; the
+/// `select_*_raw` functions take `&[IconEntryRaw]` and share the exact
+/// same tie-break rules through this trait.
+pub(crate) trait Selectable {
+    fn sel_width(&self) -> u32;
+    fn sel_height(&self) -> u32;
+    fn sel_bit_depth(&self) -> u8;
+}
+
+impl Selectable for IconImage {
+    fn sel_width(&self) -> u32 {
+        self.width
+    }
+    fn sel_height(&self) -> u32 {
+        self.height
+    }
+    fn sel_bit_depth(&self) -> u8 {
+        self.bit_depth
+    }
+}
+
+impl Selectable for crate::raw::IconEntryRaw {
+    fn sel_width(&self) -> u32 {
+        self.width
+    }
+    fn sel_height(&self) -> u32 {
+        self.height
+    }
+    fn sel_bit_depth(&self) -> u8 {
+        self.bit_depth
+    }
+}
+
+/// Generic `select_best_fit` over any [`Selectable`] slice. The public
+/// `select_best_fit` / `select_best_fit_raw` are thin wrappers.
+pub(crate) fn select_best_fit_impl<T: Selectable>(items: &[T], target: u32) -> Option<usize> {
+    if items.is_empty() {
+        return None;
+    }
+    // First pass: smallest entry whose max-dim is ≥ target.
+    let mut best: Option<usize> = None;
+    for (i, im) in items.iter().enumerate() {
+        let max_dim = im.sel_width().max(im.sel_height());
+        if max_dim < target {
+            continue;
+        }
+        let better = match best {
+            None => true,
+            Some(j) => {
+                let cur = items[j].sel_width().max(items[j].sel_height());
+                match max_dim.cmp(&cur) {
+                    core::cmp::Ordering::Less => true,
+                    core::cmp::Ordering::Equal => im.sel_bit_depth() > items[j].sel_bit_depth(),
+                    core::cmp::Ordering::Greater => false,
+                }
+            }
+        };
+        if better {
+            best = Some(i);
+        }
+    }
+    if best.is_some() {
+        return best;
+    }
+    // Fallback: every entry is smaller than `target`. Return the
+    // largest one — the closest we have without making the user
+    // upscale a tiny entry.
+    Some(select_largest_impl(items).expect("non-empty slice has a largest entry"))
+}
+
+/// Generic `select_largest` over any [`Selectable`] slice.
+pub(crate) fn select_largest_impl<T: Selectable>(items: &[T]) -> Option<usize> {
+    if items.is_empty() {
+        return None;
+    }
+    let mut best = 0;
+    for i in 1..items.len() {
+        let im = &items[i];
+        let cur = &items[best];
+        let im_area = (im.sel_width() as u64) * (im.sel_height() as u64);
+        let cur_area = (cur.sel_width() as u64) * (cur.sel_height() as u64);
+        let pick = match im_area.cmp(&cur_area) {
+            core::cmp::Ordering::Greater => true,
+            core::cmp::Ordering::Equal => im.sel_bit_depth() > cur.sel_bit_depth(),
+            core::cmp::Ordering::Less => false,
+        };
+        if pick {
+            best = i;
+        }
+    }
+    Some(best)
+}
+
+/// Generic `select_by_dimensions` over any [`Selectable`] slice.
+pub(crate) fn select_by_dimensions_impl<T: Selectable>(
+    items: &[T],
+    width: u32,
+    height: u32,
+) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for (i, im) in items.iter().enumerate() {
+        if im.sel_width() != width || im.sel_height() != height {
+            continue;
+        }
+        let better = match best {
+            None => true,
+            Some(j) => im.sel_bit_depth() > items[j].sel_bit_depth(),
+        };
+        if better {
+            best = Some(i);
+        }
+    }
+    best
+}
+
 /// Pick the sub-image that best fits a target render size, returning
 /// its index in `images`. Returns `None` only when the slice is empty.
 ///
@@ -112,39 +232,14 @@ impl Default for WriteOptions {
 /// `target` is in pixels and applies to the longer side of each
 /// candidate; this matches how shell icons are sized (a 32×32 entry
 /// fits any target up to 32 px).
+///
+/// See [`select_best_fit_raw`] for the directory-level variant that
+/// runs the same heuristic over undecoded [`IconEntryRaw`] rows — so a
+/// caller can pick a sub-image *before* spending a PNG / BMP decode on
+/// it (exactly the order Windows' `LookupIconIdFromDirectoryEx` works
+/// in).
 pub fn select_best_fit(images: &[IconImage], target: u32) -> Option<usize> {
-    if images.is_empty() {
-        return None;
-    }
-    // First pass: smallest entry whose max-dim is ≥ target.
-    let mut best: Option<usize> = None;
-    for (i, im) in images.iter().enumerate() {
-        let max_dim = im.width.max(im.height);
-        if max_dim < target {
-            continue;
-        }
-        let better = match best {
-            None => true,
-            Some(j) => {
-                let cur = images[j].width.max(images[j].height);
-                match max_dim.cmp(&cur) {
-                    core::cmp::Ordering::Less => true,
-                    core::cmp::Ordering::Equal => im.bit_depth > images[j].bit_depth,
-                    core::cmp::Ordering::Greater => false,
-                }
-            }
-        };
-        if better {
-            best = Some(i);
-        }
-    }
-    if best.is_some() {
-        return best;
-    }
-    // Fallback: every entry is smaller than `target`. Return the
-    // largest one — the closest we have without making the user
-    // upscale a tiny entry.
-    Some(select_largest(images).expect("non-empty slice has a largest entry"))
+    select_best_fit_impl(images, target)
 }
 
 /// Pick the largest sub-image by pixel area. Ties broken by bit depth
@@ -153,26 +248,11 @@ pub fn select_best_fit(images: &[IconImage], target: u32) -> Option<usize> {
 /// Useful when the caller wants the highest-fidelity entry regardless
 /// of render size — e.g. extracting the canonical "main" icon from a
 /// multi-resolution `.ico` to feed a thumbnail pipeline.
+///
+/// See [`select_largest_raw`] for the directory-level variant over
+/// undecoded [`IconEntryRaw`] rows.
 pub fn select_largest(images: &[IconImage]) -> Option<usize> {
-    if images.is_empty() {
-        return None;
-    }
-    let mut best = 0;
-    for i in 1..images.len() {
-        let im = &images[i];
-        let cur = &images[best];
-        let im_area = (im.width as u64) * (im.height as u64);
-        let cur_area = (cur.width as u64) * (cur.height as u64);
-        let pick = match im_area.cmp(&cur_area) {
-            core::cmp::Ordering::Greater => true,
-            core::cmp::Ordering::Equal => im.bit_depth > cur.bit_depth,
-            core::cmp::Ordering::Less => false,
-        };
-        if pick {
-            best = i;
-        }
-    }
-    Some(best)
+    select_largest_impl(images)
 }
 
 /// Find the sub-image whose stored dimensions are **exactly**
@@ -192,21 +272,68 @@ pub fn select_largest(images: &[IconImage]) -> Option<usize> {
 /// precisely 256×256 and would rather fail than rescale) and
 /// [`select_best_fit`] when a nearest-fit-with-downscale is
 /// acceptable.
+///
+/// See [`select_by_dimensions_raw`] for the directory-level variant
+/// over undecoded [`IconEntryRaw`] rows.
 pub fn select_by_dimensions(images: &[IconImage], width: u32, height: u32) -> Option<usize> {
-    let mut best: Option<usize> = None;
-    for (i, im) in images.iter().enumerate() {
-        if im.width != width || im.height != height {
-            continue;
-        }
-        let better = match best {
-            None => true,
-            Some(j) => im.bit_depth > images[j].bit_depth,
-        };
-        if better {
-            best = Some(i);
-        }
-    }
-    best
+    select_by_dimensions_impl(images, width, height)
+}
+
+// ---------------------------------------------------------------------------
+// Directory-level (raw) selection.
+//
+// These mirror the decoded `select_*` family but run against the
+// undecoded [`IconEntryRaw`] directory rows `read_ico_raw` produces.
+// Windows' own `LookupIconIdFromDirectoryEx` picks a directory entry
+// from its `bWidth` / `bHeight` / `wBitCount` *before* the sub-image
+// body is ever decoded; these helpers let a caller follow that order —
+// select the entry, then decode only the chosen body — instead of
+// decoding every PNG / BMP sub-image just to call the decoded
+// `select_*` family.
+//
+// The dimension and bit-depth values come straight from the directory
+// row (with the `bWidth`/`bHeight` `0 → 256` convention already applied
+// by `read_ico_raw`), so the selection is byte-cheap: no payload is
+// touched. The tie-break rules are identical to the decoded variants
+// (highest bit depth wins at equal size), since both delegate to the
+// same generic core.
+// ---------------------------------------------------------------------------
+
+/// Directory-level [`select_best_fit`]: pick the [`IconEntryRaw`] whose
+/// stored size best fits `target`, returning its index in `entries`.
+///
+/// Identical heuristic to [`select_best_fit`] — smallest entry whose
+/// longer side is `≥ target`, falling back to the largest entry when
+/// every row is smaller, with the highest-bit-depth tie-break — but
+/// run over the undecoded directory rows from [`read_ico_raw`](crate::read_ico_raw).
+/// A shell-style caller that knows its render size can pick the right
+/// sub-image first and then decode only that one entry's payload bytes,
+/// matching the order Windows' `LookupIconIdFromDirectoryEx` resolves
+/// an icon in.
+///
+/// Returns `None` only when `entries` is empty.
+pub fn select_best_fit_raw(entries: &[crate::raw::IconEntryRaw], target: u32) -> Option<usize> {
+    select_best_fit_impl(entries, target)
+}
+
+/// Directory-level [`select_largest`]: pick the largest-area
+/// [`IconEntryRaw`] (highest-bit-depth tie-break) without decoding any
+/// payload. Returns `None` only when `entries` is empty.
+pub fn select_largest_raw(entries: &[crate::raw::IconEntryRaw]) -> Option<usize> {
+    select_largest_impl(entries)
+}
+
+/// Directory-level [`select_by_dimensions`]: strict pixel-exact lookup
+/// over the undecoded [`IconEntryRaw`] rows. Returns the index of the
+/// row whose stored `width × height` equals the request (highest bit
+/// depth wins when several rows share that size), or `None` when no row
+/// matches — no nearest-fit substitution (that's [`select_best_fit_raw`]).
+pub fn select_by_dimensions_raw(
+    entries: &[crate::raw::IconEntryRaw],
+    width: u32,
+    height: u32,
+) -> Option<usize> {
+    select_by_dimensions_impl(entries, width, height)
 }
 
 #[cfg(test)]
@@ -323,5 +450,114 @@ mod tests {
         let images = [img(16, 48, 32), img(48, 16, 32)];
         assert_eq!(select_by_dimensions(&images, 16, 48), Some(0));
         assert_eq!(select_by_dimensions(&images, 48, 16), Some(1));
+    }
+
+    // ───────────────────────── directory-level (raw) ─────────────────────────
+
+    /// A directory row with no payload bytes — selection never touches
+    /// `data`, so an empty body is fine for these tests.
+    fn entry(w: u32, h: u32, bpp: u8) -> crate::raw::IconEntryRaw {
+        crate::raw::IconEntryRaw {
+            width: w,
+            height: h,
+            bit_depth: bpp,
+            sub_format: IconSubFormat::Bmp,
+            hotspot: None,
+            data: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn select_largest_raw_empty() {
+        assert!(select_largest_raw(&[]).is_none());
+    }
+
+    #[test]
+    fn select_largest_raw_picks_max_area() {
+        let entries = [entry(16, 16, 32), entry(64, 64, 32), entry(32, 32, 32)];
+        assert_eq!(select_largest_raw(&entries), Some(1));
+    }
+
+    #[test]
+    fn select_largest_raw_breaks_tie_on_bpp() {
+        let entries = [entry(32, 32, 1), entry(32, 32, 32)];
+        assert_eq!(select_largest_raw(&entries), Some(1));
+    }
+
+    #[test]
+    fn select_best_fit_raw_empty() {
+        assert!(select_best_fit_raw(&[], 32).is_none());
+    }
+
+    #[test]
+    fn select_best_fit_raw_smallest_entry_at_or_above_target() {
+        let entries = [
+            entry(16, 16, 32),
+            entry(32, 32, 32),
+            entry(64, 64, 32),
+            entry(128, 128, 32),
+        ];
+        assert_eq!(select_best_fit_raw(&entries, 32), Some(1));
+    }
+
+    #[test]
+    fn select_best_fit_raw_falls_back_to_largest_when_all_smaller() {
+        let entries = [entry(16, 16, 32), entry(32, 32, 32), entry(48, 48, 32)];
+        assert_eq!(select_best_fit_raw(&entries, 256), Some(2));
+    }
+
+    #[test]
+    fn select_best_fit_raw_breaks_tie_on_bpp() {
+        let entries = [entry(32, 32, 1), entry(32, 32, 32)];
+        assert_eq!(select_best_fit_raw(&entries, 32), Some(1));
+    }
+
+    #[test]
+    fn select_best_fit_raw_handles_non_square_entries() {
+        let entries = [entry(16, 16, 32), entry(16, 48, 32), entry(64, 64, 32)];
+        assert_eq!(select_best_fit_raw(&entries, 32), Some(1));
+    }
+
+    #[test]
+    fn select_by_dimensions_raw_exact_match() {
+        let entries = [entry(16, 16, 32), entry(32, 32, 32), entry(256, 256, 32)];
+        assert_eq!(select_by_dimensions_raw(&entries, 32, 32), Some(1));
+        assert_eq!(select_by_dimensions_raw(&entries, 256, 256), Some(2));
+    }
+
+    #[test]
+    fn select_by_dimensions_raw_no_match_returns_none() {
+        let entries = [entry(16, 16, 32), entry(32, 32, 32), entry(64, 64, 32)];
+        assert!(select_by_dimensions_raw(&entries, 48, 48).is_none());
+    }
+
+    #[test]
+    fn select_by_dimensions_raw_breaks_tie_on_bpp() {
+        let entries = [entry(32, 32, 1), entry(32, 32, 32)];
+        assert_eq!(select_by_dimensions_raw(&entries, 32, 32), Some(1));
+    }
+
+    #[test]
+    fn raw_and_decoded_selectors_agree() {
+        // The raw and decoded families must resolve to the same index
+        // when fed the same (width, height, bit-depth) facts — the
+        // whole point of sharing the generic core. Mixed sizes + a
+        // legacy/modern bit-depth tie at 32×32.
+        let facts = [(16u32, 16u32, 1u8), (32, 32, 1), (32, 32, 32), (64, 64, 32)];
+        let images: Vec<IconImage> = facts.iter().map(|&(w, h, b)| img(w, h, b)).collect();
+        let entries: Vec<crate::raw::IconEntryRaw> =
+            facts.iter().map(|&(w, h, b)| entry(w, h, b)).collect();
+
+        for target in [1u32, 16, 24, 32, 48, 64, 128, 256] {
+            assert_eq!(
+                select_best_fit(&images, target),
+                select_best_fit_raw(&entries, target),
+                "best_fit disagreed at target {target}"
+            );
+        }
+        assert_eq!(select_largest(&images), select_largest_raw(&entries));
+        // The 32×32 tie must resolve to the 32-bpp row (index 2) in both.
+        assert_eq!(select_by_dimensions(&images, 32, 32), Some(2));
+        assert_eq!(select_by_dimensions_raw(&entries, 32, 32), Some(2));
     }
 }
