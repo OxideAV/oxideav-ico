@@ -90,6 +90,35 @@ pub struct AniFrame {
     pub images: Vec<IconImage>,
 }
 
+impl AniFrame {
+    /// The sub-image a renderer would actually display for this frame:
+    /// the largest by area (highest bit depth breaks a size tie), via
+    /// the same [`select_largest`] heuristic the static-ICO API uses.
+    ///
+    /// Never `None` for a frame [`read_ani`] produces — every frame
+    /// carries at least one sub-image (the parser rejects an empty
+    /// directory) — but returns `Option` so a hand-built `AniFrame` with
+    /// an empty `images` doesn't panic.
+    pub fn primary_image(&self) -> Option<&IconImage> {
+        select_largest(&self.images).map(|i| &self.images[i])
+    }
+
+    /// The cursor hotspot to use when this frame is on screen: the
+    /// hotspot of the frame's [`primary_image`](Self::primary_image).
+    ///
+    /// `None` for an `Ico`-typed frame (icons have no click point) and
+    /// for any `Cur` frame whose primary sub-image didn't carry one. An
+    /// animated cursor's hotspot can change frame to frame (each frame is
+    /// a full CUR resource with its own directory), so a renderer reads
+    /// it per displayed frame rather than once for the whole animation.
+    pub fn hotspot(&self) -> Option<HotSpot> {
+        if self.icon_type != IconType::Cur {
+            return None;
+        }
+        self.primary_image().and_then(|im| im.hotspot)
+    }
+}
+
 /// A fully decoded ANI animated cursor: every stored frame decoded to
 /// RGBA, plus the resolved playback timeline.
 ///
@@ -256,6 +285,33 @@ impl AniAnimation {
             )));
         }
         self.step_at_jiffy(jiffies_f as u64)
+    }
+
+    /// The stored frame displayed at playback step `step_index` — i.e.
+    /// `frames[steps[step_index].frame_index]`, resolving the `seq `
+    /// indirection so the caller doesn't index two tables by hand.
+    ///
+    /// `step_index` is a subscript into [`Self::steps`] (as returned by
+    /// [`Self::step_at_jiffy`] / [`Self::step_at_second`]). Returns `None`
+    /// when `step_index` is out of range for `steps`. The inner
+    /// `frame_index` is always valid for [`Self::frames`] in any
+    /// [`AniAnimation`] [`read_ani`] produces — the timeline resolver
+    /// guarantees it — so this only `None`s on a bad `step_index`.
+    pub fn frame_at_step(&self, step_index: usize) -> Option<&AniFrame> {
+        let step = self.steps.get(step_index)?;
+        self.frames.get(step.frame_index as usize)
+    }
+
+    /// The cursor hotspot active at playback step `step_index`: the
+    /// [`hotspot`](AniFrame::hotspot) of the frame shown at that step.
+    ///
+    /// `None` when `step_index` is out of range, when the displayed frame
+    /// is `Ico`-typed, or when its primary sub-image carried no hotspot.
+    /// Combine with [`Self::step_at_jiffy`] for the per-tick query a
+    /// cursor renderer needs: "which step is on screen, and where is its
+    /// click point?".
+    pub fn hotspot_at_step(&self, step_index: usize) -> Option<HotSpot> {
+        self.frame_at_step(step_index).and_then(AniFrame::hotspot)
     }
 }
 
@@ -764,5 +820,81 @@ mod tests {
         assert!(anim.step_at_second(f64::INFINITY).is_err());
         // Past the cycle end delegates to step_at_jiffy's rejection.
         assert!(anim.step_at_second(26.0 / 60.0).is_err());
+    }
+
+    /// A complete single-sub-image CUR byte stream carrying a hotspot,
+    /// forced all-BMP so `read_ico` decodes it without PNG involvement.
+    fn cur_frame(n: u32, rgba: [u8; 4], hot: HotSpot) -> Vec<u8> {
+        let mut img = IconImage::from_rgba(n, n, solid_rgba(n, rgba));
+        img.hotspot = Some(hot);
+        let opts = WriteOptions {
+            png_size_threshold: None,
+        };
+        write_ico(IconType::Cur, &[img], opts).unwrap()
+    }
+
+    #[test]
+    fn ani_frame_primary_image_picks_largest_sub_image() {
+        // A frame carrying 8×8 and 16×16 sub-images: the primary is the
+        // 16×16 (largest area). Build a two-resolution ICO frame.
+        let imgs = vec![
+            IconImage::from_rgba(8, 8, solid_rgba(8, [1, 2, 3, 255])),
+            IconImage::from_rgba(16, 16, solid_rgba(16, [9, 9, 9, 255])),
+        ];
+        let frame_bytes = write_ico(
+            IconType::Ico,
+            &imgs,
+            WriteOptions {
+                png_size_threshold: None,
+            },
+        )
+        .unwrap();
+        let ani = build_ani(&[frame_bytes], 0, 12, None, None, None);
+        let anim = read_ani(&ani).unwrap();
+        let primary = anim.frames[0].primary_image().unwrap();
+        assert_eq!((primary.width, primary.height), (16, 16));
+        // Ico frame → no hotspot regardless of sub-images.
+        assert_eq!(anim.frames[0].hotspot(), None);
+    }
+
+    #[test]
+    fn ani_cur_frame_hotspot_surfaces_per_frame() {
+        // Two CUR frames with *different* hotspots — a renderer must read
+        // the hotspot of whichever frame is on screen, not a single
+        // animation-wide value.
+        let f0 = cur_frame(16, [200, 0, 0, 255], HotSpot { x: 3, y: 4 });
+        let f1 = cur_frame(16, [0, 200, 0, 255], HotSpot { x: 11, y: 12 });
+        let ani = build_ani(&[f0, f1], 0, 12, None, None, None);
+        let anim = read_ani(&ani).unwrap();
+
+        assert_eq!(anim.frames[0].icon_type, IconType::Cur);
+        assert_eq!(anim.frames[0].hotspot(), Some(HotSpot { x: 3, y: 4 }));
+        assert_eq!(anim.frames[1].hotspot(), Some(HotSpot { x: 11, y: 12 }));
+    }
+
+    #[test]
+    fn ani_frame_at_step_resolves_seq_indirection() {
+        // seq plays 1,0,1 — frame_at_step must follow the seq index into
+        // the frame table, returning the *displayed* frame per step.
+        let f0 = cur_frame(16, [200, 0, 0, 255], HotSpot { x: 3, y: 4 });
+        let f1 = cur_frame(16, [0, 200, 0, 255], HotSpot { x: 11, y: 12 });
+        let ani = build_ani(&[f0, f1], 3, 12, Some(&[1, 0, 1]), Some(&[5, 6, 7]), None);
+        let anim = read_ani(&ani).unwrap();
+
+        // Step 0 shows frame 1, step 1 shows frame 0, step 2 shows frame 1.
+        assert_eq!(anim.hotspot_at_step(0), Some(HotSpot { x: 11, y: 12 }));
+        assert_eq!(anim.hotspot_at_step(1), Some(HotSpot { x: 3, y: 4 }));
+        assert_eq!(anim.hotspot_at_step(2), Some(HotSpot { x: 11, y: 12 }));
+
+        // frame_at_step ties to step_at_jiffy: jiffy 6 is in step 1's
+        // interval [5,11), which displays frame 0 (hotspot 3,4).
+        let step = anim.step_at_jiffy(6).unwrap();
+        assert_eq!(step, 1);
+        let frame = anim.frame_at_step(step).unwrap();
+        assert_eq!(frame.hotspot(), Some(HotSpot { x: 3, y: 4 }));
+
+        // Out-of-range step → None, no panic.
+        assert!(anim.frame_at_step(3).is_none());
+        assert_eq!(anim.hotspot_at_step(99), None);
     }
 }

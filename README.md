@@ -279,6 +279,24 @@ range for `AniAnimation::frames`. The timeline is resolved *before* the
 frame decode, so the seq/rate validation surfaces ahead of any pixel
 work.
 
+For a cursor renderer, `AniFrame::primary_image()` returns the
+sub-image a frame would actually display (the largest, via the same
+`select_largest` heuristic the static API uses) and `AniFrame::hotspot()`
+its click point (`None` for an `Ico`-typed frame). Since an animated
+cursor's hotspot can change frame to frame — each frame is a full CUR
+resource with its own directory — `AniAnimation::frame_at_step(i)` /
+`hotspot_at_step(i)` resolve the `seq ` indirection so a timeline-driven
+loop gets the displayed frame and its active hotspot per step directly:
+
+```rust
+let anim = read_ani(&std::fs::read("cursor.ani")?)?;
+// At some elapsed jiffy offset into one cycle:
+let step = anim.step_at_jiffy(elapsed % anim.total_jiffies())?;
+let frame = anim.frame_at_step(step).unwrap();
+let hot = anim.hotspot_at_step(step);   // where to anchor the cursor now
+let display = frame.primary_image().unwrap();
+```
+
 `AniAnimation` also carries the same wall-clock helpers `AniFile` does,
 computed straight off its already-resolved `steps` table (no re-running
 the defaulting rules): `total_jiffies()` (cycle length in 1/60-second
