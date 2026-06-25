@@ -888,6 +888,20 @@ pub fn write_ani_raw(ani: &AniFile) -> Result<Vec<u8>> {
     let header = &ani.header;
 
     // --- header field ranges (mirror parse_anih) -----------------------
+    // `cbSize` mirror of the read-side check: the ANIHEADER's nine fields
+    // occupy 36 bytes, so a `cb_size` claiming a smaller structure is one
+    // `parse_anih` would later reject — refuse to emit it here so the
+    // writer never produces a file its own reader bounces (the same
+    // round-trip-asymmetry guard the `bfAttributes` / `nPlanes` mirrors
+    // give). A hand-built `AniFile` is the only way to reach this layer
+    // with `cb_size < 36`; `read_ani_raw` never yields one.
+    if header.cb_size < 36 {
+        return Err(Error::invalid(format!(
+            "ANI: write: header.cb_size = {} (must be >= 36 — the ANIHEADER's \
+             nine fields occupy 36 bytes)",
+            header.cb_size
+        )));
+    }
     if header.n_frames == 0 {
         return Err(Error::invalid(
             "ANI: write: header.n_frames = 0 (need at least one frame)",
@@ -1169,6 +1183,28 @@ fn parse_anih(payload: &[u8]) -> Result<AniHeader> {
         i_disp_rate: r(28),
         bf_attributes: r(32),
     };
+    // `cbSize` consistency. Per spec (`docs/image/ico/ani-acon-format.md`
+    // §'anih') the field "repeats that value [the 36-byte chunk length]
+    // as the first field"; the §'anih' note then directs the decoder to
+    // "prefer the chunk length for bounds and validate `cbSize`". The
+    // nine ANIHEADER fields physically occupy 36 bytes, so a `cbSize`
+    // claiming the structure is *smaller* than 36 contradicts the layout
+    // the parser just read — same probe-vs-render shape as the rest of
+    // the header range checks: a probe that trusted `cbSize` as the
+    // header extent would walk a different field map than the renderer.
+    // Reject `cbSize < 36` up front. A `cbSize > 36` is tolerated (the
+    // spec's "some encoders write a slightly different cbSize" caveat,
+    // and the chunk length — already validated by `read_chunk` — is the
+    // authoritative bound, so a larger self-claim is merely informational
+    // tail we ignore).
+    if header.cb_size < 36 {
+        return Err(Error::invalid(format!(
+            "ANI: anih.cbSize = {} (must be >= 36 — the ANIHEADER's nine \
+             fields occupy 36 bytes; a smaller self-reported size cannot \
+             describe the structure)",
+            header.cb_size
+        )));
+    }
     if header.n_frames == 0 {
         return Err(Error::invalid(
             "ANI: anih.nFrames = 0 (need at least one frame)",
@@ -1623,6 +1659,37 @@ mod tests {
         bytes[44..48].copy_from_slice(&0u32.to_le_bytes());
         let parsed = read_ani_raw(&bytes).unwrap();
         assert_eq!(parsed.header.n_planes, 0);
+    }
+
+    #[test]
+    fn rejects_anih_cb_size_below_36() {
+        // Per spec the `anih.cbSize` field repeats the 36-byte chunk
+        // length; the §'anih' note directs the decoder to validate it. A
+        // self-reported size below 36 cannot describe the nine-field
+        // ANIHEADER and is rejected. cbSize sits at anih_payload offset 0
+        // → file offset (RIFF8 + ACON4 + "anih"4 + size4) + 0 = 20.
+        let mut bytes = build_minimal_ani(1, 1);
+        bytes[20..24].copy_from_slice(&20u32.to_le_bytes());
+        let err = read_ani_raw(&bytes).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => {
+                assert!(msg.contains("cbSize") && msg.contains(">= 36"), "{msg}")
+            }
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_anih_cb_size_above_36_tolerance() {
+        // A `cbSize` larger than 36 is tolerated: the spec's "some
+        // encoders write a slightly different cbSize" caveat plus the
+        // chunk length being the authoritative bound. The extra-claim
+        // tail is ignored; the nine canonical fields still parse.
+        let mut bytes = build_minimal_ani(1, 1);
+        bytes[20..24].copy_from_slice(&64u32.to_le_bytes());
+        let parsed = read_ani_raw(&bytes).unwrap();
+        assert_eq!(parsed.header.cb_size, 64);
+        assert_eq!(parsed.header.n_frames, 1);
     }
 
     #[test]
@@ -3528,6 +3595,18 @@ mod tests {
         let mut depth = base;
         depth.header.i_bit_count = 7;
         assert!(write_ani_raw(&depth).is_err());
+    }
+
+    #[test]
+    fn write_rejects_cb_size_below_36() {
+        // Mirror of the read-side `cbSize < 36` reject: a header whose
+        // `cb_size` can't describe the nine-field ANIHEADER is one
+        // `parse_anih` would later bounce, so the writer refuses to emit
+        // it (round-trip-asymmetry guard).
+        let mut parsed = read_ani_raw(&build_minimal_ani(1, 1)).unwrap();
+        parsed.header.cb_size = 12;
+        let err = write_ani_raw(&parsed).unwrap_err();
+        assert!(err.to_string().contains("cb_size") && err.to_string().contains(">= 36"));
     }
 
     #[test]
