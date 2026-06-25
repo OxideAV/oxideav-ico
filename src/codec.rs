@@ -149,3 +149,137 @@ pub(crate) fn decode_sub_image_bytes(payload: &[u8], pts: Option<i64>) -> Result
         Ok(f)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxideav_core::{MediaType, VectorFrame, VideoPlane};
+
+    /// A solid-colour RGBA `VideoFrame` (`stride = w * 4`, top-down).
+    fn rgba_frame(w: u32, h: u32, rgba: [u8; 4]) -> VideoFrame {
+        let mut data = Vec::with_capacity((w * h * 4) as usize);
+        for _ in 0..(w * h) {
+            data.extend_from_slice(&rgba);
+        }
+        VideoFrame {
+            pts: None,
+            planes: vec![VideoPlane {
+                stride: (w * 4) as usize,
+                data,
+            }],
+        }
+    }
+
+    fn params(w: u32, h: u32) -> CodecParameters {
+        let mut p = CodecParameters::video(CodecId::new(crate::CODEC_ID_STR));
+        p.width = Some(w);
+        p.height = Some(h);
+        p.pixel_format = Some(PixelFormat::Rgba);
+        p
+    }
+
+    #[test]
+    fn make_encoder_defaults_pixel_format_and_carries_dims() {
+        let mut p = CodecParameters::video(CodecId::new(crate::CODEC_ID_STR));
+        p.width = Some(16);
+        p.height = Some(16);
+        // pixel_format left None — the encoder must default it to Rgba.
+        let enc = make_encoder(&p).unwrap();
+        let out = enc.output_params();
+        assert_eq!(out.media_type, MediaType::Video);
+        assert_eq!(out.width, Some(16));
+        assert_eq!(out.height, Some(16));
+        assert_eq!(out.pixel_format, Some(PixelFormat::Rgba));
+        assert_eq!(out.codec_id.as_str(), crate::CODEC_ID_STR);
+    }
+
+    #[test]
+    fn encoder_round_trips_bmp_sub_image_through_decoder() {
+        // 16×16 is below the encoder's PNG threshold (64), so it emits a
+        // BMP-DIB body. Encode a frame → packet → decode → frame, and
+        // confirm the RGBA pixels survive the BMP-inside-ICO path exactly
+        // (BMP is lossless, unlike a potential PNG colour conversion).
+        let w = 16;
+        let h = 16;
+        let src = rgba_frame(w, h, [200, 40, 10, 255]);
+
+        let mut enc = make_encoder(&params(w, h)).unwrap();
+        enc.send_frame(&Frame::Video(src.clone())).unwrap();
+        let pkt = enc.receive_packet().unwrap();
+        assert!(pkt.flags.keyframe);
+        // BMP body, not PNG (no PNG magic at the front).
+        assert_ne!(&pkt.data[..PNG_MAGIC.len()], &PNG_MAGIC);
+
+        let mut dec = make_decoder(&params(w, h)).unwrap();
+        dec.send_packet(&pkt).unwrap();
+        let frame = dec.receive_frame().unwrap();
+        let vf = match frame {
+            Frame::Video(v) => v,
+            _ => panic!("expected a video frame"),
+        };
+        // Compare the decoded top-down RGBA rows against the source.
+        let stride = vf.planes[0].stride;
+        for y in 0..h as usize {
+            let row = &vf.planes[0].data[y * stride..y * stride + (w as usize) * 4];
+            let exp = &src.planes[0].data[y * (w as usize) * 4..(y + 1) * (w as usize) * 4];
+            assert_eq!(row, exp, "row {y} must round-trip exactly");
+        }
+    }
+
+    #[test]
+    fn encoder_emits_png_body_at_or_above_threshold() {
+        // 64×64 is at the PNG threshold → a PNG body (PNG magic present).
+        let w = 64;
+        let h = 64;
+        let mut enc = make_encoder(&params(w, h)).unwrap();
+        enc.send_frame(&Frame::Video(rgba_frame(w, h, [10, 20, 30, 255])))
+            .unwrap();
+        let pkt = enc.receive_packet().unwrap();
+        assert_eq!(&pkt.data[..PNG_MAGIC.len()], &PNG_MAGIC);
+
+        // …and the decoder accepts it back (PNG branch of the sniff).
+        let mut dec = make_decoder(&params(w, h)).unwrap();
+        dec.send_packet(&pkt).unwrap();
+        assert!(matches!(dec.receive_frame().unwrap(), Frame::Video(_)));
+    }
+
+    #[test]
+    fn decoder_signals_need_more_then_eof() {
+        let mut dec = make_decoder(&params(8, 8)).unwrap();
+        // No packet sent yet → NeedMore, not Eof.
+        assert!(matches!(dec.receive_frame(), Err(Error::NeedMore)));
+        // After flush with nothing pending → Eof.
+        dec.flush().unwrap();
+        assert!(matches!(dec.receive_frame(), Err(Error::Eof)));
+    }
+
+    #[test]
+    fn encoder_signals_need_more_then_eof() {
+        let mut enc = make_encoder(&params(8, 8)).unwrap();
+        assert!(matches!(enc.receive_packet(), Err(Error::NeedMore)));
+        enc.flush().unwrap();
+        assert!(matches!(enc.receive_packet(), Err(Error::Eof)));
+    }
+
+    #[test]
+    fn encoder_rejects_missing_width() {
+        // No width in params → send_frame errors rather than panicking.
+        let mut p = CodecParameters::video(CodecId::new(crate::CODEC_ID_STR));
+        p.height = Some(8);
+        let mut enc = make_encoder(&p).unwrap();
+        let err = enc
+            .send_frame(&Frame::Video(rgba_frame(8, 8, [1, 2, 3, 255])))
+            .unwrap_err();
+        assert!(err.to_string().contains("width"));
+    }
+
+    #[test]
+    fn encoder_rejects_non_video_frame() {
+        let mut enc = make_encoder(&params(8, 8)).unwrap();
+        // A vector frame is the wrong shape for the ICO encoder.
+        let err = enc
+            .send_frame(&Frame::Vector(VectorFrame::default()))
+            .unwrap_err();
+        assert!(err.to_string().contains("video frame"));
+    }
+}
