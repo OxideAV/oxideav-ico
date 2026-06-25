@@ -459,7 +459,39 @@ mod tests {
     use crate::ani::{AF_ICON, AF_SEQUENCE};
     use crate::{write_ico, IconImage, IconType, WriteOptions};
     use oxideav_core::NullCodecResolver;
-    use std::io::Cursor;
+    use std::io::{Cursor, Seek, Write};
+    use std::sync::{Arc, Mutex};
+
+    /// A `Write + Seek + Send` sink backed by a shared `Cursor<Vec<u8>>`,
+    /// so a test can hand a boxed muxer its output and still read the
+    /// written bytes back afterwards (a plain `Cursor` is consumed by the
+    /// `Box<dyn WriteSeek>`).
+    #[derive(Clone)]
+    struct SharedSink(Arc<Mutex<Cursor<Vec<u8>>>>);
+
+    impl SharedSink {
+        fn new() -> Self {
+            SharedSink(Arc::new(Mutex::new(Cursor::new(Vec::new()))))
+        }
+        fn into_bytes(self) -> Vec<u8> {
+            self.0.lock().unwrap().get_ref().clone()
+        }
+    }
+
+    impl Write for SharedSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.0.lock().unwrap().flush()
+        }
+    }
+
+    impl Seek for SharedSink {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.0.lock().unwrap().seek(pos)
+        }
+    }
 
     /// A solid-colour single-sub-image ICO byte stream, forced all-BMP.
     fn ico_frame(n: u32, rgba: [u8; 4]) -> Vec<u8> {
@@ -658,6 +690,106 @@ mod tests {
                 e.to_string().to_lowercase().contains("overlap"),
                 "expected overlap rejection, got: {e}"
             ),
+        }
+    }
+
+    #[test]
+    fn ico_muxer_round_trips_through_demuxer() {
+        // Build an ICO via write_ico, demux it into streams + packets,
+        // then re-mux those through the framework IcoMuxer and confirm
+        // the muxed bytes parse back to the same two sub-images. Covers
+        // open_muxer / write_header / write_packet / write_trailer, which
+        // had no test.
+        let imgs = vec![
+            IconImage::from_rgba(
+                8,
+                8,
+                std::iter::repeat([1u8, 2, 3, 255])
+                    .take(64)
+                    .flatten()
+                    .collect(),
+            ),
+            IconImage::from_rgba(
+                16,
+                16,
+                std::iter::repeat([9u8, 8, 7, 255])
+                    .take(256)
+                    .flatten()
+                    .collect(),
+            ),
+        ];
+        let src = write_ico(
+            IconType::Ico,
+            &imgs,
+            WriteOptions {
+                png_size_threshold: None,
+            },
+        )
+        .unwrap();
+
+        let mut dx = open_ico(&src).unwrap();
+        let streams: Vec<StreamInfo> = dx.streams().to_vec();
+        let mut packets = Vec::new();
+        while let Ok(p) = dx.next_packet() {
+            packets.push(p);
+        }
+        assert_eq!(packets.len(), 2);
+
+        let sink = SharedSink::new();
+        {
+            let mut mux = open_muxer(Box::new(sink.clone()), &streams).unwrap();
+            assert_eq!(mux.format_name(), "ico");
+            mux.write_header().unwrap();
+            for p in &packets {
+                mux.write_packet(p).unwrap();
+            }
+            mux.write_trailer().unwrap();
+        }
+        let muxed = sink.into_bytes();
+
+        let (ty, entries) = crate::read_ico_raw(&muxed).unwrap();
+        assert_eq!(ty, IconType::Ico);
+        assert_eq!(entries.len(), 2);
+        assert_eq!((entries[0].width, entries[0].height), (8, 8));
+        assert_eq!((entries[1].width, entries[1].height), (16, 16));
+        // Payload bytes survive the mux verbatim.
+        assert_eq!(entries[0].data, packets[0].data);
+        assert_eq!(entries[1].data, packets[1].data);
+    }
+
+    #[test]
+    fn ico_muxer_rejects_empty_and_mismatched_packet_count() {
+        let mut p = CodecParameters::video(CodecId::new(crate::CODEC_ID_STR));
+        p.width = Some(8);
+        p.height = Some(8);
+        let stream = StreamInfo {
+            index: 0,
+            params: p,
+            time_base: TimeBase::new(1, 1),
+            start_time: Some(0),
+            duration: None,
+        };
+        // No packets written → write_trailer errors.
+        let buf = Cursor::new(Vec::<u8>::new());
+        let mut m = open_muxer(Box::new(buf), std::slice::from_ref(&stream)).unwrap();
+        m.write_header().unwrap();
+        match m.write_trailer() {
+            Ok(()) => panic!("expected no-packets error"),
+            Err(e) => assert!(e.to_string().contains("no packets")),
+        }
+
+        // One stream but two packets → count-mismatch error.
+        let buf = Cursor::new(Vec::<u8>::new());
+        let mut m = open_muxer(Box::new(buf), std::slice::from_ref(&stream)).unwrap();
+        m.write_header().unwrap();
+        let body = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+        m.write_packet(&Packet::new(0, TimeBase::new(1, 1), body.clone()))
+            .unwrap();
+        m.write_packet(&Packet::new(0, TimeBase::new(1, 1), body))
+            .unwrap();
+        match m.write_trailer() {
+            Ok(()) => panic!("expected count-mismatch error"),
+            Err(e) => assert!(e.to_string().contains("packet count")),
         }
     }
 
