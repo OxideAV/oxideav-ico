@@ -5,10 +5,13 @@
 //! them directly.
 //!
 //! The demuxer exposes one `StreamInfo` per sub-image. `pts = index`
-//! (0-based directory order); `width` / `height` carry the
-//! `ICONDIRENTRY`-declared dimensions. Hotspots from CUR entries are
-//! surfaced in `StreamInfo::params.extradata` as a 4-byte `u16 x`,
-//! `u16 y` little-endian pair (empty for ICO entries).
+//! (0-based directory order); `width` / `height` carry the sub-image's
+//! resolved dimensions (the directory's `0 == 256` convention applied
+//! and cross-validated against the body's PNG-IHDR / BMP-DIB header by
+//! the shared [`crate::read_ico_raw`] parser, so the demuxer can never
+//! diverge from the standalone API on geometry). Hotspots from CUR
+//! entries are surfaced in `StreamInfo::params.extradata` as a 4-byte
+//! `u16 x`, `u16 y` little-endian pair (empty for ICO entries).
 
 use std::io::{Read, SeekFrom, Write};
 
@@ -60,53 +63,48 @@ fn open_demuxer(
     input.seek(SeekFrom::Start(0))?;
     let mut buf = Vec::new();
     input.read_to_end(&mut buf)?;
-    if buf.len() < 6 {
-        return Err(Error::invalid("ICO: file shorter than ICONDIR"));
-    }
-    // Animated cursors (.ani) are a RIFF/ACON container, not an ICO.
-    // Refuse cleanly so callers reach for the right format instead of
-    // hitting the "unknown idType 0x4952" failure-mode.
-    if buf.len() >= 12 && &buf[..4] == b"RIFF" && &buf[8..12] == b"ACON" {
-        return Err(Error::unsupported(
-            "ICO: input is a .ani animated cursor (RIFF/ACON); \
-             oxideav-ico parses static ICO + CUR only",
-        ));
-    }
-    let id_type = u16::from_le_bytes([buf[2], buf[3]]);
-    if !(id_type == 1 || id_type == 2) {
-        return Err(Error::invalid(format!("ICO: unknown idType {id_type}")));
-    }
-    let count = u16::from_le_bytes([buf[4], buf[5]]) as usize;
-    let dir_end = 6 + count * 16;
-    if buf.len() < dir_end {
-        return Err(Error::invalid("ICO: directory truncated"));
-    }
 
+    // Delegate the directory walk to the hardened standalone parser
+    // ([`crate::read_ico_raw`]) rather than re-implementing a thinner,
+    // looser copy here. The previous in-line walk only checked
+    // payload-extent bounds; `read_ico_raw` additionally rejects the
+    // whole CVE surface this container otherwise inherited verbatim —
+    // overlapping sub-image payload ranges, a non-zero `bReserved`
+    // byte, an out-of-range `wPlanes` / `wBitCount`, a CUR hotspot
+    // outside the (body-derived) sub-image, a directory-vs-body
+    // dimension / bit-depth disagreement, and a body whose
+    // `biSize` / `biPlanes` / `biCompression` / `biBitCount` fall
+    // outside the legal ICO set. It also surfaces the `.ani`
+    // RIFF/ACON case as a clean `Unsupported` (the same refusal the
+    // old in-line check produced). One parse, one set of rules, so the
+    // demuxer and the standalone API can never diverge on what a
+    // well-formed file is.
+    let (icon_type, entries) = crate::read_ico_raw(&buf).map_err(Error::from)?;
+
+    let count = entries.len();
     let mut streams = Vec::with_capacity(count);
     let mut packets = Vec::with_capacity(count);
-    for i in 0..count {
-        let e = &buf[6 + i * 16..6 + i * 16 + 16];
-        let declared_w = if e[0] == 0 { 256 } else { e[0] as u32 };
-        let declared_h = if e[1] == 0 { 256 } else { e[1] as u32 };
-        let planes_or_hotx = u16::from_le_bytes([e[4], e[5]]);
-        let bits_or_hoty = u16::from_le_bytes([e[6], e[7]]);
-        let data_size = u32::from_le_bytes([e[8], e[9], e[10], e[11]]) as usize;
-        let data_offset = u32::from_le_bytes([e[12], e[13], e[14], e[15]]) as usize;
-        if buf.len() < data_offset.saturating_add(data_size) {
-            return Err(Error::invalid(format!("ICO: entry {i} payload OOB")));
-        }
-
+    for (i, entry) in entries.into_iter().enumerate() {
         let mut params = CodecParameters::video(CodecId::new(crate::CODEC_ID_STR));
-        params.width = Some(declared_w);
-        params.height = Some(declared_h);
+        // `read_ico_raw` resolves the directory's `0 == 256` convention
+        // *and* cross-validates the body's PNG-IHDR / BMP-DIB dimensions
+        // against the directory, so these are the authoritative, agreed
+        // sub-image dimensions — not just the directory's `u8` self-claim.
+        params.width = Some(entry.width);
+        params.height = Some(entry.height);
         params.pixel_format = Some(PixelFormat::Rgba);
-        if id_type == 2 {
+        if icon_type == crate::IconType::Cur {
             // CUR — surface the hotspot in extradata so callers that
-            // need it don't have to re-parse the directory.
-            let mut ed = Vec::with_capacity(4);
-            ed.extend_from_slice(&planes_or_hotx.to_le_bytes());
-            ed.extend_from_slice(&bits_or_hoty.to_le_bytes());
-            params.extradata = ed;
+            // need it don't have to re-parse the directory. A CUR entry
+            // always carries a hotspot (`read_ico_raw` populates it,
+            // defaulting to `(0, 0)`), but guard with a match anyway so
+            // an `Ico`-vs-`Cur` mismatch can't panic.
+            if let Some(h) = entry.hotspot {
+                let mut ed = Vec::with_capacity(4);
+                ed.extend_from_slice(&h.x.to_le_bytes());
+                ed.extend_from_slice(&h.y.to_le_bytes());
+                params.extradata = ed;
+            }
         }
         streams.push(StreamInfo {
             index: i as u32,
@@ -116,8 +114,7 @@ fn open_demuxer(
             duration: None,
         });
 
-        let payload = buf[data_offset..data_offset + data_size].to_vec();
-        let mut pkt = Packet::new(i as u32, TimeBase::new(1, 1), payload);
+        let mut pkt = Packet::new(i as u32, TimeBase::new(1, 1), entry.data);
         pkt.pts = Some(i as i64);
         pkt.dts = Some(i as i64);
         pkt.flags.keyframe = true;
@@ -544,6 +541,137 @@ mod tests {
 
     fn open_ani(bytes: &[u8]) -> Box<dyn Demuxer> {
         open_ani_demuxer(Box::new(Cursor::new(bytes.to_vec())), &NullCodecResolver).unwrap()
+    }
+
+    fn open_ico(bytes: &[u8]) -> Result<Box<dyn Demuxer>> {
+        open_demuxer(Box::new(Cursor::new(bytes.to_vec())), &NullCodecResolver)
+    }
+
+    #[test]
+    fn ico_demuxer_emits_one_stream_and_packet_per_sub_image() {
+        // Two-resolution all-BMP ICO. The demuxer presents one stream +
+        // one packet per sub-image, in directory order, each packet
+        // carrying that entry's raw payload bytes.
+        let imgs = vec![
+            IconImage::from_rgba(
+                8,
+                8,
+                std::iter::repeat([1u8, 2, 3, 255])
+                    .take(64)
+                    .flatten()
+                    .collect(),
+            ),
+            IconImage::from_rgba(
+                16,
+                16,
+                std::iter::repeat([9u8, 9, 9, 255])
+                    .take(256)
+                    .flatten()
+                    .collect(),
+            ),
+        ];
+        let bytes = write_ico(
+            IconType::Ico,
+            &imgs,
+            WriteOptions {
+                png_size_threshold: None,
+            },
+        )
+        .unwrap();
+
+        let mut dx = open_ico(&bytes).unwrap();
+        assert_eq!(dx.format_name(), "ico");
+        assert_eq!(dx.streams().len(), 2);
+        // Body-derived (and directory-cross-validated) dimensions.
+        assert_eq!(dx.streams()[0].params.width, Some(8));
+        assert_eq!(dx.streams()[0].params.height, Some(8));
+        assert_eq!(dx.streams()[1].params.width, Some(16));
+        assert_eq!(dx.streams()[1].params.height, Some(16));
+        // ICO entries carry no hotspot extradata.
+        assert!(dx.streams()[0].params.extradata.is_empty());
+
+        let p0 = dx.next_packet().unwrap();
+        assert_eq!(p0.pts, Some(0));
+        assert!(p0.flags.keyframe);
+        let p1 = dx.next_packet().unwrap();
+        assert_eq!(p1.pts, Some(1));
+        assert!(matches!(dx.next_packet(), Err(Error::Eof)));
+        // Each packet's bytes are a decodable BMP-DIB body.
+        assert!(!p0.data.is_empty());
+        assert!(!p1.data.is_empty());
+    }
+
+    #[test]
+    fn ico_demuxer_surfaces_cur_hotspot_in_extradata() {
+        let mut img = IconImage::from_rgba(
+            16,
+            16,
+            std::iter::repeat([7u8, 7, 7, 255])
+                .take(256)
+                .flatten()
+                .collect(),
+        );
+        img.hotspot = Some(crate::HotSpot { x: 5, y: 9 });
+        let bytes = write_ico(
+            IconType::Cur,
+            &[img],
+            WriteOptions {
+                png_size_threshold: None,
+            },
+        )
+        .unwrap();
+        let dx = open_ico(&bytes).unwrap();
+        let ed = &dx.streams()[0].params.extradata;
+        assert_eq!(ed.len(), 4);
+        assert_eq!(u16::from_le_bytes([ed[0], ed[1]]), 5);
+        assert_eq!(u16::from_le_bytes([ed[2], ed[3]]), 9);
+    }
+
+    #[test]
+    fn ico_demuxer_inherits_overlap_hardening() {
+        // Two adjacent entries, then rewrite entry 1's dwImageOffset to
+        // overlap entry 0's payload window. The old in-line directory
+        // walk only bounds-checked payload extents and would have
+        // accepted this; delegating to `read_ico_raw` inherits its
+        // cross-entry overlap rejection (a known icon-parser CVE shape).
+        let body = std::iter::repeat([1u8, 2, 3, 255])
+            .take(64)
+            .flatten()
+            .collect::<Vec<_>>();
+        let a = IconImage::from_rgba(8, 8, body.clone());
+        let b = IconImage::from_rgba(8, 8, body);
+        let mut bytes = write_ico(
+            IconType::Ico,
+            &[a, b],
+            WriteOptions {
+                png_size_threshold: None,
+            },
+        )
+        .unwrap();
+        // Entry 1's dwImageOffset lives at file offset 6 + 16 + 12 = 34.
+        // Point it at entry 0's payload start (just past the directory).
+        let dir_end = (6 + 16 * 2) as u32;
+        bytes[34..38].copy_from_slice(&dir_end.to_le_bytes());
+        match open_ico(&bytes) {
+            Ok(_) => panic!("expected overlap rejection, got a demuxer"),
+            Err(e) => assert!(
+                e.to_string().to_lowercase().contains("overlap"),
+                "expected overlap rejection, got: {e}"
+            ),
+        }
+    }
+
+    #[test]
+    fn ico_demuxer_refuses_ani_input() {
+        // A RIFF/ACON stream reaches the ICO demuxer (e.g. mis-probed by
+        // extension) and must be refused cleanly via the delegated
+        // parser's `.ani` recognition rather than a cryptic idType error.
+        let red = ico_frame(8, [200, 10, 10, 255]);
+        let ani = build_ani(&[red], 0, 12, None, None, None);
+        match open_ico(&ani) {
+            Ok(_) => panic!("expected .ani refusal, got a demuxer"),
+            Err(e) => assert!(e.to_string().contains(".ani"), "{e}"),
+        }
     }
 
     #[test]
