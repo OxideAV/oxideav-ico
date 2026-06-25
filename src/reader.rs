@@ -499,6 +499,169 @@ mod tests {
         write_ico(IconType::Ico, &[img], opts).unwrap()
     }
 
+    /// Build a complete single-sub-image ICO carrying one hand-built
+    /// headerless **indexed** DIB body (palette + XOR rows + 1-bpp AND
+    /// mask), exercising the low-bit-depth BMP-inside-ICO decode path
+    /// that `IconImage::from_rgba` + `write_ico` (which only emit 32-bpp)
+    /// can't reach. Spec §"DIB form structure": `BITMAPINFOHEADER`,
+    /// then `2^biBitCount` RGBQUAD palette entries, then the bottom-up
+    /// XOR colour rows at `biBitCount` bpp, then the bottom-up 1-bpp AND
+    /// mask (a set bit = transparent). `biHeight` is the doubled
+    /// (XOR + AND) height the parser halves back.
+    ///
+    /// `palette` is `(B, G, R)` triples written into the leading RGBQUAD
+    /// slots (reserved byte 0). `xor_indices` / `and_bits` are given in
+    /// **top-down** row-major order (row 0 = top); the builder flips both
+    /// to the bottom-up on-disk layout. `and_bits[i] != 0` marks pixel
+    /// `i` transparent.
+    fn indexed_dib_ico(
+        w: u32,
+        h: u32,
+        bpp: u16,
+        palette: &[[u8; 3]],
+        xor_indices: &[u8],
+        and_bits: &[bool],
+    ) -> Vec<u8> {
+        assert!(matches!(bpp, 1 | 4 | 8));
+        assert_eq!(xor_indices.len(), (w * h) as usize);
+        assert_eq!(and_bits.len(), (w * h) as usize);
+
+        let mut dib: Vec<u8> = Vec::new();
+        dib.extend_from_slice(&40u32.to_le_bytes()); // biSize
+        dib.extend_from_slice(&(w as i32).to_le_bytes()); // biWidth
+        dib.extend_from_slice(&((2 * h) as i32).to_le_bytes()); // biHeight doubled
+        dib.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
+        dib.extend_from_slice(&bpp.to_le_bytes()); // biBitCount
+        dib.extend_from_slice(&0u32.to_le_bytes()); // BI_RGB
+        dib.extend_from_slice(&0u32.to_le_bytes()); // biSizeImage
+        dib.extend_from_slice(&0i32.to_le_bytes()); // biXPelsPerMeter
+        dib.extend_from_slice(&0i32.to_le_bytes()); // biYPelsPerMeter
+        dib.extend_from_slice(&0u32.to_le_bytes()); // biClrUsed (0 -> 2^bpp)
+        dib.extend_from_slice(&0u32.to_le_bytes()); // biClrImportant
+
+        // Palette: 2^bpp RGBQUAD (B, G, R, reserved) entries.
+        let pal_entries = 1usize << bpp;
+        let mut pal = vec![0u8; pal_entries * 4];
+        for (i, &[b, g, r]) in palette.iter().enumerate() {
+            pal[i * 4..i * 4 + 4].copy_from_slice(&[b, g, r, 0]);
+        }
+        dib.extend_from_slice(&pal);
+
+        // XOR colour rows: bottom-up, 4-byte-aligned stride at `bpp`.
+        let xor_stride = ((w * bpp as u32).div_ceil(32) * 4) as usize;
+        let mut xor = vec![0u8; xor_stride * h as usize];
+        for y in 0..h {
+            let storage_row = (h - 1 - y) as usize; // top-down y -> bottom-up storage
+            for x in 0..w {
+                let idx = xor_indices[(y * w + x) as usize];
+                let bit_pos = (x * bpp as u32) as usize;
+                let byte = storage_row * xor_stride + bit_pos / 8;
+                let shift = 8 - bpp as usize - (bit_pos % 8);
+                let mask: u16 = (1u16 << bpp) - 1;
+                xor[byte] |= ((idx as u16 & mask) as u8) << shift;
+            }
+        }
+        dib.extend_from_slice(&xor);
+
+        // AND mask: 1-bpp, bottom-up, 4-byte-aligned stride.
+        let and_stride = (w.div_ceil(32) * 4) as usize;
+        let mut and = vec![0u8; and_stride * h as usize];
+        for y in 0..h {
+            let storage_row = (h - 1 - y) as usize;
+            for x in 0..w {
+                if and_bits[(y * w + x) as usize] {
+                    let byte = storage_row * and_stride + (x as usize) / 8;
+                    let shift = 7 - (x as usize % 8);
+                    and[byte] |= 1 << shift;
+                }
+            }
+        }
+        dib.extend_from_slice(&and);
+
+        let entry = crate::raw::IconEntryRaw {
+            width: w,
+            height: h,
+            bit_depth: bpp as u8,
+            sub_format: IconSubFormat::Bmp,
+            hotspot: None,
+            data: dib,
+        };
+        crate::raw::write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap()
+    }
+
+    #[test]
+    fn read_ico_decodes_8bpp_indexed_with_palette_and_mask() {
+        // 2×2 8-bpp icon. Palette: idx0 = red, idx1 = green. Image (top-down):
+        //   (0,0)=idx0 red   (1,0)=idx1 green, transparent via AND mask
+        //   (0,1)=idx1 green (1,1)=idx1 green
+        let bytes = indexed_dib_ico(
+            2,
+            2,
+            8,
+            &[[0, 0, 255], [0, 255, 0]], // BGR: red, green
+            &[0, 1, 1, 1],
+            &[false, true, false, false],
+        );
+        let (ty, imgs) = read_ico(&bytes).unwrap();
+        assert_eq!(ty, IconType::Ico);
+        assert_eq!(imgs.len(), 1);
+        let im = &imgs[0];
+        assert_eq!((im.width, im.height), (2, 2));
+        assert_eq!(im.bit_depth, 8);
+        assert_eq!(im.sub_format, IconSubFormat::Bmp);
+        // Palette lookup + bottom-up flip + AND-mask transparency.
+        assert_eq!(&im.pixels[0..4], &[255, 0, 0, 255], "(0,0) red opaque");
+        assert_eq!(&im.pixels[4..8], &[0, 255, 0, 0], "(1,0) green transparent");
+        assert_eq!(&im.pixels[8..12], &[0, 255, 0, 255], "(0,1) green opaque");
+        assert_eq!(&im.pixels[12..16], &[0, 255, 0, 255], "(1,1) green opaque");
+    }
+
+    #[test]
+    fn read_ico_decodes_1bpp_monochrome_with_mask() {
+        // 2×2 1-bpp icon. Palette: idx0 = black, idx1 = white. Image:
+        //   (0,0)=white (1,0)=black
+        //   (0,1)=black (1,1)=white, transparent
+        let bytes = indexed_dib_ico(
+            2,
+            2,
+            1,
+            &[[0, 0, 0], [255, 255, 255]],
+            &[1, 0, 0, 1],
+            &[false, false, false, true],
+        );
+        let (_, imgs) = read_ico(&bytes).unwrap();
+        let im = &imgs[0];
+        assert_eq!(im.bit_depth, 1);
+        assert_eq!(&im.pixels[0..4], &[255, 255, 255, 255], "(0,0) white");
+        assert_eq!(&im.pixels[4..8], &[0, 0, 0, 255], "(1,0) black");
+        assert_eq!(&im.pixels[8..12], &[0, 0, 0, 255], "(0,1) black");
+        assert_eq!(
+            &im.pixels[12..16],
+            &[255, 255, 255, 0],
+            "(1,1) white transparent"
+        );
+    }
+
+    #[test]
+    fn read_ico_decodes_4bpp_indexed_palette() {
+        // 4×1 4-bpp row using four distinct palette slots, no transparency.
+        let bytes = indexed_dib_ico(
+            4,
+            1,
+            4,
+            &[[0, 0, 255], [0, 255, 0], [255, 0, 0], [0, 255, 255]], // r, g, b, yellow
+            &[0, 1, 2, 3],
+            &[false, false, false, false],
+        );
+        let (_, imgs) = read_ico(&bytes).unwrap();
+        let im = &imgs[0];
+        assert_eq!(im.bit_depth, 4);
+        assert_eq!(&im.pixels[0..4], &[255, 0, 0, 255], "idx0 red");
+        assert_eq!(&im.pixels[4..8], &[0, 255, 0, 255], "idx1 green");
+        assert_eq!(&im.pixels[8..12], &[0, 0, 255, 255], "idx2 blue");
+        assert_eq!(&im.pixels[12..16], &[255, 255, 0, 255], "idx3 yellow");
+    }
+
     /// Append a RIFF chunk (tag + LE u32 len + payload, even-padded).
     fn push_chunk(buf: &mut Vec<u8>, tag: &[u8; 4], payload: &[u8]) {
         buf.extend_from_slice(tag);
