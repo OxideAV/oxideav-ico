@@ -73,6 +73,12 @@ oxideav_ico::register(&mut codecs, &mut containers);
 // "ico" codec + container are now available to the pipeline / CLI.
 ```
 
+The framework `Demuxer` shares the same `read_ico_raw` directory walk
+as the standalone API, so it inherits the full validation surface below
+(overlap rejection, range checks, directory-vs-body cross-checks) rather
+than a thinner copy — the demuxer and `read_ico_raw` can never disagree
+on what a well-formed file is.
+
 ## Scope
 
 - Read: ICO + CUR, PNG + BMP sub-images, 1..=256 px in each axis.
@@ -662,6 +668,14 @@ adversarial `iWidth = 0xFFFF_FFFF` is the classic "size pulled
 from user-controlled bytes" smuggling shape that would size a
 raw-BMP-path renderer allocation past anything real; an
 `iBitCount = 7` doesn't correspond to any renderable DIB layout.
+
+`anih.cbSize` is validated too: the field repeats the 36-byte chunk
+length, and the spec's §'anih' note directs the decoder to "validate
+`cbSize`". The nine ANIHEADER fields occupy 36 bytes, so a self-reported
+`cbSize < 36` cannot describe the structure and is rejected; a larger
+value is tolerated (the documented "some encoders write a slightly
+different cbSize" caveat — the RIFF chunk length, already validated, is
+the authoritative bound). `write_ani_raw` mirrors the reject.
 
 ## Fuzzing
 
