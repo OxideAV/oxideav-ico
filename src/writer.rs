@@ -433,6 +433,25 @@ mod bmp_depth_tests {
     }
 
     #[test]
+    fn write_indexed4_round_trips_pixels_and_directory_depth() {
+        // 4×1 row, four distinct colours — fits the 16-entry 4-bpp table.
+        let colours = [
+            [255, 0, 0, 255],
+            [0, 255, 0, 255],
+            [0, 0, 255, 255],
+            [255, 255, 0, 255],
+        ];
+        let img = IconImage::from_rgba(4, 1, rgba_palette(&colours));
+        let bytes = write_ico(IconType::Ico, &[img], opts_bmp(BmpBitDepth::Indexed4)).unwrap();
+        assert_eq!(u16::from_le_bytes([bytes[12], bytes[13]]), 4);
+        let (_, decoded) = read_ico(&bytes).unwrap();
+        assert_eq!(decoded[0].bit_depth, 4);
+        for (i, c) in colours.iter().enumerate() {
+            assert_eq!(&decoded[0].pixels[i * 4..i * 4 + 4], c, "pixel {i}");
+        }
+    }
+
+    #[test]
     fn write_indexed1_monochrome_round_trips() {
         let colours = [
             [255, 255, 255, 255],
@@ -563,6 +582,61 @@ mod ani_write_tests {
         assert_eq!(anim.steps[1].frame_index, 1);
         assert!(anim.steps.iter().all(|s| s.jiffies == 12));
         assert_eq!(anim.total_jiffies(), 24);
+    }
+
+    #[test]
+    fn write_ani_indexed8_frames_round_trip() {
+        // Drive the whole ANI encode/decode chain through the indexed
+        // BMP path: every frame's icon resource is an 8-bpp indexed DIB
+        // with a palette + AND mask, which read_ani must decode back to
+        // the exact source pixels.
+        let frames = [frame(8, [200, 10, 10, 255]), frame(8, [10, 200, 10, 255])];
+        let opts = AniWriteOptions {
+            default_jiffies: 8,
+            ico: WriteOptions {
+                png_size_threshold: None,
+                bmp_bit_depth: BmpBitDepth::Indexed8,
+            },
+            ..AniWriteOptions::default()
+        };
+        let bytes = write_ani(&frames, &opts).unwrap();
+        let anim = read_ani(&bytes).unwrap();
+        assert_eq!(anim.frames.len(), 2);
+        assert_eq!(anim.frames[0].images[0].bit_depth, 8);
+        assert_eq!(
+            anim.frames[0].images[0].pixels,
+            solid_rgba(8, [200, 10, 10, 255])
+        );
+        assert_eq!(
+            anim.frames[1].images[0].pixels,
+            solid_rgba(8, [10, 200, 10, 255])
+        );
+    }
+
+    #[test]
+    fn write_ani_indexed1_monochrome_frames_round_trip() {
+        // 1-bpp (monochrome) ANI frames — a single solid colour per
+        // frame fits a 1-entry palette comfortably.
+        let frames = [frame(8, [255, 255, 255, 255]), frame(8, [0, 0, 0, 255])];
+        let opts = AniWriteOptions {
+            default_jiffies: 6,
+            ico: WriteOptions {
+                png_size_threshold: None,
+                bmp_bit_depth: BmpBitDepth::Indexed1,
+            },
+            ..AniWriteOptions::default()
+        };
+        let bytes = write_ani(&frames, &opts).unwrap();
+        let anim = read_ani(&bytes).unwrap();
+        assert_eq!(anim.frames[0].images[0].bit_depth, 1);
+        assert_eq!(
+            anim.frames[0].images[0].pixels,
+            solid_rgba(8, [255, 255, 255, 255])
+        );
+        assert_eq!(
+            anim.frames[1].images[0].pixels,
+            solid_rgba(8, [0, 0, 0, 255])
+        );
     }
 
     #[test]
