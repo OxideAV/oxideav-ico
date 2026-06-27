@@ -72,6 +72,57 @@ impl IconImage {
     }
 }
 
+/// Bit depth to use when the writer emits a BMP-DIB sub-image. The
+/// default `Bgra32` matches what `write_ico` historically produced; the
+/// lower depths drive the classic indexed / true-colour `ICONIMAGE` DIB
+/// forms (palette + XOR + AND mask) for compact, legacy-faithful icons.
+///
+/// PNG sub-images always carry full RGBA regardless of this setting —
+/// it only governs the BMP path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BmpBitDepth {
+    /// 32-bpp BGRA — the modern, lossless default (alpha in the colour
+    /// bits, all-zero AND mask). No colour or transparency limits.
+    #[default]
+    Bgra32,
+    /// 24-bpp true-colour BGR with a 1-bpp AND mask for transparency.
+    /// Drops the alpha channel to a hard on/off mask; full colour range.
+    Rgb24,
+    /// 8-bpp indexed (≤ 256 distinct opaque colours) with a palette and
+    /// 1-bpp AND mask. The writer builds the palette by exact-colour
+    /// collection and errors if the image needs more than 256 colours.
+    Indexed8,
+    /// 4-bpp indexed (≤ 16 distinct opaque colours).
+    Indexed4,
+    /// 1-bpp indexed (≤ 2 distinct opaque colours — classic monochrome).
+    Indexed1,
+}
+
+impl BmpBitDepth {
+    /// Bits-per-pixel value this depth writes into the directory + DIB
+    /// header.
+    pub fn bits(self) -> u8 {
+        match self {
+            BmpBitDepth::Bgra32 => 32,
+            BmpBitDepth::Rgb24 => 24,
+            BmpBitDepth::Indexed8 => 8,
+            BmpBitDepth::Indexed4 => 4,
+            BmpBitDepth::Indexed1 => 1,
+        }
+    }
+
+    /// The indexed bit depth (1/4/8) when this is an indexed variant,
+    /// else `None` (32/24-bpp are direct-colour).
+    pub fn indexed_bpp(self) -> Option<u8> {
+        match self {
+            BmpBitDepth::Indexed8 => Some(8),
+            BmpBitDepth::Indexed4 => Some(4),
+            BmpBitDepth::Indexed1 => Some(1),
+            _ => None,
+        }
+    }
+}
+
 /// Options for the writer. Defaults favour modern icons (PNG for
 /// larger sub-images, BMP for smaller ones), matching what the
 /// Windows 10+ icon tooling produces.
@@ -85,12 +136,20 @@ pub struct WriteOptions {
     /// BMP so they still render on Windows XP-era loaders that don't
     /// understand PNG-in-ICO.
     pub png_size_threshold: Option<u32>,
+    /// Bit depth for the BMP-DIB path. Default [`BmpBitDepth::Bgra32`]
+    /// (the historical 32-bpp output). Set to an indexed or 24-bpp
+    /// variant to emit compact, legacy-faithful sub-images; the writer
+    /// quantises each BMP-bound sub-image to the requested depth and
+    /// errors if an indexed depth can't hold the image's colour count.
+    /// Ignored for any sub-image the size threshold routes to PNG.
+    pub bmp_bit_depth: BmpBitDepth,
 }
 
 impl Default for WriteOptions {
     fn default() -> Self {
         Self {
             png_size_threshold: Some(64),
+            bmp_bit_depth: BmpBitDepth::Bgra32,
         }
     }
 }

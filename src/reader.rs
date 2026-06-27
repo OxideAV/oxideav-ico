@@ -495,6 +495,7 @@ mod tests {
         let img = IconImage::from_rgba(n, n, solid_rgba(n, rgba));
         let opts = WriteOptions {
             png_size_threshold: None,
+            ..Default::default()
         };
         write_ico(IconType::Ico, &[img], opts).unwrap()
     }
@@ -992,6 +993,7 @@ mod tests {
         img.hotspot = Some(hot);
         let opts = WriteOptions {
             png_size_threshold: None,
+            ..Default::default()
         };
         write_ico(IconType::Cur, &[img], opts).unwrap()
     }
@@ -1009,6 +1011,7 @@ mod tests {
             &imgs,
             WriteOptions {
                 png_size_threshold: None,
+                ..Default::default()
             },
         )
         .unwrap();

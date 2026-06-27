@@ -92,6 +92,7 @@ mod tests {
             &[img],
             WriteOptions {
                 png_size_threshold: None,
+                ..Default::default()
             },
         )
         .unwrap()

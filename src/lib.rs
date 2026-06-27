@@ -68,7 +68,8 @@ pub use raw::{
 };
 pub use types::{
     select_best_fit, select_best_fit_raw, select_by_dimensions, select_by_dimensions_raw,
-    select_largest, select_largest_raw, HotSpot, IconImage, IconSubFormat, IconType, WriteOptions,
+    select_largest, select_largest_raw, BmpBitDepth, HotSpot, IconImage, IconSubFormat, IconType,
+    WriteOptions,
 };
 
 // ---------------------------------------------------------------------------
@@ -213,6 +214,7 @@ mod tests {
             &[img],
             WriteOptions {
                 png_size_threshold: None,
+                ..Default::default()
             },
         )
         .unwrap();

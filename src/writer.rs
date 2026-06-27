@@ -9,7 +9,10 @@
 use oxideav_core::{Error, PixelFormat, Result, VideoFrame, VideoPlane};
 
 use crate::ani::{write_ani_raw, AniFile, AniHeader, AniInfo, AF_ICON, AF_SEQUENCE};
-use crate::raw::{write_ico_raw, IconEntryRaw};
+use crate::raw::{
+    encode_indexed_dib_body, encode_rgb24_dib_body, quantise_rgba_to_indexed, write_ico_raw,
+    IconEntryRaw,
+};
 use crate::types::*;
 
 /// Serialize a batch of images into a single `.ico` / `.cur` byte
@@ -48,13 +51,21 @@ pub fn write_ico(icon_type: IconType, images: &[IconImage], opts: WriteOptions) 
     }
 
     let mut entries: Vec<IconEntryRaw> = Vec::with_capacity(images.len());
-    for im in images {
+    for (i, im) in images.iter().enumerate() {
         let chosen = choose_sub_format(im, &opts);
-        let bytes = encode_sub_image(im, chosen)?;
+        let bytes = encode_sub_image(im, chosen, opts.bmp_bit_depth)
+            .map_err(|e| Error::invalid(format!("ICO: entry {i}: {e}")))?;
+        // PNG bodies always carry full RGBA; BMP bodies carry the depth
+        // the writer actually emitted so the directory `wBitCount` and
+        // the body's `biBitCount` agree (read_ico_raw cross-checks them).
+        let bit_depth = match chosen {
+            SubFormatChosen::Png => 32,
+            SubFormatChosen::Bmp => opts.bmp_bit_depth.bits(),
+        };
         entries.push(IconEntryRaw {
             width: im.width,
             height: im.height,
-            bit_depth: 32, // we only ever emit 32-bpp today
+            bit_depth,
             sub_format: match chosen {
                 SubFormatChosen::Png => IconSubFormat::Png,
                 SubFormatChosen::Bmp => IconSubFormat::Bmp,
@@ -89,17 +100,32 @@ fn choose_sub_format(im: &IconImage, opts: &WriteOptions) -> SubFormatChosen {
     }
 }
 
-fn encode_sub_image(im: &IconImage, fmt: SubFormatChosen) -> Result<Vec<u8>> {
-    let frame = iconimage_to_frame(im);
+fn encode_sub_image(
+    im: &IconImage,
+    fmt: SubFormatChosen,
+    bmp_depth: BmpBitDepth,
+) -> Result<Vec<u8>> {
     match fmt {
         SubFormatChosen::Png => {
+            let frame = iconimage_to_frame(im);
             oxideav_png::encode_single(&frame, im.width, im.height, PixelFormat::Rgba, &[])
         }
-        SubFormatChosen::Bmp => {
+        SubFormatChosen::Bmp => encode_bmp_sub_image(im, bmp_depth),
+    }
+}
+
+/// Encode one BMP-DIB sub-image body at the requested bit depth. The
+/// 32-bpp path delegates to `oxideav-bmp` (BGRA + alpha-derived AND
+/// mask); the indexed / 24-bpp paths use the framework-free `raw`
+/// encoders that build the palette + XOR rows + AND mask in-crate.
+fn encode_bmp_sub_image(im: &IconImage, depth: BmpBitDepth) -> Result<Vec<u8>> {
+    match depth {
+        BmpBitDepth::Bgra32 => {
             // The BMP-inside-ICO convention is doubled height + AND
             // mask appended; oxideav-bmp handles both via the
             // `double_height_for_ico_mask` flag on the registry-gated
             // VideoFrame-shaped wrapper.
+            let frame = iconimage_to_frame(im);
             oxideav_bmp::encode_dib_videoframe(
                 &frame,
                 PixelFormat::Rgba,
@@ -107,6 +133,40 @@ fn encode_sub_image(im: &IconImage, fmt: SubFormatChosen) -> Result<Vec<u8>> {
                 im.height,
                 /* doubled */ true,
             )
+        }
+        BmpBitDepth::Rgb24 => {
+            // Drop the RGBA buffer to RGB triples; transparency goes to
+            // the AND mask (alpha 0 ⇒ transparent).
+            let pixels = im.width as usize * im.height as usize;
+            let mut rgb = Vec::with_capacity(pixels * 3);
+            let mut transparent = Vec::with_capacity(pixels);
+            for p in 0..pixels {
+                rgb.push(im.pixels[p * 4]);
+                rgb.push(im.pixels[p * 4 + 1]);
+                rgb.push(im.pixels[p * 4 + 2]);
+                transparent.push(im.pixels[p * 4 + 3] == 0);
+            }
+            Ok(encode_rgb24_dib_body(
+                im.width,
+                im.height,
+                &rgb,
+                &transparent,
+            )?)
+        }
+        BmpBitDepth::Indexed8 | BmpBitDepth::Indexed4 | BmpBitDepth::Indexed1 => {
+            let bpp = depth
+                .indexed_bpp()
+                .expect("indexed variant has an indexed bpp");
+            let (palette, indices, transparent) =
+                quantise_rgba_to_indexed(im.width, im.height, &im.pixels, bpp)?;
+            Ok(encode_indexed_dib_body(
+                im.width,
+                im.height,
+                bpp,
+                &palette,
+                &indices,
+                &transparent,
+            )?)
         }
     }
 }
@@ -329,6 +389,120 @@ pub fn write_ani(frames: &[AniWriteFrame], opts: &AniWriteOptions) -> Result<Vec
 }
 
 #[cfg(test)]
+mod bmp_depth_tests {
+    use super::*;
+    use crate::reader::read_ico;
+
+    /// 2×2 RGBA with `n` distinct opaque colours, cycling palette slots.
+    fn rgba_palette(colours: &[[u8; 4]]) -> Vec<u8> {
+        let mut v = Vec::new();
+        for c in colours {
+            v.extend_from_slice(c);
+        }
+        v
+    }
+
+    fn opts_bmp(depth: BmpBitDepth) -> WriteOptions {
+        WriteOptions {
+            png_size_threshold: None, // force BMP everywhere
+            bmp_bit_depth: depth,
+        }
+    }
+
+    #[test]
+    fn write_indexed8_round_trips_pixels_and_directory_depth() {
+        let colours = [
+            [255, 0, 0, 255],
+            [0, 255, 0, 255],
+            [0, 0, 255, 255],
+            [255, 255, 0, 255],
+        ];
+        let img = IconImage::from_rgba(2, 2, rgba_palette(&colours));
+        let bytes = write_ico(IconType::Ico, &[img], opts_bmp(BmpBitDepth::Indexed8)).unwrap();
+
+        // Directory wBitCount (entry 0, offset 6+6 = 12) must read 8.
+        assert_eq!(u16::from_le_bytes([bytes[12], bytes[13]]), 8);
+
+        let (_, decoded) = read_ico(&bytes).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].bit_depth, 8);
+        assert_eq!(decoded[0].sub_format, IconSubFormat::Bmp);
+        for (i, c) in colours.iter().enumerate() {
+            assert_eq!(&decoded[0].pixels[i * 4..i * 4 + 4], c, "pixel {i}");
+        }
+    }
+
+    #[test]
+    fn write_indexed1_monochrome_round_trips() {
+        let colours = [
+            [255, 255, 255, 255],
+            [0, 0, 0, 255],
+            [0, 0, 0, 255],
+            [255, 255, 255, 255],
+        ];
+        let img = IconImage::from_rgba(2, 2, rgba_palette(&colours));
+        let bytes = write_ico(IconType::Ico, &[img], opts_bmp(BmpBitDepth::Indexed1)).unwrap();
+        assert_eq!(u16::from_le_bytes([bytes[12], bytes[13]]), 1);
+        let (_, decoded) = read_ico(&bytes).unwrap();
+        assert_eq!(decoded[0].bit_depth, 1);
+        for (i, c) in colours.iter().enumerate() {
+            assert_eq!(&decoded[0].pixels[i * 4..i * 4 + 4], c, "pixel {i}");
+        }
+    }
+
+    #[test]
+    fn write_rgb24_round_trips_colour_and_mask() {
+        // (1,0) transparent via alpha 0.
+        let colours = [
+            [11, 22, 33, 255],
+            [44, 55, 66, 0],
+            [77, 88, 99, 255],
+            [100, 110, 120, 255],
+        ];
+        let img = IconImage::from_rgba(2, 2, rgba_palette(&colours));
+        let bytes = write_ico(IconType::Ico, &[img], opts_bmp(BmpBitDepth::Rgb24)).unwrap();
+        assert_eq!(u16::from_le_bytes([bytes[12], bytes[13]]), 24);
+        let (_, decoded) = read_ico(&bytes).unwrap();
+        assert_eq!(decoded[0].bit_depth, 24);
+        assert_eq!(&decoded[0].pixels[0..4], &[11, 22, 33, 255]);
+        assert_eq!(decoded[0].pixels[7], 0, "(1,0) transparent");
+        assert_eq!(&decoded[0].pixels[8..12], &[77, 88, 99, 255]);
+    }
+
+    #[test]
+    fn write_indexed_errors_when_too_many_colours() {
+        // 3 distinct colours can't fit a 1-bpp (2-entry) palette.
+        let colours = [
+            [1, 0, 0, 255],
+            [0, 2, 0, 255],
+            [0, 0, 3, 255],
+            [1, 0, 0, 255],
+        ];
+        let img = IconImage::from_rgba(2, 2, rgba_palette(&colours));
+        let err = write_ico(IconType::Ico, &[img], opts_bmp(BmpBitDepth::Indexed1)).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("entry 0"), "error names the entry: {msg}");
+        assert!(msg.contains("more than 2 colours"), "got: {msg}");
+    }
+
+    #[test]
+    fn indexed_depth_ignored_for_png_routed_entries() {
+        // With a size threshold the 64×64 entry routes to PNG; the
+        // indexed depth only governs the BMP path, so the PNG entry
+        // still carries full RGBA at directory bit-depth 32.
+        let big = IconImage::from_rgba(64, 64, vec![128u8; 64 * 64 * 4]);
+        let opts = WriteOptions {
+            png_size_threshold: Some(64),
+            bmp_bit_depth: BmpBitDepth::Indexed8,
+        };
+        let bytes = write_ico(IconType::Ico, &[big], opts).unwrap();
+        let (_, decoded) = read_ico(&bytes).unwrap();
+        assert_eq!(decoded[0].sub_format, IconSubFormat::Png);
+        assert_eq!(decoded[0].bit_depth, 32);
+    }
+}
+
+#[cfg(test)]
 mod ani_write_tests {
     use super::*;
     use crate::ani::AniInfo;
@@ -355,6 +529,7 @@ mod ani_write_tests {
         AniWriteOptions {
             ico: WriteOptions {
                 png_size_threshold: None,
+                ..Default::default()
             },
             ..AniWriteOptions::default()
         }
