@@ -70,6 +70,28 @@ impl IconImage {
             hotspot: None,
         }
     }
+
+    /// Builder-style setter for [`IconImage::bit_depth`] — the BMP depth
+    /// the writer should target for this sub-image when
+    /// [`WriteOptions::per_image_bit_depth`] is enabled. Returns `self`
+    /// so it chains off [`IconImage::from_rgba`]:
+    ///
+    /// ```
+    /// # use oxideav_ico::IconImage;
+    /// let im = IconImage::from_rgba(16, 16, vec![0; 16 * 16 * 4]).with_bit_depth(8);
+    /// assert_eq!(im.bit_depth, 8);
+    /// ```
+    pub fn with_bit_depth(mut self, bit_depth: u8) -> Self {
+        self.bit_depth = bit_depth;
+        self
+    }
+
+    /// Builder-style setter for [`IconImage::hotspot`] (CUR entries).
+    /// Returns `self` so it chains off [`IconImage::from_rgba`].
+    pub fn with_hotspot(mut self, hotspot: HotSpot) -> Self {
+        self.hotspot = Some(hotspot);
+        self
+    }
 }
 
 /// Bit depth to use when the writer emits a BMP-DIB sub-image. The

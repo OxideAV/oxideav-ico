@@ -331,6 +331,55 @@ mod tests {
         assert_eq!(&im.pixels[12..16], &[100, 110, 120, 255], "(1,1) opaque");
     }
 
+    /// A decoded mixed-depth icon re-encodes faithfully: decode an ICO
+    /// carrying a 1-bpp and an 8-bpp entry, then re-encode with
+    /// `per_image_bit_depth` so each `IconImage::bit_depth` (set by the
+    /// decoder) drives the re-encode depth. The re-read directory must
+    /// carry the same per-entry depths — the round-trip a thumbnail /
+    /// editing tool performs when it loads, tweaks, and re-saves an icon.
+    #[cfg(feature = "registry")]
+    #[test]
+    fn decode_then_reencode_preserves_per_entry_depth() {
+        // Build the source via the per-image-depth writer: a 1-bpp 2×2
+        // and an 8-bpp 2×2.
+        let mono = IconImage::from_rgba(
+            2,
+            2,
+            vec![
+                0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 255,
+            ],
+        )
+        .with_bit_depth(1);
+        let idx8 = IconImage::from_rgba(
+            2,
+            2,
+            vec![
+                255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
+            ],
+        )
+        .with_bit_depth(8);
+        let opts = WriteOptions {
+            png_size_threshold: None,
+            per_image_bit_depth: true,
+            ..Default::default()
+        };
+        let src = write_ico(IconType::Ico, &[mono, idx8], opts).unwrap();
+
+        // Decode — each IconImage.bit_depth reflects the on-disk depth.
+        let (_, decoded) = read_ico(&src).unwrap();
+        assert_eq!(decoded[0].bit_depth, 1);
+        assert_eq!(decoded[1].bit_depth, 8);
+
+        // Re-encode straight from the decoded images with the same opts.
+        let reencoded = write_ico(IconType::Ico, &decoded, opts).unwrap();
+        let (_, again) = read_ico(&reencoded).unwrap();
+        assert_eq!(again[0].bit_depth, 1, "1-bpp entry stays 1-bpp");
+        assert_eq!(again[1].bit_depth, 8, "8-bpp entry stays 8-bpp");
+        // Pixels survive the full decode→re-encode→decode cycle.
+        assert_eq!(again[0].pixels, decoded[0].pixels);
+        assert_eq!(again[1].pixels, decoded[1].pixels);
+    }
+
     /// The `read_ico_raw` standalone parser must catch a non-ICO magic
     /// without involving any decoder. Available even with the
     /// `registry` feature off.
