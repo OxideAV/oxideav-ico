@@ -121,6 +121,23 @@ impl BmpBitDepth {
             _ => None,
         }
     }
+
+    /// Map a directory/DIB `biBitCount` value to a [`BmpBitDepth`].
+    /// Recognises the legal ICO depths `1/4/8/24/32`; `16` (which the
+    /// reader accepts but the writer has no encoder for) and any other
+    /// value map to `None`. Used by the per-image-depth write path to
+    /// turn a decoded [`IconImage::bit_depth`] back into an encode
+    /// choice for a faithful round-trip.
+    pub fn from_bits(bits: u8) -> Option<Self> {
+        match bits {
+            1 => Some(BmpBitDepth::Indexed1),
+            4 => Some(BmpBitDepth::Indexed4),
+            8 => Some(BmpBitDepth::Indexed8),
+            24 => Some(BmpBitDepth::Rgb24),
+            32 => Some(BmpBitDepth::Bgra32),
+            _ => None,
+        }
+    }
 }
 
 /// Options for the writer. Defaults favour modern icons (PNG for
@@ -141,8 +158,23 @@ pub struct WriteOptions {
     /// variant to emit compact, legacy-faithful sub-images; the writer
     /// quantises each BMP-bound sub-image to the requested depth and
     /// errors if an indexed depth can't hold the image's colour count.
-    /// Ignored for any sub-image the size threshold routes to PNG.
+    /// Ignored for any sub-image the size threshold routes to PNG, and
+    /// overridden per-image when [`WriteOptions::per_image_bit_depth`]
+    /// is set.
     pub bmp_bit_depth: BmpBitDepth,
+    /// When `true`, each BMP-bound sub-image is encoded at the depth its
+    /// own [`IconImage::bit_depth`] field names (via
+    /// [`BmpBitDepth::from_bits`]) instead of the single
+    /// [`WriteOptions::bmp_bit_depth`]. This lets one `write_ico` call
+    /// emit a faithful **mixed-depth** multi-resolution icon — e.g. a
+    /// decoded `.ico` carrying a legacy 1-bpp 16×16 next to a 32-bpp
+    /// 32×32 re-encodes each entry at its original depth. A
+    /// `bit_depth` the writer can't encode (`16`, or anything outside
+    /// `1/4/8/24/32`) falls back to [`WriteOptions::bmp_bit_depth`].
+    ///
+    /// Default `false` — every BMP sub-image uses the single
+    /// `bmp_bit_depth`, preserving the historical behaviour.
+    pub per_image_bit_depth: bool,
 }
 
 impl Default for WriteOptions {
@@ -150,6 +182,7 @@ impl Default for WriteOptions {
         Self {
             png_size_threshold: Some(64),
             bmp_bit_depth: BmpBitDepth::Bgra32,
+            per_image_bit_depth: false,
         }
     }
 }

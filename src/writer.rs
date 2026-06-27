@@ -53,14 +53,22 @@ pub fn write_ico(icon_type: IconType, images: &[IconImage], opts: WriteOptions) 
     let mut entries: Vec<IconEntryRaw> = Vec::with_capacity(images.len());
     for (i, im) in images.iter().enumerate() {
         let chosen = choose_sub_format(im, &opts);
-        let bytes = encode_sub_image(im, chosen, opts.bmp_bit_depth)
+        // Per-image depth (when enabled) lets one call emit a mixed-depth
+        // multi-resolution icon; an unencodable `bit_depth` falls back to
+        // the single `bmp_bit_depth`.
+        let depth = if opts.per_image_bit_depth {
+            BmpBitDepth::from_bits(im.bit_depth).unwrap_or(opts.bmp_bit_depth)
+        } else {
+            opts.bmp_bit_depth
+        };
+        let bytes = encode_sub_image(im, chosen, depth)
             .map_err(|e| Error::invalid(format!("ICO: entry {i}: {e}")))?;
         // PNG bodies always carry full RGBA; BMP bodies carry the depth
         // the writer actually emitted so the directory `wBitCount` and
         // the body's `biBitCount` agree (read_ico_raw cross-checks them).
         let bit_depth = match chosen {
             SubFormatChosen::Png => 32,
-            SubFormatChosen::Bmp => opts.bmp_bit_depth.bits(),
+            SubFormatChosen::Bmp => depth.bits(),
         };
         entries.push(IconEntryRaw {
             width: im.width,
@@ -406,6 +414,7 @@ mod bmp_depth_tests {
         WriteOptions {
             png_size_threshold: None, // force BMP everywhere
             bmp_bit_depth: depth,
+            per_image_bit_depth: false,
         }
     }
 
@@ -505,6 +514,77 @@ mod bmp_depth_tests {
     }
 
     #[test]
+    fn from_bits_maps_legal_depths() {
+        assert_eq!(BmpBitDepth::from_bits(1), Some(BmpBitDepth::Indexed1));
+        assert_eq!(BmpBitDepth::from_bits(4), Some(BmpBitDepth::Indexed4));
+        assert_eq!(BmpBitDepth::from_bits(8), Some(BmpBitDepth::Indexed8));
+        assert_eq!(BmpBitDepth::from_bits(24), Some(BmpBitDepth::Rgb24));
+        assert_eq!(BmpBitDepth::from_bits(32), Some(BmpBitDepth::Bgra32));
+        // 16-bpp has no writer; 0 and odd values are unencodable.
+        assert_eq!(BmpBitDepth::from_bits(16), None);
+        assert_eq!(BmpBitDepth::from_bits(0), None);
+        assert_eq!(BmpBitDepth::from_bits(7), None);
+    }
+
+    #[test]
+    fn per_image_bit_depth_emits_mixed_depth_icon() {
+        // One call producing a faithful mixed-depth multi-resolution
+        // icon: a 1-bpp 2×2 monochrome entry next to an 8-bpp 2×2 entry.
+        let mut mono = IconImage::from_rgba(
+            2,
+            2,
+            rgba_palette(&[
+                [0, 0, 0, 255],
+                [255, 255, 255, 255],
+                [255, 255, 255, 255],
+                [0, 0, 0, 255],
+            ]),
+        );
+        mono.bit_depth = 1;
+        let mut idx8 = IconImage::from_rgba(
+            2,
+            2,
+            rgba_palette(&[
+                [255, 0, 0, 255],
+                [0, 255, 0, 255],
+                [0, 0, 255, 255],
+                [255, 255, 0, 255],
+            ]),
+        );
+        idx8.bit_depth = 8;
+
+        let opts = WriteOptions {
+            png_size_threshold: None,
+            bmp_bit_depth: BmpBitDepth::Bgra32, // default, overridden per image
+            per_image_bit_depth: true,
+        };
+        let bytes = write_ico(IconType::Ico, &[mono, idx8], opts).unwrap();
+        let (_, decoded) = read_ico(&bytes).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].bit_depth, 1, "first entry stays 1-bpp");
+        assert_eq!(decoded[1].bit_depth, 8, "second entry stays 8-bpp");
+        // Pixels survive both depths.
+        assert_eq!(&decoded[0].pixels[0..4], &[0, 0, 0, 255]);
+        assert_eq!(&decoded[1].pixels[0..4], &[255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn per_image_bit_depth_falls_back_for_unencodable_depth() {
+        // bit_depth = 16 has no writer; the per-image path falls back to
+        // the global bmp_bit_depth (here 32) rather than erroring.
+        let mut im = IconImage::from_rgba(2, 2, vec![100u8; 16]);
+        im.bit_depth = 16;
+        let opts = WriteOptions {
+            png_size_threshold: None,
+            bmp_bit_depth: BmpBitDepth::Bgra32,
+            per_image_bit_depth: true,
+        };
+        let bytes = write_ico(IconType::Ico, &[im], opts).unwrap();
+        let (_, decoded) = read_ico(&bytes).unwrap();
+        assert_eq!(decoded[0].bit_depth, 32, "fell back to 32-bpp");
+    }
+
+    #[test]
     fn indexed_depth_ignored_for_png_routed_entries() {
         // With a size threshold the 64×64 entry routes to PNG; the
         // indexed depth only governs the BMP path, so the PNG entry
@@ -513,6 +593,7 @@ mod bmp_depth_tests {
         let opts = WriteOptions {
             png_size_threshold: Some(64),
             bmp_bit_depth: BmpBitDepth::Indexed8,
+            per_image_bit_depth: false,
         };
         let bytes = write_ico(IconType::Ico, &[big], opts).unwrap();
         let (_, decoded) = read_ico(&bytes).unwrap();
@@ -596,6 +677,7 @@ mod ani_write_tests {
             ico: WriteOptions {
                 png_size_threshold: None,
                 bmp_bit_depth: BmpBitDepth::Indexed8,
+                per_image_bit_depth: false,
             },
             ..AniWriteOptions::default()
         };
@@ -623,6 +705,7 @@ mod ani_write_tests {
             ico: WriteOptions {
                 png_size_threshold: None,
                 bmp_bit_depth: BmpBitDepth::Indexed1,
+                per_image_bit_depth: false,
             },
             ..AniWriteOptions::default()
         };
