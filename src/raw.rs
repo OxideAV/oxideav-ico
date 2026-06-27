@@ -721,6 +721,295 @@ fn parse_dib_compression(body: &[u8]) -> Option<u32> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Low-bit-depth + true-colour DIB sub-image encoders.
+//
+// The registry-side `write_ico` only emits 32-bpp BGRA (and PNG). These
+// framework-free builders produce the classic indexed (1/4/8-bpp) and
+// 24-bpp BGR DIB sub-image bodies — a `BITMAPINFOHEADER` with the
+// doubled `biHeight`, the RGBQUAD colour table (indexed only), the
+// bottom-up XOR colour rows at the requested bit depth, and the
+// bottom-up 1-bpp AND mask — exactly the `ICONIMAGE` DIB form documented
+// in `docs/image/ico/ico-cur-format.md §"DIB form structure"`.
+//
+// They sit in the framework-free `raw` layer (rather than leaning on
+// `oxideav-bmp`) because the doubled-height + AND-mask packing is
+// intrinsic to the ICO sub-image, not the standalone BMP file, and
+// `oxideav-bmp`'s `encode_dib_plane` only appends the AND mask for its
+// 32-bpp BGRA path — an indexed body encoded through it would claim a
+// doubled `biHeight` yet omit the mask rows.
+// ---------------------------------------------------------------------------
+
+/// `BITMAPINFOHEADER` size — the v3 header every ICO DIB sub-image uses.
+const BITMAPINFOHEADER_SIZE: u32 = 40;
+
+/// A single RGBQUAD palette entry: blue, green, red (and an implied
+/// zero reserved byte on disk), matching the on-disk ICO colour-table
+/// layout. Construct from RGB with [`PaletteEntry::from_rgb`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaletteEntry {
+    pub b: u8,
+    pub g: u8,
+    pub r: u8,
+}
+
+impl PaletteEntry {
+    /// Build a palette entry from an `(r, g, b)` triple.
+    pub fn from_rgb(r: u8, g: u8, b: u8) -> Self {
+        Self { b, g, r }
+    }
+}
+
+/// 4-byte-aligned row stride (in bytes) for a `width`-pixel row at
+/// `bpp` bits per pixel — the standard DIB packing rule (`((w*bpp+31)/32)*4`).
+fn dib_row_stride(width: u32, bpp: u32) -> usize {
+    ((width * bpp).div_ceil(32) * 4) as usize
+}
+
+/// Write the v3 `BITMAPINFOHEADER` for an ICO DIB sub-image: the height
+/// is the **doubled** (XOR + AND) value the ICO convention mandates,
+/// `biClrUsed` is the written palette length (0 for direct-colour),
+/// everything else is the spec's BI_RGB defaults.
+fn write_ico_dib_header(out: &mut Vec<u8>, width: u32, height: u32, bpp: u16, clr_used: u32) {
+    out.extend_from_slice(&BITMAPINFOHEADER_SIZE.to_le_bytes()); // biSize
+    out.extend_from_slice(&(width as i32).to_le_bytes()); // biWidth
+    out.extend_from_slice(&((2 * height) as i32).to_le_bytes()); // biHeight (doubled)
+    out.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
+    out.extend_from_slice(&bpp.to_le_bytes()); // biBitCount
+    out.extend_from_slice(&BI_RGB.to_le_bytes()); // biCompression
+    out.extend_from_slice(&0u32.to_le_bytes()); // biSizeImage (0 ok for BI_RGB)
+    out.extend_from_slice(&0i32.to_le_bytes()); // biXPelsPerMeter
+    out.extend_from_slice(&0i32.to_le_bytes()); // biYPelsPerMeter
+    out.extend_from_slice(&clr_used.to_le_bytes()); // biClrUsed
+    out.extend_from_slice(&0u32.to_le_bytes()); // biClrImportant
+}
+
+/// Pack the bottom-up 1-bpp AND mask. `transparent[y*w + x]` (top-down,
+/// row 0 = top) marks pixel `(x, y)` transparent (mask bit = 1); rows
+/// are flipped to bottom-up storage and padded to a 4-byte boundary.
+fn build_and_mask(width: u32, height: u32, transparent: &[bool]) -> Vec<u8> {
+    let stride = dib_row_stride(width, 1);
+    let mut and = vec![0u8; stride * height as usize];
+    for y in 0..height {
+        let storage_row = (height - 1 - y) as usize;
+        for x in 0..width {
+            if transparent[(y * width + x) as usize] {
+                let byte = storage_row * stride + (x as usize) / 8;
+                let shift = 7 - (x as usize % 8);
+                and[byte] |= 1 << shift;
+            }
+        }
+    }
+    and
+}
+
+/// Build a complete headerless **indexed** DIB sub-image body (the
+/// `ICONIMAGE` DIB form) at 1, 4, or 8 bpp: `BITMAPINFOHEADER` +
+/// `2^bpp` RGBQUAD palette + bottom-up XOR index rows + bottom-up 1-bpp
+/// AND mask.
+///
+/// * `indices` and `transparent` are **top-down** (row 0 = top),
+///   row-major, length `width * height`. Each index must be
+///   `< 2^bpp`; `transparent[i] == true` makes pixel `i` transparent.
+/// * `palette` supplies the colour for each used index. It is written
+///   into the leading RGBQUAD slots; the table is always padded out to
+///   the full `2^bpp` entries (Windows requires the full table for
+///   indexed DIBs), so a shorter palette leaves the trailing slots
+///   black.
+///
+/// Returns the DIB bytes ready to drop into an [`IconEntryRaw::data`].
+pub fn encode_indexed_dib_body(
+    width: u32,
+    height: u32,
+    bpp: u8,
+    palette: &[PaletteEntry],
+    indices: &[u8],
+    transparent: &[bool],
+) -> Result<Vec<u8>> {
+    if !matches!(bpp, 1 | 4 | 8) {
+        return Err(Error::invalid(format!(
+            "ICO: indexed DIB bit depth must be 1, 4 or 8 (got {bpp})"
+        )));
+    }
+    if width == 0 || height == 0 {
+        return Err(Error::invalid("ICO: indexed DIB has zero dimension"));
+    }
+    let pixels = width as usize * height as usize;
+    if indices.len() != pixels {
+        return Err(Error::invalid(format!(
+            "ICO: indexed DIB index count {} != {width}×{height}",
+            indices.len()
+        )));
+    }
+    if transparent.len() != pixels {
+        return Err(Error::invalid(format!(
+            "ICO: indexed DIB transparency mask len {} != {width}×{height}",
+            transparent.len()
+        )));
+    }
+    let max_index = 1u16 << bpp; // 2, 16, or 256
+    if palette.len() > max_index as usize {
+        return Err(Error::invalid(format!(
+            "ICO: {bpp}-bpp palette has {} entries (max {max_index})",
+            palette.len()
+        )));
+    }
+    for (i, &idx) in indices.iter().enumerate() {
+        if (idx as u16) >= max_index {
+            return Err(Error::invalid(format!(
+                "ICO: pixel {i} index {idx} exceeds {bpp}-bpp range (0..{})",
+                max_index - 1
+            )));
+        }
+    }
+
+    let mut out = Vec::new();
+    write_ico_dib_header(&mut out, width, height, bpp as u16, max_index as u32);
+
+    // RGBQUAD colour table — full 2^bpp entries, trailing slots black.
+    let mut table = vec![0u8; max_index as usize * 4];
+    for (i, e) in palette.iter().enumerate() {
+        table[i * 4..i * 4 + 4].copy_from_slice(&[e.b, e.g, e.r, 0]);
+    }
+    out.extend_from_slice(&table);
+
+    // XOR index rows: bottom-up, 4-byte-aligned, MSB-first packing.
+    let stride = dib_row_stride(width, bpp as u32);
+    let mut xor = vec![0u8; stride * height as usize];
+    let mask: u16 = (1u16 << bpp) - 1;
+    for y in 0..height {
+        let storage_row = (height - 1 - y) as usize;
+        for x in 0..width {
+            let idx = indices[(y * width + x) as usize];
+            let bit_pos = (x * bpp as u32) as usize;
+            let byte = storage_row * stride + bit_pos / 8;
+            let shift = 8 - bpp as usize - (bit_pos % 8);
+            xor[byte] |= ((idx as u16 & mask) as u8) << shift;
+        }
+    }
+    out.extend_from_slice(&xor);
+
+    out.extend_from_slice(&build_and_mask(width, height, transparent));
+    Ok(out)
+}
+
+/// Build a complete headerless **24-bpp** (true-colour, no palette) DIB
+/// sub-image body: `BITMAPINFOHEADER` + bottom-up XOR rows of `B G R`
+/// triples (each row padded to 4 bytes) + bottom-up 1-bpp AND mask.
+///
+/// `rgb` is **top-down** `R G B` (3 bytes/pixel), row-major, length
+/// `width*height*3`; `transparent` is the same-shaped top-down mask.
+/// 24-bpp icons carry no alpha, so transparency lives entirely in the
+/// AND mask.
+pub fn encode_rgb24_dib_body(
+    width: u32,
+    height: u32,
+    rgb: &[u8],
+    transparent: &[bool],
+) -> Result<Vec<u8>> {
+    if width == 0 || height == 0 {
+        return Err(Error::invalid("ICO: 24-bpp DIB has zero dimension"));
+    }
+    let pixels = width as usize * height as usize;
+    if rgb.len() != pixels * 3 {
+        return Err(Error::invalid(format!(
+            "ICO: 24-bpp DIB byte count {} != {width}×{height}×3",
+            rgb.len()
+        )));
+    }
+    if transparent.len() != pixels {
+        return Err(Error::invalid(format!(
+            "ICO: 24-bpp DIB transparency mask len {} != {width}×{height}",
+            transparent.len()
+        )));
+    }
+
+    let mut out = Vec::new();
+    write_ico_dib_header(&mut out, width, height, 24, 0);
+
+    let stride = dib_row_stride(width, 24);
+    let mut xor = vec![0u8; stride * height as usize];
+    for y in 0..height {
+        let storage_row = (height - 1 - y) as usize;
+        for x in 0..width {
+            let src = (y * width + x) as usize * 3;
+            let dst = storage_row * stride + x as usize * 3;
+            // On-disk DIB order is B, G, R.
+            xor[dst] = rgb[src + 2];
+            xor[dst + 1] = rgb[src + 1];
+            xor[dst + 2] = rgb[src];
+        }
+    }
+    out.extend_from_slice(&xor);
+
+    out.extend_from_slice(&build_and_mask(width, height, transparent));
+    Ok(out)
+}
+
+/// Quantise top-down RGBA pixels into a palette + index buffer suitable
+/// for [`encode_indexed_dib_body`], deriving the transparency mask from
+/// the alpha channel (alpha `0` ⇒ transparent ⇒ a set AND-mask bit).
+///
+/// The palette is built by **exact colour collection**: every distinct
+/// opaque `(r, g, b)` is assigned the next free index in first-seen
+/// order — no lossy colour reduction. A pixel that is transparent
+/// (alpha `0`) does not consume a palette slot; its index is `0` and
+/// the AND mask hides it. If the distinct-colour count exceeds the
+/// `2^bpp` capacity the call fails (the caller picks a deeper bit depth
+/// or pre-quantises), so a successful round-trip is always colour-exact.
+///
+/// Returns `(palette, indices, transparent)`.
+#[allow(clippy::type_complexity)]
+pub fn quantise_rgba_to_indexed(
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+    bpp: u8,
+) -> Result<(Vec<PaletteEntry>, Vec<u8>, Vec<bool>)> {
+    if !matches!(bpp, 1 | 4 | 8) {
+        return Err(Error::invalid(format!(
+            "ICO: indexed bit depth must be 1, 4 or 8 (got {bpp})"
+        )));
+    }
+    let pixels = width as usize * height as usize;
+    if rgba.len() != pixels * 4 {
+        return Err(Error::invalid(format!(
+            "ICO: quantise input {} bytes != {width}×{height}×4",
+            rgba.len()
+        )));
+    }
+    let capacity = 1usize << bpp;
+    let mut palette: Vec<PaletteEntry> = Vec::new();
+    let mut indices = vec![0u8; pixels];
+    let mut transparent = vec![false; pixels];
+    for i in 0..pixels {
+        let r = rgba[i * 4];
+        let g = rgba[i * 4 + 1];
+        let b = rgba[i * 4 + 2];
+        let a = rgba[i * 4 + 3];
+        if a == 0 {
+            transparent[i] = true;
+            continue;
+        }
+        let entry = PaletteEntry::from_rgb(r, g, b);
+        let idx = match palette.iter().position(|&e| e == entry) {
+            Some(p) => p,
+            None => {
+                if palette.len() >= capacity {
+                    return Err(Error::invalid(format!(
+                        "ICO: image needs more than {capacity} colours — won't fit a \
+                         {bpp}-bpp palette (use a deeper bit depth or pre-quantise)"
+                    )));
+                }
+                palette.push(entry);
+                palette.len() - 1
+            }
+        };
+        indices[i] = idx as u8;
+    }
+    Ok((palette, indices, transparent))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2323,5 +2612,131 @@ mod tests {
         let bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
         let (_, got) = read_ico_raw(&bytes).unwrap();
         assert_eq!(got.len(), 1);
+    }
+
+    // ───────────────── low-bit-depth / 24-bpp DIB body encoders ─────────────────
+
+    #[test]
+    fn encode_indexed_dib_body_rejects_bad_bpp() {
+        let err = encode_indexed_dib_body(2, 2, 2, &[], &[0; 4], &[false; 4]).unwrap_err();
+        assert!(err.to_string().contains("must be 1, 4 or 8"));
+    }
+
+    #[test]
+    fn encode_indexed_dib_body_rejects_index_out_of_range() {
+        // 1-bpp: only indices 0 and 1 are legal.
+        let pal = [
+            PaletteEntry::from_rgb(0, 0, 0),
+            PaletteEntry::from_rgb(255, 255, 255),
+        ];
+        let err = encode_indexed_dib_body(2, 1, 1, &pal, &[0, 2], &[false, false]).unwrap_err();
+        assert!(err.to_string().contains("exceeds"));
+    }
+
+    #[test]
+    fn encode_indexed_dib_body_rejects_oversized_palette() {
+        // 1-bpp table holds 2 entries; a 3-entry palette is impossible.
+        let pal = [
+            PaletteEntry::from_rgb(0, 0, 0),
+            PaletteEntry::from_rgb(1, 1, 1),
+            PaletteEntry::from_rgb(2, 2, 2),
+        ];
+        let err = encode_indexed_dib_body(2, 1, 1, &pal, &[0, 1], &[false, false]).unwrap_err();
+        assert!(err.to_string().contains("max 2"));
+    }
+
+    #[test]
+    fn encode_indexed_dib_body_header_is_doubled_height_v3() {
+        let pal = [PaletteEntry::from_rgb(10, 20, 30)];
+        let dib = encode_indexed_dib_body(2, 2, 8, &pal, &[0; 4], &[false; 4]).unwrap();
+        // biSize = 40, biWidth = 2, biHeight = 4 (doubled), biBitCount = 8.
+        assert_eq!(u32::from_le_bytes([dib[0], dib[1], dib[2], dib[3]]), 40);
+        assert_eq!(i32::from_le_bytes([dib[4], dib[5], dib[6], dib[7]]), 2);
+        assert_eq!(i32::from_le_bytes([dib[8], dib[9], dib[10], dib[11]]), 4);
+        assert_eq!(u16::from_le_bytes([dib[14], dib[15]]), 8);
+        // biClrUsed = 256 for an 8-bpp table.
+        assert_eq!(
+            u32::from_le_bytes([dib[32], dib[33], dib[34], dib[35]]),
+            256
+        );
+    }
+
+    #[test]
+    fn quantise_collects_distinct_colours_and_alpha_mask() {
+        // 2×2: red opaque, green opaque, transparent, red opaque again.
+        let rgba = vec![
+            255, 0, 0, 255, // red
+            0, 255, 0, 255, // green
+            9, 9, 9, 0, // transparent (colour ignored)
+            255, 0, 0, 255, // red again -> reuses index 0
+        ];
+        let (pal, idx, transp) = quantise_rgba_to_indexed(2, 2, &rgba, 8).unwrap();
+        assert_eq!(pal.len(), 2); // red, green
+        assert_eq!(pal[0], PaletteEntry::from_rgb(255, 0, 0));
+        assert_eq!(pal[1], PaletteEntry::from_rgb(0, 255, 0));
+        assert_eq!(idx, vec![0, 1, 0, 0]);
+        assert_eq!(transp, vec![false, false, true, false]);
+    }
+
+    #[test]
+    fn quantise_overflow_when_too_many_colours_for_bpp() {
+        // Three distinct colours can't fit a 1-bpp (2-entry) palette.
+        let rgba = vec![
+            1, 0, 0, 255, //
+            0, 2, 0, 255, //
+            0, 0, 3, 255, //
+            4, 0, 0, 255, //
+        ];
+        let err = quantise_rgba_to_indexed(2, 2, &rgba, 1).unwrap_err();
+        assert!(err.to_string().contains("more than 2 colours"));
+    }
+
+    #[test]
+    fn indexed_dib_round_trips_through_reader_8bpp() {
+        // Quantise → encode → wrap in ICO directory → decode back to RGBA.
+        let rgba = vec![
+            255, 0, 0, 255, // (0,0) red
+            0, 255, 0, 0, // (1,0) green but transparent
+            0, 0, 255, 255, // (0,1) blue
+            255, 255, 0, 255, // (1,1) yellow
+        ];
+        let (pal, idx, transp) = quantise_rgba_to_indexed(2, 2, &rgba, 8).unwrap();
+        let dib = encode_indexed_dib_body(2, 2, 8, &pal, &idx, &transp).unwrap();
+        let entry = IconEntryRaw {
+            width: 2,
+            height: 2,
+            bit_depth: 8,
+            sub_format: IconSubFormat::Bmp,
+            hotspot: None,
+            data: dib,
+        };
+        let bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
+        let (_, got) = read_ico_raw(&bytes).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].bit_depth, 8);
+        // The directory + body parse cleanly; the pixel-exact decode is
+        // covered by the registry-side reader tests.
+    }
+
+    #[test]
+    fn encode_rgb24_dib_body_packs_bgr_and_doubled_height() {
+        // 2×1 RGB: red, blue. Stored bottom-up B,G,R with 4-byte row pad.
+        let rgb = vec![255, 0, 0, 0, 0, 255];
+        let dib = encode_rgb24_dib_body(2, 1, &rgb, &[false, false]).unwrap();
+        // biBitCount = 24, biHeight = 2 (doubled from 1).
+        assert_eq!(u16::from_le_bytes([dib[14], dib[15]]), 24);
+        assert_eq!(i32::from_le_bytes([dib[8], dib[9], dib[10], dib[11]]), 2);
+        // No palette: pixel data begins right after the 40-byte header.
+        // Row stride for 2px*24bpp = 6 bytes -> padded to 8.
+        let row = &dib[40..48];
+        // x=0 red -> B,G,R = 0,0,255 ; x=1 blue -> B,G,R = 255,0,0.
+        assert_eq!(&row[0..3], &[0, 0, 255]);
+        assert_eq!(&row[3..6], &[255, 0, 0]);
+    }
+
+    #[test]
+    fn encode_rgb24_dib_body_rejects_size_mismatch() {
+        let err = encode_rgb24_dib_body(2, 1, &[0, 0, 0], &[false, false]).unwrap_err();
+        assert!(err.to_string().contains("!= 2×1×3"));
     }
 }

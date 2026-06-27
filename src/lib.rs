@@ -62,7 +62,10 @@ pub use ani::{
     AF_SEQUENCE,
 };
 pub use error::{IcoError, Result};
-pub use raw::{read_ico_raw, write_ico_raw, IconEntryRaw};
+pub use raw::{
+    encode_indexed_dib_body, encode_rgb24_dib_body, quantise_rgba_to_indexed, read_ico_raw,
+    write_ico_raw, IconEntryRaw, PaletteEntry,
+};
 pub use types::{
     select_best_fit, select_best_fit_raw, select_by_dimensions, select_by_dimensions_raw,
     select_largest, select_largest_raw, HotSpot, IconImage, IconSubFormat, IconType, WriteOptions,
@@ -215,6 +218,115 @@ mod tests {
         .unwrap();
         let (_, got) = read_ico(&bytes).unwrap();
         assert_eq!(got[0].sub_format, IconSubFormat::Bmp);
+    }
+
+    /// Indexed (8-bpp) DIB sub-image, end to end: quantise an RGBA
+    /// image to a palette + indices, encode the headerless indexed DIB
+    /// body, wrap it in an `ICONDIRENTRY`, then decode the whole file
+    /// back through the registry-side reader and assert the pixels come
+    /// out exactly — proving the new low-bit-depth encode path lines up
+    /// with the existing palette + AND-mask decode path.
+    #[cfg(feature = "registry")]
+    #[test]
+    fn indexed_8bpp_dib_pixel_exact_roundtrip() {
+        // Four distinct opaque colours + one transparent pixel.
+        let rgba = vec![
+            255, 0, 0, 255, // (0,0) red
+            0, 255, 0, 255, // (1,0) green
+            0, 0, 255, 255, // (0,1) blue
+            12, 34, 56, 0, // (1,1) transparent — colour discarded
+        ];
+        let (pal, idx, transp) = quantise_rgba_to_indexed(2, 2, &rgba, 8).unwrap();
+        assert_eq!(pal.len(), 3, "three opaque colours collected");
+        let dib = encode_indexed_dib_body(2, 2, 8, &pal, &idx, &transp).unwrap();
+        let entry = IconEntryRaw {
+            width: 2,
+            height: 2,
+            bit_depth: 8,
+            sub_format: IconSubFormat::Bmp,
+            hotspot: None,
+            data: dib,
+        };
+        let bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
+
+        let (ty, decoded) = read_ico(&bytes).unwrap();
+        assert_eq!(ty, IconType::Ico);
+        assert_eq!(decoded.len(), 1);
+        let im = &decoded[0];
+        assert_eq!((im.width, im.height), (2, 2));
+        assert_eq!(im.bit_depth, 8);
+        assert_eq!(im.sub_format, IconSubFormat::Bmp);
+        assert_eq!(&im.pixels[0..4], &[255, 0, 0, 255], "(0,0) red opaque");
+        assert_eq!(&im.pixels[4..8], &[0, 255, 0, 255], "(1,0) green opaque");
+        assert_eq!(&im.pixels[8..12], &[0, 0, 255, 255], "(0,1) blue opaque");
+        // Transparent pixel: alpha 0; colour is whatever palette slot 0
+        // holds, but the AND mask makes it transparent regardless.
+        assert_eq!(im.pixels[15], 0, "(1,1) transparent (alpha 0)");
+    }
+
+    /// 1-bpp monochrome DIB sub-image, end to end — the smallest legal
+    /// bit depth, the classic black/white legacy icon.
+    #[cfg(feature = "registry")]
+    #[test]
+    fn indexed_1bpp_dib_pixel_exact_roundtrip() {
+        // 2×2: white, black / black, white. No transparency.
+        let rgba = vec![
+            255, 255, 255, 255, // white
+            0, 0, 0, 255, // black
+            0, 0, 0, 255, // black
+            255, 255, 255, 255, // white
+        ];
+        let (pal, idx, transp) = quantise_rgba_to_indexed(2, 2, &rgba, 1).unwrap();
+        assert_eq!(pal.len(), 2);
+        let dib = encode_indexed_dib_body(2, 2, 1, &pal, &idx, &transp).unwrap();
+        let entry = IconEntryRaw {
+            width: 2,
+            height: 2,
+            bit_depth: 1,
+            sub_format: IconSubFormat::Bmp,
+            hotspot: None,
+            data: dib,
+        };
+        let bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
+        let (_, decoded) = read_ico(&bytes).unwrap();
+        let im = &decoded[0];
+        assert_eq!(im.bit_depth, 1);
+        assert_eq!(&im.pixels[0..4], &[255, 255, 255, 255]);
+        assert_eq!(&im.pixels[4..8], &[0, 0, 0, 255]);
+        assert_eq!(&im.pixels[8..12], &[0, 0, 0, 255]);
+        assert_eq!(&im.pixels[12..16], &[255, 255, 255, 255]);
+    }
+
+    /// 24-bpp true-colour DIB sub-image, end to end — no palette, BGR
+    /// triples, transparency carried solely by the AND mask.
+    #[cfg(feature = "registry")]
+    #[test]
+    fn rgb24_dib_pixel_exact_roundtrip() {
+        // 2×2 arbitrary colours; mark (1,0) transparent via the mask.
+        let rgb = vec![
+            10, 20, 30, // (0,0)
+            40, 50, 60, // (1,0) -> transparent
+            70, 80, 90, // (0,1)
+            100, 110, 120, // (1,1)
+        ];
+        let transp = vec![false, true, false, false];
+        let dib = encode_rgb24_dib_body(2, 2, &rgb, &transp).unwrap();
+        let entry = IconEntryRaw {
+            width: 2,
+            height: 2,
+            bit_depth: 24,
+            sub_format: IconSubFormat::Bmp,
+            hotspot: None,
+            data: dib,
+        };
+        let bytes = write_ico_raw(IconType::Ico, std::slice::from_ref(&entry)).unwrap();
+        let (_, decoded) = read_ico(&bytes).unwrap();
+        let im = &decoded[0];
+        assert_eq!(im.bit_depth, 24);
+        assert_eq!(&im.pixels[0..4], &[10, 20, 30, 255], "(0,0) opaque");
+        assert_eq!(im.pixels[7], 0, "(1,0) transparent via AND mask");
+        assert_eq!(&im.pixels[8..12], &[70, 80, 90, 255], "(0,1) opaque");
+        assert_eq!(&im.pixels[12..16], &[100, 110, 120, 255], "(1,1) opaque");
     }
 
     /// The `read_ico_raw` standalone parser must catch a non-ICO magic
