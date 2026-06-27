@@ -8,6 +8,9 @@ the way modern Windows produces them.
 - `ICONDIR` (`idType = 1` for `.ico`, `2` for `.cur`)
 - N × `ICONDIRENTRY` → PNG body (sniffed by magic) or BMP DIB body
   (doubled `biHeight` + 1-bpp AND mask)
+- BMP sub-images at 1/4/8-bpp indexed (palette + AND mask), 24-bpp
+  BGR, and 32-bpp BGRA — read **and** write, with mixed depths in a
+  single multi-resolution file
 - CUR hotspot round-tripped via the `planes` / `bit_count` fields
 
 ## Read
@@ -47,6 +50,51 @@ keeps smaller ones as BMP — matches what Windows 10+ ships. Set
 `png_size_threshold = None` to force all-BMP (maximum legacy
 compatibility).
 
+### BMP bit depth
+
+The BMP-DIB path defaults to 32-bpp BGRA (lossless, alpha in the colour
+bits) but can emit any classic `ICONIMAGE` depth via
+`WriteOptions::bmp_bit_depth`:
+
+```rust
+use oxideav_ico::{write_ico, BmpBitDepth, IconImage, IconType, WriteOptions};
+
+let opts = WriteOptions {
+    png_size_threshold: None,            // all-BMP
+    bmp_bit_depth: BmpBitDepth::Indexed8, // 8-bpp palette + AND mask
+    ..Default::default()
+};
+let bytes = write_ico(IconType::Ico, &imgs, opts)?;
+```
+
+- `Bgra32` (default) — 32-bpp BGRA, no colour / transparency limits.
+- `Rgb24` — 24-bpp BGR; alpha collapses to the 1-bpp AND mask.
+- `Indexed8` / `Indexed4` / `Indexed1` — indexed DIB with a colour
+  table built by exact-colour collection (≤ 256 / 16 / 2 distinct
+  opaque colours) plus a 1-bpp AND mask. The writer errors with the
+  offending entry index when an image needs more colours than the
+  depth's palette can hold, so a successful encode is always
+  colour-exact.
+
+Indexed / 24-bpp bodies are built in-crate (the doubled-`biHeight` +
+AND-mask packing is intrinsic to the ICO sub-image): a
+`BITMAPINFOHEADER`, the RGBQUAD palette (indexed only), bottom-up XOR
+rows at the chosen depth, then the bottom-up 1-bpp AND mask. The
+directory `wBitCount` is written to match the body's `biBitCount` so a
+re-read passes the directory-vs-body cross-check. The lower-level
+`encode_indexed_dib_body` / `encode_rgb24_dib_body` /
+`quantise_rgba_to_indexed` (and the `PaletteEntry` type) are exported
+for callers driving the framework-free `write_ico_raw` directly.
+
+#### Mixed-depth multi-resolution icons
+
+A real-world `.ico` often mixes depths — a legacy 1-bpp 16×16 next to a
+32-bpp 256×256 PNG. Set `per_image_bit_depth = true` and each BMP-bound
+sub-image is encoded at the depth its own `IconImage::bit_depth` names
+(`BmpBitDepth::from_bits` maps `1/4/8/24/32`); an unencodable value
+(e.g. `16`) falls back to `bmp_bit_depth`. This lets one `write_ico`
+call re-emit a decoded mixed-depth icon faithfully.
+
 A 256×256 sub-image is the canonical large-icon case: the directory's
 single-byte width/height fields can't hold 256, so they serialise as
 `0` (the `0 == 256` convention) and the true size is recovered from
@@ -81,8 +129,11 @@ on what a well-formed file is.
 
 ## Scope
 
-- Read: ICO + CUR, PNG + BMP sub-images, 1..=256 px in each axis.
-- Write: 32-bpp RGBA inputs, PNG or BMP output per entry.
+- Read: ICO + CUR, PNG + BMP sub-images at 1/4/8/16/24/32-bpp
+  (indexed + direct), 1..=256 px in each axis.
+- Write: RGBA inputs; PNG, 32-bpp BGRA, 24-bpp BGR, or 1/4/8-bpp
+  indexed BMP output per entry (mixed depths in one file via
+  `per_image_bit_depth`).
 - Not implemented: Windows Vista-era `PNG-inside-BMP-header` quirk
   (where the directory entry claims BMP but the body is secretly
   PNG). Nobody writes this; the reader already handles it because it
@@ -577,7 +628,7 @@ let opts = AniWriteOptions {
     sequence: Some(vec![0, 1, 0, 1]),   // play A,B,A,B
     rates: Some(vec![6, 6, 6, 6]),      // 6 jiffies each
     default_jiffies: 6,
-    ico: WriteOptions { png_size_threshold: None }, // all-BMP frames
+    ico: WriteOptions { png_size_threshold: None, ..Default::default() }, // all-BMP
 };
 let bytes = write_ani(&frames, &opts)?;
 let anim = read_ani(&bytes)?;            // decodes back to an equivalent animation
