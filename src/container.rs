@@ -1022,6 +1022,38 @@ mod tests {
     }
 
     #[test]
+    fn ani_demuxer_consumes_write_ani_raw_frames_output() {
+        // The AF_ICON-clear encoder's output flows through the framework
+        // demuxer: geometry on the stream (width/height + bit-depth
+        // extradata), one packet per step carrying the raw body bytes.
+        use crate::{write_ani_raw_frames, AniRawWriteOptions, RawFrameBitDepth};
+        let mk = |c: [u8; 4]| -> (u32, u32, Vec<u8>) {
+            let mut v = Vec::new();
+            for _ in 0..16 {
+                v.extend_from_slice(&c);
+            }
+            (4, 4, v)
+        };
+        let opts = AniRawWriteOptions {
+            default_jiffies: 5,
+            bit_depth: RawFrameBitDepth::Bgra32,
+            ..Default::default()
+        };
+        let bytes = write_ani_raw_frames(&[mk([1, 2, 3, 255]), mk([4, 5, 6, 255])], &opts).unwrap();
+
+        let mut dx = open_ani(&bytes);
+        let s = &dx.streams()[0];
+        assert_eq!(s.params.width, Some(4));
+        assert_eq!(s.params.height, Some(4));
+        assert_eq!(s.params.extradata, 32u32.to_le_bytes().to_vec());
+        let p0 = dx.next_packet().unwrap();
+        assert_eq!(p0.duration, Some(5));
+        assert_eq!(p0.data.len(), 4 * 4 * 4); // headerless 32-bpp rows
+        let _p1 = dx.next_packet().unwrap();
+        assert!(matches!(dx.next_packet(), Err(Error::Eof)));
+    }
+
+    #[test]
     fn ani_demuxer_omits_unset_anih_geometry() {
         // AF_ICON set with anih width/height = 0 (the "take from frame"
         // sentinel): the demuxer leaves stream width/height as None

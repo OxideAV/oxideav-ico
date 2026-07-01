@@ -901,6 +901,46 @@ mod tests {
     }
 
     #[test]
+    fn write_ani_raw_frames_output_decodes_through_read_ani() {
+        // Closes the encoder↔decoder loop on the AF_ICON-clear raw path:
+        // write_ani_raw_frames produces a headerless-BMP ANI, and both
+        // read_ani (pixel decode) and read_ani_raw + raw_bmp_descriptor
+        // (geometry) consume its output.
+        use crate::{read_ani_raw, write_ani_raw_frames, AniRawWriteOptions, RawFrameBitDepth};
+        let red = [190, 30, 40, 255];
+        let blue = [40, 30, 190, 255];
+        let mkframe = |c: [u8; 4]| -> (u32, u32, Vec<u8>) {
+            let mut v = Vec::new();
+            for _ in 0..(5 * 3) {
+                v.extend_from_slice(&c);
+            }
+            (5, 3, v) // 5×3 exercises the 4-byte row pad at 32 bpp too
+        };
+        let opts = AniRawWriteOptions {
+            default_jiffies: 8,
+            bit_depth: RawFrameBitDepth::Bgra32,
+            ..Default::default()
+        };
+        let bytes = write_ani_raw_frames(&[mkframe(red), mkframe(blue)], &opts).unwrap();
+
+        // raw_bmp_descriptor round-trips the anih geometry.
+        let raw = read_ani_raw(&bytes).unwrap();
+        assert!(!raw.header.frames_are_icons());
+        let desc = raw.raw_bmp_descriptor().unwrap().unwrap();
+        assert_eq!((desc.width, desc.height, desc.bit_count), (5, 3, 32));
+
+        // read_ani decodes the bodies back to the exact source RGBA.
+        let anim = read_ani(&bytes).unwrap();
+        assert_eq!(anim.frames.len(), 2);
+        let mut expect_red = Vec::new();
+        for _ in 0..15 {
+            expect_red.extend_from_slice(&red);
+        }
+        assert_eq!(anim.frames[0].images[0].pixels, expect_red);
+        assert_eq!(anim.frames[0].images[0].bit_depth, 32);
+    }
+
+    #[test]
     fn animation_total_and_cycle_seconds_from_resolved_steps() {
         let a = ico_frame(8, [1, 2, 3, 255]);
         let b = ico_frame(8, [4, 5, 6, 255]);
