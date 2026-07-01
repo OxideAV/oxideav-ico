@@ -396,6 +396,238 @@ pub fn write_ani(frames: &[AniWriteFrame], opts: &AniWriteOptions) -> Result<Vec
     Ok(write_ani_raw(&ani)?)
 }
 
+/// Target bit-depth for the [`write_ani_raw_frames`] `AF_ICON`-clear
+/// raw-BMP encoder. Only the two direct-colour depths [`read_ani`]
+/// decodes on the raw path are offered: a raw frame carries no colour
+/// table, and the ACON format leaves the indexed (`iBitCount <= 8`)
+/// colour-table layout undefined, so an indexed raw frame could not be
+/// decoded back unambiguously.
+///
+/// [`read_ani`]: crate::read_ani
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RawFrameBitDepth {
+    /// 32-bpp BGRA — full alpha preserved in the colour bits.
+    #[default]
+    Bgra32,
+    /// 24-bpp BGR — alpha is dropped (a raw frame has no AND mask, so
+    /// every pixel decodes opaque).
+    Rgb24,
+}
+
+impl RawFrameBitDepth {
+    fn bits(self) -> u32 {
+        match self {
+            RawFrameBitDepth::Bgra32 => 32,
+            RawFrameBitDepth::Rgb24 => 24,
+        }
+    }
+}
+
+/// Encode-time knobs for [`write_ani_raw_frames`] — the `AF_ICON`-clear
+/// counterpart of [`AniWriteOptions`]. The raw path has one shared
+/// geometry (in `anih`) and no per-frame ICO directory, so the
+/// per-sub-image `WriteOptions` of the icon path don't apply; the only
+/// pixel-level knob is the target [`RawFrameBitDepth`].
+#[derive(Debug, Clone, Default)]
+pub struct AniRawWriteOptions {
+    /// Optional `LIST 'INFO'` title / author, written verbatim (same as
+    /// [`AniWriteOptions::info`]).
+    pub info: AniInfo,
+    /// Optional `seq ` playback order — one zero-based frame index per
+    /// step. `None` plays frames in identity order.
+    pub sequence: Option<Vec<u32>>,
+    /// Optional per-step `rate` durations in jiffies. `None` holds every
+    /// step for `default_jiffies`.
+    pub rates: Option<Vec<u32>>,
+    /// `anih.iDispRate` — default per-step duration in jiffies. Must be
+    /// non-zero.
+    pub default_jiffies: u32,
+    /// Target bit-depth for the raw pixel rows.
+    pub bit_depth: RawFrameBitDepth,
+}
+
+/// Pack a top-down RGBA image into the bottom-up direct-colour pixel
+/// rows a headerless raw-BMP ANI frame stores: `BGRA` at 32-bpp or `BGR`
+/// at 24-bpp, rows emitted bottom-to-top and padded to a 4-byte
+/// boundary (the DIB pixel-array rule). This is the exact byte layout
+/// [`synthesize_headerless_dib`](crate::read_ani) reconstructs a
+/// `BITMAPINFOHEADER` around on decode.
+fn pack_raw_bmp_rows(width: u32, height: u32, rgba: &[u8], bits: u32) -> Result<Vec<u8>> {
+    let w = width as usize;
+    let h = height as usize;
+    let expected_rgba = w
+        .checked_mul(h)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| Error::Unsupported("ANI raw frame: geometry overflow".into()))?;
+    if rgba.len() != expected_rgba {
+        return Err(Error::Unsupported(format!(
+            "ANI raw frame: pixel buffer is {} bytes but {w}x{h} RGBA needs {expected_rgba}",
+            rgba.len()
+        )));
+    }
+    let bytes_per_px = (bits / 8) as usize;
+    let row_bytes = w * bytes_per_px;
+    let stride = (row_bytes + 3) & !3;
+    let mut out = vec![0u8; stride * h];
+    for y in 0..h {
+        // Bottom-up: source row y goes to destination row (h - 1 - y).
+        let dst_row = (h - 1 - y) * stride;
+        let src_row = y * w * 4;
+        for x in 0..w {
+            let s = src_row + x * 4;
+            let d = dst_row + x * bytes_per_px;
+            // RGBA -> BGR(A)
+            out[d] = rgba[s + 2]; // B
+            out[d + 1] = rgba[s + 1]; // G
+            out[d + 2] = rgba[s]; // R
+            if bytes_per_px == 4 {
+                out[d + 3] = rgba[s + 3]; // A
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Encode a set of RGBA frames into an `AF_ICON`-**clear** raw-BMP ANI
+/// (RIFF/`ACON`) byte stream — the headerless-raw-BMP counterpart of
+/// [`write_ani`].
+///
+/// Where [`write_ani`] wraps each frame in a complete ICO/CUR resource
+/// (the common `AF_ICON`-set path), this variant produces the compact
+/// `AF_ICON`-clear form: every frame is a bare bottom-up DIB pixel array
+/// with **no** per-frame header, and the shared geometry
+/// (`iWidth` / `iHeight` / `iBitCount`) lives once in the `anih` header.
+/// The result parses back through [`crate::read_ani`] to an equivalent
+/// animation (one `Cur`-tagged opaque sub-image per frame).
+///
+/// Every frame must share one geometry — the raw path has a single
+/// `anih` descriptor for the whole file, so frames of differing size
+/// cannot be represented. All frames are `(width, height)` RGBA, tightly
+/// packed (`width * height * 4` bytes each).
+///
+/// Only the two direct-colour depths [`crate::read_ani`] can decode on
+/// this path are offered ([`RawFrameBitDepth`]): a raw frame carries no
+/// colour table, and the ACON format leaves the indexed colour-table
+/// layout undefined.
+///
+/// Errors mirror [`write_ani`]'s timeline checks (empty frame list, zero
+/// `default_jiffies` / `rate` entry, out-of-range `sequence` index,
+/// `rates` length mismatch) plus: a frame outside `1..=256` in either
+/// axis (the ICO/CUR sub-image limit the `anih` geometry inherits), a
+/// frame whose dimensions differ from the first, and a pixel buffer that
+/// isn't `width * height * 4` bytes.
+pub fn write_ani_raw_frames(
+    frames: &[(u32, u32, Vec<u8>)],
+    opts: &AniRawWriteOptions,
+) -> Result<Vec<u8>> {
+    if frames.is_empty() {
+        return Err(Error::Unsupported(
+            "ANI: write_ani_raw_frames: must have at least one frame".into(),
+        ));
+    }
+    if opts.default_jiffies == 0 {
+        return Err(Error::Unsupported(
+            "ANI: write_ani_raw_frames: default_jiffies = 0 — a zero-jiffy step has no \
+             defined display behaviour and read_ani would reject it"
+                .into(),
+        ));
+    }
+
+    let (width, height, _) = &frames[0];
+    let (width, height) = (*width, *height);
+    // The anih geometry is a single ICO/CUR-range descriptor for every
+    // frame — reject an out-of-range or heterogeneous batch up front so
+    // the file always round-trips.
+    if !(1..=256).contains(&width) || !(1..=256).contains(&height) {
+        return Err(Error::Unsupported(format!(
+            "ANI: write_ani_raw_frames: frame geometry {width}x{height} outside 1..=256"
+        )));
+    }
+    for (i, (w, h, _)) in frames.iter().enumerate() {
+        if (*w, *h) != (width, height) {
+            return Err(Error::Unsupported(format!(
+                "ANI: write_ani_raw_frames: frame {i} is {w}x{h} but frame 0 is \
+                 {width}x{height} — the raw path shares one anih geometry across all frames"
+            )));
+        }
+    }
+
+    let n_frames = frames.len() as u32;
+    let step_count = match &opts.sequence {
+        Some(seq) => seq.len(),
+        None => frames.len(),
+    };
+    if let Some(seq) = &opts.sequence {
+        for (i, &idx) in seq.iter().enumerate() {
+            if idx >= n_frames {
+                return Err(Error::Unsupported(format!(
+                    "ANI: write_ani_raw_frames: sequence[{i}] = {idx} out of range \
+                     (frames.len() = {n_frames})"
+                )));
+            }
+        }
+    }
+    if let Some(rates) = &opts.rates {
+        if rates.len() != step_count {
+            return Err(Error::Unsupported(format!(
+                "ANI: write_ani_raw_frames: rates len {} != resolved step count {step_count}",
+                rates.len()
+            )));
+        }
+        for (i, &r) in rates.iter().enumerate() {
+            if r == 0 {
+                return Err(Error::Unsupported(format!(
+                    "ANI: write_ani_raw_frames: rates[{i}] = 0 — a zero-jiffy step has no \
+                     defined display behaviour"
+                )));
+            }
+        }
+    }
+
+    let bits = opts.bit_depth.bits();
+    let mut frame_payloads: Vec<Vec<u8>> = Vec::with_capacity(frames.len());
+    for (_, _, rgba) in frames {
+        frame_payloads.push(pack_raw_bmp_rows(width, height, rgba, bits)?);
+    }
+
+    let n_steps = if opts.sequence.is_some() {
+        step_count as u32
+    } else {
+        0
+    };
+    // AF_ICON clear (raw frames); AF_SEQUENCE only when a seq is present.
+    let attrs = if opts.sequence.is_some() {
+        AF_SEQUENCE
+    } else {
+        0
+    };
+
+    let header = AniHeader {
+        cb_size: 36,
+        n_frames,
+        n_steps,
+        // Raw path: the anih geometry is authoritative (no per-frame
+        // header to defer to), so it carries the real width / height /
+        // bit-depth rather than the "take from frame" sentinel.
+        i_width: width,
+        i_height: height,
+        i_bit_count: bits,
+        n_planes: 1,
+        i_disp_rate: opts.default_jiffies,
+        bf_attributes: attrs,
+    };
+
+    let ani = AniFile {
+        header,
+        info: opts.info.clone(),
+        sequence: opts.sequence.clone(),
+        rates: opts.rates.clone(),
+        frames: frame_payloads,
+    };
+
+    Ok(write_ani_raw(&ani)?)
+}
+
 #[cfg(test)]
 mod bmp_depth_tests {
     use super::*;
@@ -836,5 +1068,169 @@ mod ani_write_tests {
         };
         let err = write_ani(&frames, &opts).unwrap_err();
         assert!(err.to_string().contains("zero-jiffy"));
+    }
+
+    // ----- AF_ICON-clear raw-BMP encoder (write_ani_raw_frames) -----
+
+    fn raw_frame(w: u32, h: u32, rgba: [u8; 4]) -> (u32, u32, Vec<u8>) {
+        let mut v = Vec::with_capacity((w * h * 4) as usize);
+        for _ in 0..(w * h) {
+            v.extend_from_slice(&rgba);
+        }
+        (w, h, v)
+    }
+
+    #[test]
+    fn write_ani_raw_frames_32bpp_round_trips_through_read_ani() {
+        // Two solid 4×4 frames encoded on the AF_ICON-clear raw path.
+        // read_ani synthesises a header around the bare BGRA rows and
+        // decodes them back to the exact source RGBA.
+        let red = [200, 10, 20, 255];
+        let green = [10, 200, 20, 255];
+        let frames = [raw_frame(4, 4, red), raw_frame(4, 4, green)];
+        let opts = AniRawWriteOptions {
+            default_jiffies: 7,
+            ..Default::default()
+        };
+        let bytes = write_ani_raw_frames(&frames, &opts).unwrap();
+
+        let anim = read_ani(&bytes).unwrap();
+        assert_eq!(anim.frames.len(), 2);
+        for frame in &anim.frames {
+            // Raw frames decode as a single Cur-tagged opaque sub-image.
+            assert_eq!(frame.icon_type, IconType::Cur);
+            assert_eq!(frame.images.len(), 1);
+            assert_eq!((frame.images[0].width, frame.images[0].height), (4, 4));
+            assert_eq!(frame.images[0].bit_depth, 32);
+            assert!(frame.images[0].hotspot.is_none());
+        }
+        // Alpha is preserved at 32-bpp (source was opaque here).
+        let mut expect_red = Vec::new();
+        for _ in 0..16 {
+            expect_red.extend_from_slice(&red);
+        }
+        assert_eq!(anim.frames[0].images[0].pixels, expect_red);
+        assert_eq!(anim.steps.len(), 2);
+        assert!(anim.steps.iter().all(|s| s.jiffies == 7));
+    }
+
+    #[test]
+    fn write_ani_raw_frames_24bpp_round_trips_opaque() {
+        // 24-bpp raw frames: colour survives, alpha forced opaque (no AND
+        // mask on the raw path). A 3×2 frame exercises the 4-byte row pad
+        // (3 px × 3 bytes = 9 → padded to 12).
+        let blue = [10, 20, 200, 128]; // alpha 128 will read back as 255
+        let frames = [raw_frame(3, 2, blue)];
+        let opts = AniRawWriteOptions {
+            default_jiffies: 9,
+            bit_depth: RawFrameBitDepth::Rgb24,
+            ..Default::default()
+        };
+        let bytes = write_ani_raw_frames(&frames, &opts).unwrap();
+        let anim = read_ani(&bytes).unwrap();
+        assert_eq!(anim.frames.len(), 1);
+        let img = &anim.frames[0].images[0];
+        assert_eq!((img.width, img.height), (3, 2));
+        assert_eq!(img.bit_depth, 24);
+        // Every pixel: source RGB, alpha snapped to opaque.
+        for px in img.pixels.chunks_exact(4) {
+            assert_eq!(&px[0..3], &[10, 20, 200]);
+            assert_eq!(px[3], 255);
+        }
+    }
+
+    #[test]
+    fn write_ani_raw_frames_seq_rate_and_info_round_trip() {
+        // seq / rate override + INFO metadata on the raw path.
+        let frames = [
+            raw_frame(4, 4, [255, 0, 0, 255]),
+            raw_frame(4, 4, [0, 255, 0, 255]),
+        ];
+        let opts = AniRawWriteOptions {
+            info: AniInfo {
+                title: Some(b"Raw Spinner\0".to_vec()),
+                author: Some(b"OxideAV\0".to_vec()),
+            },
+            sequence: Some(vec![0, 1, 0]),
+            rates: Some(vec![4, 5, 6]),
+            default_jiffies: 10,
+            bit_depth: RawFrameBitDepth::Bgra32,
+        };
+        let bytes = write_ani_raw_frames(&frames, &opts).unwrap();
+        let anim = read_ani(&bytes).unwrap();
+        assert_eq!(anim.info.title_str().as_deref(), Some("Raw Spinner"));
+        assert_eq!(anim.info.author_str().as_deref(), Some("OxideAV"));
+        assert_eq!(anim.steps.len(), 3);
+        let idx: Vec<u32> = anim.steps.iter().map(|s| s.frame_index).collect();
+        assert_eq!(idx, vec![0, 1, 0]);
+        let jif: Vec<u32> = anim.steps.iter().map(|s| s.jiffies).collect();
+        assert_eq!(jif, vec![4, 5, 6]);
+    }
+
+    #[test]
+    fn write_ani_raw_frames_rejects_empty() {
+        let err = write_ani_raw_frames(&[], &AniRawWriteOptions::default()).unwrap_err();
+        assert!(err.to_string().contains("at least one frame"));
+    }
+
+    #[test]
+    fn write_ani_raw_frames_rejects_zero_default_jiffies() {
+        let frames = [raw_frame(4, 4, [1, 1, 1, 255])];
+        let opts = AniRawWriteOptions {
+            default_jiffies: 0,
+            ..Default::default()
+        };
+        let err = write_ani_raw_frames(&frames, &opts).unwrap_err();
+        assert!(err.to_string().contains("default_jiffies = 0"));
+    }
+
+    #[test]
+    fn write_ani_raw_frames_rejects_heterogeneous_geometry() {
+        // The raw path has a single anih geometry — a frame of a
+        // different size can't be represented.
+        let frames = [
+            raw_frame(4, 4, [1, 1, 1, 255]),
+            raw_frame(8, 8, [2, 2, 2, 255]),
+        ];
+        let opts = AniRawWriteOptions {
+            default_jiffies: 5,
+            ..Default::default()
+        };
+        let err = write_ani_raw_frames(&frames, &opts).unwrap_err();
+        assert!(err.to_string().contains("shares one anih geometry"));
+    }
+
+    #[test]
+    fn write_ani_raw_frames_rejects_out_of_range_geometry() {
+        let frames = [(0u32, 4u32, vec![0u8; 0])];
+        let opts = AniRawWriteOptions {
+            default_jiffies: 5,
+            ..Default::default()
+        };
+        let err = write_ani_raw_frames(&frames, &opts).unwrap_err();
+        assert!(err.to_string().contains("outside 1..=256"));
+    }
+
+    #[test]
+    fn write_ani_raw_frames_rejects_bad_pixel_len() {
+        let frames = [(4u32, 4u32, vec![0u8; 10])]; // needs 4*4*4 = 64
+        let opts = AniRawWriteOptions {
+            default_jiffies: 5,
+            ..Default::default()
+        };
+        let err = write_ani_raw_frames(&frames, &opts).unwrap_err();
+        assert!(err.to_string().contains("pixel buffer"));
+    }
+
+    #[test]
+    fn write_ani_raw_frames_rejects_seq_out_of_range() {
+        let frames = [raw_frame(4, 4, [1, 1, 1, 255])];
+        let opts = AniRawWriteOptions {
+            sequence: Some(vec![0, 1]),
+            default_jiffies: 5,
+            ..Default::default()
+        };
+        let err = write_ani_raw_frames(&frames, &opts).unwrap_err();
+        assert!(err.to_string().contains("out of range"));
     }
 }
