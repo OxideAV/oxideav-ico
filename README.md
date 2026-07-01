@@ -601,8 +601,10 @@ to its `icon` chunk via `write_ico`, and `AniWriteOptions` carries the
 animation-level metadata (`LIST 'INFO'` title / author), the optional
 `seq ` playback order, the optional per-step `rate` table, the default
 per-step duration (`anih.iDispRate`), and the per-sub-image PNG / BMP
-`WriteOptions`. Only the common `AF_ICON`-set path is produced (each frame
-is a full ICO/CUR resource). It rejects up front anything `read_ani` would
+`WriteOptions`. `write_ani` produces the common `AF_ICON`-set path (each
+frame is a full ICO/CUR resource); the compact `AF_ICON`-clear raw-BMP
+path has its own encoder, `write_ani_raw_frames` (below). It rejects up
+front anything `read_ani` would
 later refuse: an empty frame list, a zero `default_jiffies` or zero `rate`
 entry (a zero-jiffy step has no defined display behaviour), a `seq ` index
 `>= frames.len()`, and a `rate` length that doesn't match the resolved step
@@ -634,6 +636,53 @@ let bytes = write_ani(&frames, &opts)?;
 let anim = read_ani(&bytes)?;            // decodes back to an equivalent animation
 assert_eq!(anim.steps.len(), 4);
 ```
+
+### Encoding `AF_ICON`-clear raw-BMP frames (`write_ani_raw_frames`)
+
+`write_ani_raw_frames` is the encode-side counterpart of `read_ani`'s
+`AF_ICON`-clear decode: it takes RGBA frames plus a timeline and emits the
+compact raw form where every frame is a bare bottom-up DIB pixel array
+(**no** per-frame header) and the shared geometry lives once in `anih`
+(`iWidth` / `iHeight` / `iBitCount`, `AF_ICON` cleared). The result parses
+back through `read_ani` to an equivalent animation (one `Cur`-tagged opaque
+sub-image per frame).
+
+```rust
+use oxideav_ico::{
+    read_ani, write_ani_raw_frames, AniRawWriteOptions, RawFrameBitDepth,
+};
+
+// Every frame shares one geometry — the raw path has a single anih
+// descriptor for the whole file. Each is (width, height, RGBA bytes).
+let frames = vec![
+    (32, 32, rgba_a),
+    (32, 32, rgba_b),
+];
+let opts = AniRawWriteOptions {
+    default_jiffies: 6,
+    bit_depth: RawFrameBitDepth::Bgra32,   // or Rgb24
+    ..Default::default()
+};
+let bytes = write_ani_raw_frames(&frames, &opts)?;
+let anim = read_ani(&bytes)?;
+assert_eq!(anim.frames.len(), 2);
+```
+
+Only the two direct-colour depths `read_ani` can decode on the raw path
+are offered (`RawFrameBitDepth::{Bgra32, Rgb24}`): a raw frame carries no
+colour table, and the ACON format leaves the indexed (`iBitCount <= 8`)
+colour-table layout undefined, so an indexed raw frame could not be
+decoded back unambiguously. `Rgb24` drops alpha (a raw frame has no AND
+mask, so every pixel decodes opaque). The encoder mirrors `write_ani`'s
+timeline validation (empty frame list, zero `default_jiffies` / `rate`
+entry, out-of-range `seq ` index, `rate`-length mismatch) plus a per-file
+single-geometry check (all frames must share one size — the raw path can't
+describe differing dimensions) and the `1..=256` axis range the `anih`
+geometry inherits from the ICO/CUR sub-image limit. The framework `"ani"`
+demuxer consumes the output too, surfacing the raw-path bit-depth as a
+4-byte little-endian `extradata` block alongside the stream's width /
+height (the `AF_ICON`-set path leaves `extradata` empty — the per-frame
+directory is authoritative there).
 
 ### Raw-image (`AF_ICON`-clear) frames
 
