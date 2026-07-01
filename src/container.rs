@@ -358,6 +358,19 @@ fn open_ani_demuxer(
     if ani.header.i_height != 0 {
         params.height = Some(ani.header.i_height);
     }
+    // `iBitCount` is the third piece of the `AF_ICON`-clear raw-BMP
+    // descriptor: the frame bodies are headerless DIB pixel rows, so a
+    // consumer needs the bit-depth (alongside width / height) to decode
+    // them. Surface it as a 4-byte little-endian `extradata` value when
+    // the header filled it in (the raw path otherwise carries no
+    // extradata, so a present 4-byte block unambiguously means "raw-BMP
+    // `iBitCount`"). On the `AF_ICON`-set path it stays the "take from
+    // frame" sentinel (`0`) — the per-frame ICO/CUR directory is
+    // authoritative there, exactly as with width / height above — so
+    // leave `extradata` empty.
+    if ani.header.i_bit_count != 0 {
+        params.extradata = ani.header.i_bit_count.to_le_bytes().to_vec();
+    }
     params.pixel_format = Some(PixelFormat::Rgba);
     // The 1/60-s jiffy is the animation's native cadence; expose it as
     // the stream's nominal frame rate (steps are not uniform, so this is
@@ -992,9 +1005,13 @@ mod tests {
 
         let mut dx = open_ani(&ani);
         let s = &dx.streams()[0];
-        // anih geometry is authoritative for the raw path → surfaced.
+        // anih geometry is authoritative for the raw path → surfaced,
+        // including the bit-depth a consumer needs to decode the
+        // headerless bodies.
         assert_eq!(s.params.width, Some(4));
         assert_eq!(s.params.height, Some(4));
+        // Bit-depth surfaced as a 4-byte LE extradata block.
+        assert_eq!(s.params.extradata, 32u32.to_le_bytes().to_vec());
 
         let p0 = dx.next_packet().unwrap();
         assert_eq!(p0.data, f0, "raw frame 0 bytes pass through verbatim");
@@ -1015,6 +1032,10 @@ mod tests {
         let s = &dx.streams()[0];
         assert_eq!(s.params.width, None);
         assert_eq!(s.params.height, None);
+        // iBitCount is the "take from frame" sentinel on the AF_ICON
+        // path too — the per-frame directory is authoritative, so the
+        // stream doesn't fabricate a bit-depth (no extradata block).
+        assert!(s.params.extradata.is_empty());
     }
 
     #[test]
