@@ -1233,4 +1233,33 @@ mod ani_write_tests {
         let err = write_ani_raw_frames(&frames, &opts).unwrap_err();
         assert!(err.to_string().contains("out of range"));
     }
+
+    #[test]
+    fn write_ani_raw_frames_output_is_byte_stable_through_raw_reparse() {
+        // The emitted chunk layout is canonical: re-serialising the
+        // parsed AniFile (via write_ani_raw) reproduces the exact bytes,
+        // so the raw encoder and the raw round-trip agree on the wire form.
+        use crate::{read_ani_raw, write_ani_raw};
+        let opts = AniRawWriteOptions {
+            info: AniInfo {
+                title: Some(b"Raw\0".to_vec()),
+                author: None,
+            },
+            sequence: Some(vec![0, 1, 0]),
+            rates: Some(vec![3, 4, 5]),
+            default_jiffies: 4,
+            bit_depth: RawFrameBitDepth::Bgra32,
+        };
+        let bytes = write_ani_raw_frames(
+            &[
+                raw_frame(4, 4, [10, 20, 30, 255]),
+                raw_frame(4, 4, [40, 50, 60, 255]),
+            ],
+            &opts,
+        )
+        .unwrap();
+        let parsed = read_ani_raw(&bytes).unwrap();
+        let reser = write_ani_raw(&parsed).unwrap();
+        assert_eq!(bytes, reser, "raw ANI wire form must be byte-stable");
+    }
 }
