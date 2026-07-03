@@ -1,5 +1,7 @@
 # oxideav-ico
 
+[![CI](https://github.com/OxideAV/oxideav-ico/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-ico/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-ico.svg)](https://crates.io/crates/oxideav-ico) [![docs.rs](https://docs.rs/oxideav-ico/badge.svg)](https://docs.rs/oxideav-ico) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust **ICO** + **CUR** (Windows icon / cursor) reader and writer
 for the [`oxideav`](https://github.com/OxideAV/oxideav) framework.
 Handles multi-resolution icons with mixed BMP + PNG sub-images exactly
