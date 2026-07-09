@@ -828,6 +828,61 @@ mod tests {
         v
     }
 
+    /// A bottom-up 16-bpp (XRGB1555, BI_RGB default) DIB pixel array for
+    /// a `w`×`h` raw ANI frame, every pixel the same little-endian u16.
+    /// Rows are padded to a 4-byte boundary (`w` px × 2 bytes, rounded
+    /// up to a multiple of 4), matching the DIB packing rule the reader's
+    /// synthesised header implies.
+    fn raw_rgb555(w: u32, h: u32, px: u16) -> Vec<u8> {
+        let row_bytes = (w as usize) * 2;
+        let stride = (row_bytes + 3) & !3;
+        let mut v = vec![0u8; stride * h as usize];
+        for row in 0..h as usize {
+            for col in 0..w as usize {
+                let o = row * stride + col * 2;
+                v[o..o + 2].copy_from_slice(&px.to_le_bytes());
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn read_ani_decodes_af_icon_clear_raw_bmp_16bpp() {
+        // The README claims read_ani decodes the AF_ICON-clear raw path
+        // at {16, 24, 32} bpp; 16-bpp (XRGB1555) is the one depth no
+        // encoder test reached (write_ani_raw_frames only offers 32/24).
+        // A 3×2 frame exercises the 4-byte row pad (3 px × 2 = 6 → 8).
+        // Pick the two channel-saturation endpoints so the assertion is
+        // independent of the 5→8-bit expansion rounding: 0x7FFF is all
+        // three 5-bit channels max (white), 0x0000 is black.
+        let white = raw_rgb555(3, 2, 0x7FFF);
+        let black = raw_rgb555(3, 2, 0x0000);
+        let ani = build_raw_ani(&[white, black], 3, 2, 16, 7);
+
+        let anim = read_ani(&ani).unwrap();
+        assert_eq!(anim.frames.len(), 2);
+        for frame in &anim.frames {
+            assert_eq!(frame.icon_type, IconType::Cur);
+            assert_eq!(frame.images.len(), 1);
+            let img = &frame.images[0];
+            assert_eq!((img.width, img.height), (3, 2));
+            assert_eq!(img.sub_format, IconSubFormat::Bmp);
+            assert_eq!(img.bit_depth, 16);
+            assert!(img.hotspot.is_none());
+            assert_eq!(img.pixels.len(), 3 * 2 * 4);
+        }
+        // Every white pixel decodes to opaque white, every black to
+        // opaque black (raw frames carry no AND mask → all opaque).
+        for px in anim.frames[0].images[0].pixels.chunks_exact(4) {
+            assert_eq!(px, &[255, 255, 255, 255]);
+        }
+        for px in anim.frames[1].images[0].pixels.chunks_exact(4) {
+            assert_eq!(px, &[0, 0, 0, 255]);
+        }
+        assert_eq!(anim.steps.len(), 2);
+        assert!(anim.steps.iter().all(|s| s.jiffies == 7));
+    }
+
     #[test]
     fn read_ani_decodes_af_icon_clear_raw_bmp_32bpp() {
         // Two raw 4×4 32-bpp frames: BGRA in storage → RGBA on decode.
