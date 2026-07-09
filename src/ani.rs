@@ -766,6 +766,16 @@ pub fn read_ani_raw(input: &[u8]) -> Result<AniFile> {
                 header = Some(parse_anih(payload)?);
             }
             b"seq " => {
+                // A second `seq ` chunk is malformed and ambiguous: a
+                // probe that read the first would drive a different
+                // playback order than a renderer that read the last.
+                // Reject rather than silently last-wins — the same
+                // duplicate-chunk strictness `anih` and `LIST 'fram'`
+                // already get (both rejected above / below). A conforming
+                // ACON file carries at most one `seq ` chunk.
+                if sequence.is_some() {
+                    return Err(Error::invalid("ANI: duplicate seq chunk"));
+                }
                 let count = expected_step_count(&header)?;
                 let indices = parse_u32_array(payload, count, "seq")?;
                 // Bounds-check each step index against `nFrames` — a
@@ -788,6 +798,13 @@ pub fn read_ani_raw(input: &[u8]) -> Result<AniFile> {
                 sequence = Some(indices);
             }
             b"rate" => {
+                // Same duplicate-chunk strictness as `seq ` / `anih` /
+                // `LIST 'fram'`: two `rate` chunks give a probe and a
+                // renderer different per-step durations. A conforming
+                // ACON file carries at most one.
+                if rates.is_some() {
+                    return Err(Error::invalid("ANI: duplicate rate chunk"));
+                }
                 let count = expected_step_count(&header)?;
                 rates = Some(parse_u32_array(payload, count, "rate")?);
             }
@@ -2380,6 +2397,107 @@ mod tests {
         let bytes = build_ani_with_seq(2, 4, &[0, 1, 1, 0]);
         let parsed = read_ani_raw(&bytes).unwrap();
         assert_eq!(parsed.sequence.as_ref().unwrap(), &vec![0u32, 1, 1, 0]);
+    }
+
+    /// Assemble an ANI whose body carries `anih`, then the caller's
+    /// extra chunks (already tag+len+payload encoded), then the
+    /// `LIST 'fram'`. Lets the duplicate-chunk tests inject two `seq `
+    /// or two `rate` chunks into an otherwise well-formed file.
+    fn build_ani_with_extra_chunks(n_frames: u32, n_steps: u32, extra: &[u8]) -> Vec<u8> {
+        let mut anih_payload = vec![0u8; 36];
+        anih_payload[0..4].copy_from_slice(&36u32.to_le_bytes());
+        anih_payload[4..8].copy_from_slice(&n_frames.to_le_bytes());
+        anih_payload[8..12].copy_from_slice(&n_steps.to_le_bytes());
+        anih_payload[24..28].copy_from_slice(&1u32.to_le_bytes()); // nPlanes
+        anih_payload[28..32].copy_from_slice(&10u32.to_le_bytes()); // iDispRate
+        anih_payload[32..36].copy_from_slice(&(AF_ICON | AF_SEQUENCE).to_le_bytes());
+        let mut body = Vec::new();
+        body.extend_from_slice(b"ACON");
+        push_chunk(&mut body, b"anih", &anih_payload);
+        body.extend_from_slice(extra);
+        let mut fram_body = Vec::new();
+        fram_body.extend_from_slice(b"fram");
+        for i in 0..n_frames {
+            push_chunk(&mut fram_body, b"icon", &[b'F', b'R', b'M', i as u8]);
+        }
+        push_chunk(&mut body, b"LIST", &fram_body);
+        let mut out = Vec::new();
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(&body);
+        out
+    }
+
+    #[test]
+    fn rejects_duplicate_seq_chunk() {
+        // Two `seq ` chunks are ambiguous: a probe reading the first
+        // and a renderer reading the last would drive different
+        // playback orders. Reject rather than silently last-wins,
+        // mirroring the duplicate-`anih` / duplicate-`fram` strictness.
+        let mut extra = Vec::new();
+        let seq_a: Vec<u8> = [0u32, 1, 1, 0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let seq_b: Vec<u8> = [1u32, 0, 0, 1]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        push_chunk(&mut extra, b"seq ", &seq_a);
+        push_chunk(&mut extra, b"seq ", &seq_b);
+        let bytes = build_ani_with_extra_chunks(2, 4, &extra);
+        let err = read_ani_raw(&bytes).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => assert!(msg.contains("duplicate seq"), "{msg}"),
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_rate_chunk() {
+        // Same ambiguity for two `rate` chunks — a probe and a renderer
+        // would resolve different per-step durations.
+        let mut extra = Vec::new();
+        let rate_a: Vec<u8> = [5u32, 6, 7, 8]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let rate_b: Vec<u8> = [1u32, 1, 1, 1]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        // AF_SEQUENCE is set by the helper but we emit no `seq ` here;
+        // the read side is lenient about a flag-without-chunk, so the
+        // duplicate-`rate` rejection is what this test isolates.
+        push_chunk(&mut extra, b"rate", &rate_a);
+        push_chunk(&mut extra, b"rate", &rate_b);
+        let bytes = build_ani_with_extra_chunks(4, 4, &extra);
+        let err = read_ani_raw(&bytes).unwrap_err();
+        match err {
+            Error::InvalidData(msg) => assert!(msg.contains("duplicate rate"), "{msg}"),
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_single_seq_and_single_rate_chunk() {
+        // Positive control: exactly one `seq ` and one `rate` chunk in
+        // the same file is the normal case and must still parse.
+        let mut extra = Vec::new();
+        let seq: Vec<u8> = [0u32, 1, 1, 0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let rate: Vec<u8> = [5u32, 6, 7, 8]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        push_chunk(&mut extra, b"seq ", &seq);
+        push_chunk(&mut extra, b"rate", &rate);
+        let bytes = build_ani_with_extra_chunks(2, 4, &extra);
+        let parsed = read_ani_raw(&bytes).unwrap();
+        assert_eq!(parsed.sequence.as_ref().unwrap(), &vec![0u32, 1, 1, 0]);
+        assert_eq!(parsed.rates.as_ref().unwrap(), &vec![5u32, 6, 7, 8]);
     }
 
     // ------------------------------------------------------------------
