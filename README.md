@@ -738,7 +738,11 @@ truncated declared RIFF size, missing or out-of-order `anih`,
 oversized `nFrames` (capped at 65_536 to bound allocator pressure),
 stray non-`icon` chunks inside `LIST 'fram'`, child chunks that
 declare a length running past their parent, `seq ` / `rate`
-appearing before `anih`, **`seq ` step indices `>= nFrames`** —
+appearing before `anih`, **duplicate `seq ` / `rate` chunks** (a
+second occurrence is ambiguous — a probe reading the first and a
+renderer reading the last would resolve different playback orders /
+durations; rejected up front, mirroring the duplicate-`anih` /
+duplicate-`LIST 'fram'` strictness), **`seq ` step indices `>= nFrames`** —
 a renderer reaches `frames[seq[i]]` directly, so an out-of-range
 entry (the classic `seq[k] = 0xFFFFFFFF` adversarial value) would
 panic / out-of-bounds-read downstream — and **`anih.nPlanes` outside
@@ -781,7 +785,7 @@ the authoritative bound). `write_ani_raw` mirrors the reject.
 
 ## Fuzzing
 
-The `fuzz/` crate ships two complementary cargo-fuzz targets:
+The `fuzz/` crate ships three complementary cargo-fuzz targets:
 
 - `ico_self_roundtrip` — RGBA → `make_encoder` → packet → `make_decoder`
   → RGBA pixel-equality. Catches encoder bugs that emit corrupt
@@ -793,5 +797,16 @@ The `fuzz/` crate ships two complementary cargo-fuzz targets:
   historically take CVE hits — adversarial input goes after the
   offset arithmetic, the payload-overlap detector, the RIFF/ACON
   detection, and the `planes` / `bit_count` range checks.
+- `ani_raw_parser` — arbitrary fuzz bytes → standalone `read_ani_raw`
+  RIFF/`ACON` walker plus every playback accessor (`playback_steps`,
+  `total_jiffies`, `cycle_seconds`, `step_at_jiffy`, `step_at_second`,
+  `raw_bmp_descriptor`). On accepted inputs it asserts the parser's
+  structural guarantees (frame count matches `nFrames`, header ranges
+  in-spec, `seq ` indices in range, optional-array lengths matched) and
+  round-trips through `write_ani_raw` to assert value-stability. This
+  drives the second CVE-prone surface: the declared RIFF size, the
+  per-chunk lengths, the `nFrames` / `nSteps` counts, and the `seq `
+  step indices all feed offset arithmetic and allocation sizing.
 
-Run with `cargo fuzz run ico_raw_parser` (or `ico_self_roundtrip`).
+Run with `cargo fuzz run ico_raw_parser` (or `ico_self_roundtrip` /
+`ani_raw_parser`).

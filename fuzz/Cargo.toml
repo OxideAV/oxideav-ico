@@ -20,6 +20,13 @@ cargo-fuzz = true
 #   panics / overflows / OOB in the directory walker, the RIFF/ACON
 #   detection, the payload-overlap detector, and the planes / bit_count
 #   validators.
+# * `ani_raw_parser` — arbitrary bytes → standalone `read_ani_raw`
+#   RIFF/ACON parser, every playback accessor (playback_steps /
+#   total_jiffies / step_at_jiffy / step_at_second / raw_bmp_descriptor),
+#   then a `write_ani_raw` value-stability round-trip on accepted inputs.
+#   Catches panics / overflows / OOB in the RIFF chunk walker, the anih
+#   header validator, the seq / rate array parsers, the frame extractor,
+#   and the timeline resolution arithmetic.
 
 [dependencies]
 libfuzzer-sys = "0.4"
@@ -54,5 +61,17 @@ doc = false
 [[bin]]
 name = "ico_raw_parser"
 path = "fuzz_targets/ico_raw_parser.rs"
+test = false
+doc = false
+
+# Standalone ANI (RIFF/ACON animated-cursor) parser harness. Drives
+# `read_ani_raw` + every playback accessor on arbitrary fuzz bytes, then
+# round-trips accepted values through `write_ani_raw`. Covers the RIFF
+# chunk walker, the anih validator, the seq / rate parsers, the frame
+# extractor, and the timeline arithmetic. Independent from the two ICO
+# targets (ANI is a different container `read_ico_raw` refuses).
+[[bin]]
+name = "ani_raw_parser"
+path = "fuzz_targets/ani_raw_parser.rs"
 test = false
 doc = false
