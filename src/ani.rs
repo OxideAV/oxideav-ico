@@ -2143,7 +2143,7 @@ mod tests {
         anih_chunk.extend_from_slice(&anih_payload);
 
         // Odd-length (5 bytes) icon payload + pad inside LIST 'fram'.
-        let frame_payload = [b'P', b'A', b'D', b'D', b'Y'];
+        let frame_payload = *b"PADDY";
         let mut fram_body = Vec::new();
         fram_body.extend_from_slice(b"fram");
         fram_body.extend_from_slice(b"icon");
