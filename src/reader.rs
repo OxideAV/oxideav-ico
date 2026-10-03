@@ -1,76 +1,40 @@
-//! ICO / CUR file parser (registry-side, oxideav-core-using path).
+//! Decoded-ANI reader ([`read_ani`] → [`AniAnimation`]) and the
+//! deprecated pre-contract [`read_ico`] wrapper.
 //!
-//! Walks the 6-byte `ICONDIR` header, then each 16-byte `ICONDIRENTRY`,
-//! and decodes the pointed-at payload (either PNG or BMP-DIB) into an
-//! RGBA [`IconImage`]. The lower-level container layout walk lives in
-//! [`crate::raw::read_ico_raw`] which returns raw payload bytes;
-//! this layer adds the PNG / BMP-DIB decode on top.
-
-use oxideav_core::{Error, Result};
+//! The ICO / CUR decode itself lives in the crate root
+//! ([`crate::decode`] / [`crate::decode_all`] / [`crate::decode_entry`]);
+//! this module builds the animated-cursor model on top of it. Everything
+//! here is framework-free.
 
 use crate::ani::{read_ani_raw, AniInfo, AniStep};
-use crate::raw::{read_ico_raw, IconEntryRaw};
+use crate::error::{IcoError as Error, Result};
+use crate::image::IcoImage;
+use crate::options::DecodeOptions;
+use crate::raw::read_ico_raw;
 use crate::types::*;
 
-/// Parse an ICO / CUR byte stream. Returns the container type and one
-/// [`IconImage`] per directory entry, in directory order.
+/// The pre-contract decode entry point: every sub-image as a legacy
+/// [`IconImage`], with the directory type.
+#[deprecated(note = "use oxideav_ico::decode_all / oxideav_ico::info (IMAGE_CRATE_API)")]
+#[allow(deprecated)]
 pub fn read_ico(input: &[u8]) -> Result<(IconType, Vec<IconImage>)> {
-    let (icon_type, entries) = read_ico_raw(input)?;
-    let mut images = Vec::with_capacity(entries.len());
-    for entry in entries {
-        images.push(decode_entry(entry)?);
-    }
-    Ok((icon_type, images))
+    let (icon_type, _) = read_ico_raw(input)?;
+    let frames = crate::decode_all(input)?;
+    Ok((
+        icon_type,
+        frames
+            .into_iter()
+            .map(|f| IconImage::from(f.image))
+            .collect(),
+    ))
 }
 
-fn decode_entry(entry: IconEntryRaw) -> Result<IconImage> {
-    match entry.sub_format {
-        IconSubFormat::Png => {
-            let frame = oxideav_png::decode_png_to_frame(&entry.data, None)?;
-            let rgba = frame_to_rgba_bytes(&frame, entry.width, entry.height)?;
-            Ok(IconImage {
-                width: entry.width,
-                height: entry.height,
-                pixels: rgba,
-                bit_depth: entry.bit_depth,
-                sub_format: IconSubFormat::Png,
-                hotspot: entry.hotspot,
-            })
-        }
-        IconSubFormat::Bmp => {
-            // BMP-inside-ICO: headerless DIB with doubled height + AND
-            // mask. `decode_dib_videoframe` is the registry-gated
-            // VideoFrame-shaped wrapper around `oxideav_bmp::decode_dib`
-            // (which now returns the standalone `BmpImage` shape).
-            let frame = oxideav_bmp::decode_dib_videoframe(&entry.data, /* doubled */ true)?;
-            let rgba = frame_to_rgba_bytes(&frame, entry.width, entry.height)?;
-            Ok(IconImage {
-                width: entry.width,
-                height: entry.height,
-                pixels: rgba,
-                bit_depth: entry.bit_depth,
-                sub_format: IconSubFormat::Bmp,
-                hotspot: entry.hotspot,
-            })
-        }
-    }
-}
-
-/// Copy a `VideoFrame` (produced by either oxideav-png or oxideav-bmp,
-/// always in `Rgba`) into a tightly-packed top-down RGBA byte Vec.
-fn frame_to_rgba_bytes(frame: &oxideav_core::VideoFrame, w: u32, h: u32) -> Result<Vec<u8>> {
-    let w = w as usize;
-    let h = h as usize;
-    if frame.planes.is_empty() {
-        return Err(Error::invalid("ICO: sub-image frame has no planes"));
-    }
-    let src_stride = frame.planes[0].stride;
-    let mut out = Vec::with_capacity(w * h * 4);
-    for y in 0..h {
-        let src = &frame.planes[0].data[y * src_stride..y * src_stride + w * 4];
-        out.extend_from_slice(src);
-    }
-    Ok(out)
+/// Decode one complete ICO / CUR resource (an ANI frame) into its
+/// directory type and sub-images.
+fn decode_resource(input: &[u8], opts: &DecodeOptions) -> Result<(IconType, Vec<IcoImage>)> {
+    let (icon_type, _) = read_ico_raw(input)?;
+    let frames = crate::decode_all_with(input, opts)?;
+    Ok((icon_type, frames.into_iter().map(|f| f.image).collect()))
 }
 
 /// One stored frame of a decoded ANI animation.
@@ -87,7 +51,7 @@ pub struct AniFrame {
     pub icon_type: IconType,
     /// The frame's decoded sub-images, in directory order. Always at
     /// least one (the parser rejects an empty directory).
-    pub images: Vec<IconImage>,
+    pub images: Vec<IcoImage>,
 }
 
 impl AniFrame {
@@ -99,7 +63,7 @@ impl AniFrame {
     /// carries at least one sub-image (the parser rejects an empty
     /// directory) — but returns `Option` so a hand-built `AniFrame` with
     /// an empty `images` doesn't panic.
-    pub fn primary_image(&self) -> Option<&IconImage> {
+    pub fn primary_image(&self) -> Option<&IcoImage> {
         select_largest(&self.images).map(|i| &self.images[i])
     }
 
@@ -122,9 +86,9 @@ impl AniFrame {
 /// A fully decoded ANI animated cursor: every stored frame decoded to
 /// RGBA, plus the resolved playback timeline.
 ///
-/// This is the ANI-side counterpart of [`read_ico`]'s
-/// `(IconType, Vec<IconImage>)`: where `read_ico` decodes one icon
-/// resource's sub-images, [`read_ani`] decodes a whole animation —
+/// This is the ANI-side counterpart of [`crate::decode_all`]: where
+/// `decode_all` decodes one icon resource's sub-images, [`read_ani`]
+/// decodes a whole animation —
 /// every frame's sub-images *and* the `seq ` / `rate` timeline merged
 /// into a flat step table a renderer can drive directly.
 #[derive(Debug, Clone)]
@@ -325,7 +289,7 @@ impl AniAnimation {
 /// Two frame layouts are decoded, selected by the `anih` `AF_ICON` flag:
 ///
 /// * **`AF_ICON` set** (the common case): each frame is a complete
-///   ICO/CUR resource carrying its own headers, decoded via [`read_ico`].
+///   ICO/CUR resource carrying its own headers, decoded via [`crate::decode_all`].
 ///   A frame may carry several sub-images at different resolutions.
 ///
 /// * **`AF_ICON` clear**: each frame is a single headerless BMP whose
@@ -353,10 +317,11 @@ pub fn read_ani(input: &[u8]) -> Result<AniAnimation> {
         .playback_steps()
         .map_err(|e| Error::invalid(e.to_string()))?;
 
+    let opts = DecodeOptions::default();
     let frames = if ani.header.frames_are_icons() {
         let mut frames = Vec::with_capacity(ani.frames.len());
         for (i, frame_bytes) in ani.frames.iter().enumerate() {
-            let (icon_type, images) = read_ico(frame_bytes)
+            let (icon_type, images) = decode_resource(frame_bytes, &opts)
                 .map_err(|e| Error::invalid(format!("ANI: frame {i}: {e}")))?;
             frames.push(AniFrame { icon_type, images });
         }
@@ -374,7 +339,7 @@ pub fn read_ani(input: &[u8]) -> Result<AniAnimation> {
 
 /// Decode the `AF_ICON`-clear path: every `LIST 'fram'` frame is a
 /// single headerless BMP whose geometry comes from `anih`. Each decoded
-/// frame becomes an [`AniFrame`] carrying exactly one [`IconImage`],
+/// frame becomes an [`AniFrame`] carrying exactly one [`IcoImage`],
 /// tagged `Cur` (an ANI is always a cursor resource).
 fn decode_raw_bmp_frames(ani: &crate::AniFile) -> Result<Vec<AniFrame>> {
     // `raw_bmp_descriptor` validates the geometry is fully specified
@@ -405,17 +370,20 @@ fn decode_raw_bmp_frames(ani: &crate::AniFile) -> Result<Vec<AniFrame>> {
         let dib = synthesize_headerless_dib(&desc, pixels)?;
         // doubled = false: a raw ANI frame is a single image with no
         // doubled-height AND-mask region (that is an ICO/CUR-only layout).
-        let frame = oxideav_bmp::decode_dib_videoframe(&dib, /* doubled */ false)
+        let bmp = oxideav_bmp::decode_dib(&dib, /* doubled */ false)
             .map_err(|e| Error::invalid(format!("ANI: raw frame {i}: {e}")))?;
-        let rgba = frame_to_rgba_bytes(&frame, desc.width, desc.height)?;
-        let image = IconImage {
-            width: desc.width,
-            height: desc.height,
-            pixels: rgba,
-            bit_depth: desc.bit_count as u8,
-            sub_format: IconSubFormat::Bmp,
-            hotspot: None,
-        };
+        if (bmp.width(), bmp.height()) != (desc.width, desc.height) {
+            return Err(Error::invalid(format!(
+                "ANI: raw frame {i}: decoded {}×{} but anih says {}×{}",
+                bmp.width(),
+                bmp.height(),
+                desc.width,
+                desc.height
+            )));
+        }
+        let image = IcoImage::from_rgba8(desc.width, desc.height, bmp.to_rgba8())?
+            .with_bit_depth(desc.bit_count as u8)
+            .with_sub_format(IconSubFormat::Bmp);
         frames.push(AniFrame {
             icon_type: IconType::Cur,
             images: vec![image],
@@ -478,7 +446,14 @@ fn synthesize_headerless_dib(desc: &crate::RawBmpDescriptor, pixels: &[u8]) -> R
 mod tests {
     use super::*;
     use crate::ani::{AF_ICON, AF_SEQUENCE};
-    use crate::write_ico;
+    use crate::{decode_all, encode_images, EncodeOptions};
+
+    /// All-DIB encode options (no PNG routing) for `icon_type`.
+    fn dib_opts(icon_type: IconType) -> EncodeOptions {
+        EncodeOptions::new()
+            .with_icon_type(icon_type)
+            .with_png_size_threshold(None)
+    }
 
     /// Solid-colour RGBA buffer for an `n`×`n` sub-image.
     fn solid_rgba(n: u32, rgba: [u8; 4]) -> Vec<u8> {
@@ -489,21 +464,17 @@ mod tests {
         v
     }
 
-    /// A complete single-sub-image ICO byte stream, forced all-BMP so
-    /// `read_ico` decodes it without PNG involvement.
+    /// A complete single-sub-image ICO byte stream, forced all-DIB so
+    /// the decode never involves PNG.
     fn ico_frame(n: u32, rgba: [u8; 4]) -> Vec<u8> {
-        let img = IconImage::from_rgba(n, n, solid_rgba(n, rgba));
-        let opts = WriteOptions {
-            png_size_threshold: None,
-            ..Default::default()
-        };
-        write_ico(IconType::Ico, &[img], opts).unwrap()
+        let img = IcoImage::from_rgba8(n, n, solid_rgba(n, rgba)).unwrap();
+        encode_images(&[img], &dib_opts(IconType::Ico)).unwrap()
     }
 
     /// Build a complete single-sub-image ICO carrying one hand-built
     /// headerless **indexed** DIB body (palette + XOR rows + 1-bpp AND
     /// mask), exercising the low-bit-depth BMP-inside-ICO decode path
-    /// that `IconImage::from_rgba` + `write_ico` (which only emit 32-bpp)
+    /// that `IcoImage::from_rgba8` + `encode` (which emit 32-bpp DIBs)
     /// can't reach. Spec §"DIB form structure": `BITMAPINFOHEADER`,
     /// then `2^biBitCount` RGBQUAD palette entries, then the bottom-up
     /// XOR colour rows at `biBitCount` bpp, then the bottom-up 1-bpp AND
@@ -603,18 +574,34 @@ mod tests {
             &[0, 1, 1, 1],
             &[false, true, false, false],
         );
-        let (ty, imgs) = read_ico(&bytes).unwrap();
-        assert_eq!(ty, IconType::Ico);
+        let imgs: Vec<IcoImage> = decode_all(&bytes)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.image)
+            .collect();
+        assert_eq!(crate::info(&bytes).unwrap().icon_type, IconType::Ico);
         assert_eq!(imgs.len(), 1);
         let im = &imgs[0];
         assert_eq!((im.width, im.height), (2, 2));
         assert_eq!(im.bit_depth, 8);
         assert_eq!(im.sub_format, IconSubFormat::Bmp);
         // Palette lookup + bottom-up flip + AND-mask transparency.
-        assert_eq!(&im.pixels[0..4], &[255, 0, 0, 255], "(0,0) red opaque");
-        assert_eq!(&im.pixels[4..8], &[0, 255, 0, 0], "(1,0) green transparent");
-        assert_eq!(&im.pixels[8..12], &[0, 255, 0, 255], "(0,1) green opaque");
-        assert_eq!(&im.pixels[12..16], &[0, 255, 0, 255], "(1,1) green opaque");
+        assert_eq!(&im.to_rgba8()[0..4], &[255, 0, 0, 255], "(0,0) red opaque");
+        assert_eq!(
+            &im.to_rgba8()[4..8],
+            &[0, 255, 0, 0],
+            "(1,0) green transparent"
+        );
+        assert_eq!(
+            &im.to_rgba8()[8..12],
+            &[0, 255, 0, 255],
+            "(0,1) green opaque"
+        );
+        assert_eq!(
+            &im.to_rgba8()[12..16],
+            &[0, 255, 0, 255],
+            "(1,1) green opaque"
+        );
     }
 
     #[test]
@@ -630,14 +617,18 @@ mod tests {
             &[1, 0, 0, 1],
             &[false, false, false, true],
         );
-        let (_, imgs) = read_ico(&bytes).unwrap();
+        let imgs: Vec<IcoImage> = decode_all(&bytes)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.image)
+            .collect();
         let im = &imgs[0];
         assert_eq!(im.bit_depth, 1);
-        assert_eq!(&im.pixels[0..4], &[255, 255, 255, 255], "(0,0) white");
-        assert_eq!(&im.pixels[4..8], &[0, 0, 0, 255], "(1,0) black");
-        assert_eq!(&im.pixels[8..12], &[0, 0, 0, 255], "(0,1) black");
+        assert_eq!(&im.to_rgba8()[0..4], &[255, 255, 255, 255], "(0,0) white");
+        assert_eq!(&im.to_rgba8()[4..8], &[0, 0, 0, 255], "(1,0) black");
+        assert_eq!(&im.to_rgba8()[8..12], &[0, 0, 0, 255], "(0,1) black");
         assert_eq!(
-            &im.pixels[12..16],
+            &im.to_rgba8()[12..16],
             &[255, 255, 255, 0],
             "(1,1) white transparent"
         );
@@ -654,13 +645,17 @@ mod tests {
             &[0, 1, 2, 3],
             &[false, false, false, false],
         );
-        let (_, imgs) = read_ico(&bytes).unwrap();
+        let imgs: Vec<IcoImage> = decode_all(&bytes)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.image)
+            .collect();
         let im = &imgs[0];
         assert_eq!(im.bit_depth, 4);
-        assert_eq!(&im.pixels[0..4], &[255, 0, 0, 255], "idx0 red");
-        assert_eq!(&im.pixels[4..8], &[0, 255, 0, 255], "idx1 green");
-        assert_eq!(&im.pixels[8..12], &[0, 0, 255, 255], "idx2 blue");
-        assert_eq!(&im.pixels[12..16], &[255, 255, 0, 255], "idx3 yellow");
+        assert_eq!(&im.to_rgba8()[0..4], &[255, 0, 0, 255], "idx0 red");
+        assert_eq!(&im.to_rgba8()[4..8], &[0, 255, 0, 255], "idx1 green");
+        assert_eq!(&im.to_rgba8()[8..12], &[0, 0, 255, 255], "idx2 blue");
+        assert_eq!(&im.to_rgba8()[12..16], &[255, 255, 0, 255], "idx3 yellow");
     }
 
     /// Append a RIFF chunk (tag + LE u32 len + payload, even-padded).
@@ -741,7 +736,7 @@ mod tests {
             assert_eq!(frame.images.len(), 1);
             assert_eq!(frame.images[0].width, 8);
             assert_eq!(frame.images[0].height, 8);
-            assert_eq!(frame.images[0].pixels.len(), 8 * 8 * 4);
+            assert_eq!(frame.images[0].to_rgba8().len(), 8 * 8 * 4);
         }
         // No seq chunk → identity timeline, iDispRate for every step.
         assert_eq!(anim.steps.len(), 2);
@@ -869,14 +864,14 @@ mod tests {
             assert_eq!(img.sub_format, IconSubFormat::Bmp);
             assert_eq!(img.bit_depth, 16);
             assert!(img.hotspot.is_none());
-            assert_eq!(img.pixels.len(), 3 * 2 * 4);
+            assert_eq!(img.to_rgba8().len(), 3 * 2 * 4);
         }
         // Every white pixel decodes to opaque white, every black to
         // opaque black (raw frames carry no AND mask → all opaque).
-        for px in anim.frames[0].images[0].pixels.chunks_exact(4) {
+        for px in anim.frames[0].images[0].to_rgba8().chunks_exact(4) {
             assert_eq!(px, &[255, 255, 255, 255]);
         }
-        for px in anim.frames[1].images[0].pixels.chunks_exact(4) {
+        for px in anim.frames[1].images[0].to_rgba8().chunks_exact(4) {
             assert_eq!(px, &[0, 0, 0, 255]);
         }
         assert_eq!(anim.steps.len(), 2);
@@ -902,11 +897,17 @@ mod tests {
             assert_eq!(img.sub_format, IconSubFormat::Bmp);
             assert_eq!(img.bit_depth, 32);
             assert!(img.hotspot.is_none());
-            assert_eq!(img.pixels.len(), 4 * 4 * 4);
+            assert_eq!(img.to_rgba8().len(), 4 * 4 * 4);
         }
         // BGRA red stored → top-left RGBA pixel is (200, 0, 0, 255).
-        assert_eq!(&anim.frames[0].images[0].pixels[0..4], &[200, 0, 0, 255]);
-        assert_eq!(&anim.frames[1].images[0].pixels[0..4], &[0, 200, 0, 255]);
+        assert_eq!(
+            &anim.frames[0].images[0].to_rgba8()[0..4],
+            &[200, 0, 0, 255]
+        );
+        assert_eq!(
+            &anim.frames[1].images[0].to_rgba8()[0..4],
+            &[0, 200, 0, 255]
+        );
         // Identity timeline (no seq), iDispRate per step.
         assert_eq!(anim.steps.len(), 2);
         assert!(anim.steps.iter().all(|s| s.jiffies == 9));
@@ -991,7 +992,7 @@ mod tests {
         for _ in 0..15 {
             expect_red.extend_from_slice(&red);
         }
-        assert_eq!(anim.frames[0].images[0].pixels, expect_red);
+        assert_eq!(anim.frames[0].images[0].to_rgba8(), expect_red);
         assert_eq!(anim.frames[0].images[0].bit_depth, 32);
     }
 
@@ -1082,15 +1083,12 @@ mod tests {
     }
 
     /// A complete single-sub-image CUR byte stream carrying a hotspot,
-    /// forced all-BMP so `read_ico` decodes it without PNG involvement.
+    /// forced all-DIB so the decode never involves PNG.
     fn cur_frame(n: u32, rgba: [u8; 4], hot: HotSpot) -> Vec<u8> {
-        let mut img = IconImage::from_rgba(n, n, solid_rgba(n, rgba));
-        img.hotspot = Some(hot);
-        let opts = WriteOptions {
-            png_size_threshold: None,
-            ..Default::default()
-        };
-        write_ico(IconType::Cur, &[img], opts).unwrap()
+        let img = IcoImage::from_rgba8(n, n, solid_rgba(n, rgba))
+            .unwrap()
+            .with_hotspot(hot);
+        encode_images(&[img], &dib_opts(IconType::Cur)).unwrap()
     }
 
     #[test]
@@ -1098,18 +1096,10 @@ mod tests {
         // A frame carrying 8×8 and 16×16 sub-images: the primary is the
         // 16×16 (largest area). Build a two-resolution ICO frame.
         let imgs = vec![
-            IconImage::from_rgba(8, 8, solid_rgba(8, [1, 2, 3, 255])),
-            IconImage::from_rgba(16, 16, solid_rgba(16, [9, 9, 9, 255])),
+            IcoImage::from_rgba8(8, 8, solid_rgba(8, [1, 2, 3, 255])).unwrap(),
+            IcoImage::from_rgba8(16, 16, solid_rgba(16, [9, 9, 9, 255])).unwrap(),
         ];
-        let frame_bytes = write_ico(
-            IconType::Ico,
-            &imgs,
-            WriteOptions {
-                png_size_threshold: None,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let frame_bytes = encode_images(&imgs, &dib_opts(IconType::Ico)).unwrap();
         let ani = build_ani(&[frame_bytes], 0, 12, None, None, None);
         let anim = read_ani(&ani).unwrap();
         let primary = anim.frames[0].primary_image().unwrap();

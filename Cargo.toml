@@ -12,31 +12,37 @@ readme = "README.md"
 keywords = ["multimedia", "image", "ico", "cursor", "pure-rust"]
 categories = ["multimedia::encoding", "multimedia::images"]
 
+exclude = ["/tests", "/fuzz"]
+
 [dependencies]
-# All three deps are gated behind the default-on `registry` feature so
+# `oxideav-core` is gated behind the default-on `registry` feature so
 # image-library consumers can depend on `oxideav-ico` with
-# `default-features = false` to get the standalone container parser
-# (`read_ico_raw` / `write_ico_raw`) without dragging in the
-# `oxideav-core` framework dependency tree or the BMP / PNG sub-image
-# codec crates.
+# `default-features = false` and get the whole image-crate contract
+# (`probe` / `info` / `decode*` / `encode*`, `IcoImage`) without the
+# framework dependency tree.
 oxideav-core = { version = "0.1", optional = true }
-# Needs the `decode_dib_videoframe` / `encode_dib_videoframe` compat
-# wrappers that ship with oxideav-bmp 0.1.3 alongside the `BmpImage`
-# standalone retrofit. Loose `0.1` constraint here so the workspace
-# path-dep stays usable; the published-from-crates.io build needs
-# oxideav-bmp 0.1.3 to be on the registry.
-oxideav-bmp = { version = "0.1", optional = true }
-oxideav-png = { version = "0.1", optional = true }
+# The sub-image codecs are plain (non-optional) dependencies in their own
+# standalone layer (`default-features = false`): a DIB payload decodes
+# through `oxideav_bmp::decode_dib_with`, an embedded PNG through
+# `oxideav_png::decode_with`, so every ICO / CUR entry decodes standalone.
+# The crate is written against their image-crate-contract surface
+# (`BmpImage::new`, `PngImage::new`, `Plane` / `ColorInfo` / `Metadata`),
+# first published as oxideav-bmp 0.1.7 and oxideav-png 0.1.11 and also
+# present in the umbrella's path-patched trees (whose `[package] version`
+# still reads 0.1.6 / 0.1.10 until the release bump is pulled). The
+# lower bounds therefore stay at the umbrella trees' versions so the path
+# patch resolves (same transition as oxideav-cli-convert); a registry
+# build resolves the newest 0.1.x / 0.2.x. Tighten to "0.2" once both
+# publish 0.2.0.
+oxideav-bmp = { version = ">=0.1.6, <0.3", default-features = false }
+oxideav-png = { version = ">=0.1.8, <0.3", default-features = false }
 
 [features]
 default = ["registry"]
 
 # Wires up the codec / encoder / decoder / container demuxer + muxer
-# trait implementations against `oxideav-core` and pulls in
-# `oxideav-bmp` / `oxideav-png` for the actual sub-image decode +
-# encode (PNG-inside-ICO + BMP-DIB-inside-ICO). Also exposes the
-# `read_ico` / `write_ico` helpers that materialise pixels into
-# `IconImage`s. Default-on; turn off for image-library use-cases that
-# only need the standalone `read_ico_raw` / `write_ico_raw` container
-# parser.
-registry = ["dep:oxideav-core", "dep:oxideav-bmp", "dep:oxideav-png"]
+# trait implementations against `oxideav-core` plus the `VideoFrame`
+# bridge and `register` / `make_decoder` / `make_encoder`. Default-on;
+# turn off for image-library use-cases that only need the standalone
+# contract API.
+registry = ["dep:oxideav-core"]

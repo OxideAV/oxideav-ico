@@ -1,192 +1,46 @@
-//! ICO / CUR file encoder (registry-side, oxideav-core-using path).
+//! ANI (animated cursor) encoders ([`write_ani`] over ICO/CUR frames,
+//! [`write_ani_raw_frames`] over headerless raw-BMP frames) and the
+//! deprecated pre-contract [`write_ico`] wrapper.
 //!
-//! Picks PNG or BMP per sub-image according to [`WriteOptions`] (default:
-//! PNG for sizes ≥ 64, BMP otherwise), encodes each [`IconImage`] to
-//! its packed payload via `oxideav-png` / `oxideav-bmp`, then hands
-//! the resulting `IconEntryRaw` batch to the framework-free
-//! [`crate::raw::write_ico_raw`] for the directory layout.
-
-use oxideav_core::{Error, PixelFormat, Result, VideoFrame, VideoPlane};
+//! The ICO / CUR encode itself lives in the crate root
+//! ([`crate::encode`] / [`crate::encode_all`] / [`crate::encode_entry`]);
+//! this module builds the animated-cursor files on top of it. Everything
+//! here is framework-free.
 
 use crate::ani::{write_ani_raw, AniFile, AniHeader, AniInfo, AF_ICON, AF_SEQUENCE};
-use crate::raw::{
-    encode_indexed_dib_body, encode_rgb24_dib_body, quantise_rgba_to_indexed, write_ico_raw,
-    IconEntryRaw,
-};
+use crate::error::{IcoError as Error, Result};
+use crate::image::IcoImage;
+use crate::options::EncodeOptions;
 use crate::types::*;
 
-/// Serialize a batch of images into a single `.ico` / `.cur` byte
-/// stream. The caller is responsible for ensuring every image fits
-/// within 1 ≤ dim ≤ 256 (the format's hard limit — stored as `u8` in
-/// the directory entry, with 0 meaning 256).
+/// The pre-contract encode entry point: a batch of legacy
+/// [`IconImage`]s as one ICO / CUR file under [`WriteOptions`].
+#[deprecated(note = "use oxideav_ico::encode_all / oxideav_ico::encode (IMAGE_CRATE_API)")]
+#[allow(deprecated)]
 pub fn write_ico(icon_type: IconType, images: &[IconImage], opts: WriteOptions) -> Result<Vec<u8>> {
     if images.is_empty() {
-        return Err(oxideav_core::Error::invalid(
-            "ICO: must have at least one sub-image",
-        ));
+        return Err(Error::invalid("ICO: must have at least one sub-image"));
     }
+    let mut converted = Vec::with_capacity(images.len());
     for (i, im) in images.iter().enumerate() {
-        // The `ICONDIRENTRY` width / height fields are single bytes
-        // (`0` encodes the 256 case), so the directory physically
-        // cannot describe a sub-image outside `1..=256` in either
-        // axis. Reject oversized inputs here — before the (potentially
-        // expensive) PNG / BMP encode — so callers get the dimension
-        // error up front rather than after wasting an encode pass.
-        // `write_ico_raw` re-checks the same bound as a backstop.
         if im.width == 0 || im.height == 0 || im.width > 256 || im.height > 256 {
-            return Err(oxideav_core::Error::invalid(format!(
+            return Err(Error::invalid(format!(
                 "ICO: entry {i} dimensions {}×{} out of 1..=256 \
                  (ICONDIRENTRY width/height are single bytes, 0 == 256)",
                 im.width, im.height
             )));
         }
         if im.pixels.len() != (im.width as usize * im.height as usize * 4) {
-            return Err(oxideav_core::Error::invalid(format!(
+            return Err(Error::invalid(format!(
                 "ICO: entry {i} pixel buffer size {} != {}×{}×4",
                 im.pixels.len(),
                 im.width,
                 im.height
             )));
         }
+        converted.push(IcoImage::try_from(im.clone())?);
     }
-
-    let mut entries: Vec<IconEntryRaw> = Vec::with_capacity(images.len());
-    for (i, im) in images.iter().enumerate() {
-        let chosen = choose_sub_format(im, &opts);
-        // Per-image depth (when enabled) lets one call emit a mixed-depth
-        // multi-resolution icon; an unencodable `bit_depth` falls back to
-        // the single `bmp_bit_depth`.
-        let depth = if opts.per_image_bit_depth {
-            BmpBitDepth::from_bits(im.bit_depth).unwrap_or(opts.bmp_bit_depth)
-        } else {
-            opts.bmp_bit_depth
-        };
-        let bytes = encode_sub_image(im, chosen, depth)
-            .map_err(|e| Error::invalid(format!("ICO: entry {i}: {e}")))?;
-        // PNG bodies always carry full RGBA; BMP bodies carry the depth
-        // the writer actually emitted so the directory `wBitCount` and
-        // the body's `biBitCount` agree (read_ico_raw cross-checks them).
-        let bit_depth = match chosen {
-            SubFormatChosen::Png => 32,
-            SubFormatChosen::Bmp => depth.bits(),
-        };
-        entries.push(IconEntryRaw {
-            width: im.width,
-            height: im.height,
-            bit_depth,
-            sub_format: match chosen {
-                SubFormatChosen::Png => IconSubFormat::Png,
-                SubFormatChosen::Bmp => IconSubFormat::Bmp,
-            },
-            hotspot: im.hotspot,
-            data: bytes,
-        });
-    }
-
-    Ok(write_ico_raw(icon_type, &entries)?)
-}
-
-/// Alias of [`IconSubFormat`] used at encode time, so we don't confuse
-/// the "caller's hint" (which we may override) with "what we actually
-/// wrote".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SubFormatChosen {
-    Png,
-    Bmp,
-}
-
-fn choose_sub_format(im: &IconImage, opts: &WriteOptions) -> SubFormatChosen {
-    match opts.png_size_threshold {
-        None => SubFormatChosen::Bmp,
-        Some(threshold) => {
-            if im.width.min(im.height) >= threshold {
-                SubFormatChosen::Png
-            } else {
-                SubFormatChosen::Bmp
-            }
-        }
-    }
-}
-
-fn encode_sub_image(
-    im: &IconImage,
-    fmt: SubFormatChosen,
-    bmp_depth: BmpBitDepth,
-) -> Result<Vec<u8>> {
-    match fmt {
-        SubFormatChosen::Png => {
-            let frame = iconimage_to_frame(im);
-            oxideav_png::encode_single(&frame, im.width, im.height, PixelFormat::Rgba, &[])
-        }
-        SubFormatChosen::Bmp => encode_bmp_sub_image(im, bmp_depth),
-    }
-}
-
-/// Encode one BMP-DIB sub-image body at the requested bit depth. The
-/// 32-bpp path delegates to `oxideav-bmp` (BGRA + alpha-derived AND
-/// mask); the indexed / 24-bpp paths use the framework-free `raw`
-/// encoders that build the palette + XOR rows + AND mask in-crate.
-fn encode_bmp_sub_image(im: &IconImage, depth: BmpBitDepth) -> Result<Vec<u8>> {
-    match depth {
-        BmpBitDepth::Bgra32 => {
-            // The BMP-inside-ICO convention is doubled height + AND
-            // mask appended; oxideav-bmp handles both via the
-            // `double_height_for_ico_mask` flag on the registry-gated
-            // VideoFrame-shaped wrapper.
-            let frame = iconimage_to_frame(im);
-            oxideav_bmp::encode_dib_videoframe(
-                &frame,
-                PixelFormat::Rgba,
-                im.width,
-                im.height,
-                /* doubled */ true,
-            )
-        }
-        BmpBitDepth::Rgb24 => {
-            // Drop the RGBA buffer to RGB triples; transparency goes to
-            // the AND mask (alpha 0 ⇒ transparent).
-            let pixels = im.width as usize * im.height as usize;
-            let mut rgb = Vec::with_capacity(pixels * 3);
-            let mut transparent = Vec::with_capacity(pixels);
-            for p in 0..pixels {
-                rgb.push(im.pixels[p * 4]);
-                rgb.push(im.pixels[p * 4 + 1]);
-                rgb.push(im.pixels[p * 4 + 2]);
-                transparent.push(im.pixels[p * 4 + 3] == 0);
-            }
-            Ok(encode_rgb24_dib_body(
-                im.width,
-                im.height,
-                &rgb,
-                &transparent,
-            )?)
-        }
-        BmpBitDepth::Indexed8 | BmpBitDepth::Indexed4 | BmpBitDepth::Indexed1 => {
-            let bpp = depth
-                .indexed_bpp()
-                .expect("indexed variant has an indexed bpp");
-            let (palette, indices, transparent) =
-                quantise_rgba_to_indexed(im.width, im.height, &im.pixels, bpp)?;
-            Ok(encode_indexed_dib_body(
-                im.width,
-                im.height,
-                bpp,
-                &palette,
-                &indices,
-                &transparent,
-            )?)
-        }
-    }
-}
-
-fn iconimage_to_frame(im: &IconImage) -> VideoFrame {
-    VideoFrame {
-        pts: None,
-        planes: vec![VideoPlane {
-            stride: im.width as usize * 4,
-            data: im.pixels.clone(),
-        }],
-    }
+    crate::encode_images(&converted, &opts.into_encode_options(icon_type))
 }
 
 // ---------------------------------------------------------------------------
@@ -201,7 +55,7 @@ fn iconimage_to_frame(im: &IconImage) -> VideoFrame {
 /// [`crate::read_ani`] produces): where the reader hands back one
 /// `AniFrame` per stored `LIST 'fram'` `icon` chunk (decoded to RGBA),
 /// the writer takes one `AniWriteFrame` per chunk and serialises it back
-/// to a complete ICO/CUR resource via [`write_ico`]. A frame may carry
+/// to a complete ICO/CUR resource via [`crate::encode_all`]. A frame may carry
 /// several resolutions exactly as a `.ico` does — they all share the
 /// frame's `icon_type` and become one `icon` chunk.
 #[derive(Debug, Clone)]
@@ -211,8 +65,8 @@ pub struct AniWriteFrame {
     pub icon_type: IconType,
     /// The frame's sub-images, in directory order. Must be non-empty —
     /// every `icon` chunk needs at least one sub-image, and the
-    /// underlying [`write_ico`] rejects an empty batch.
-    pub images: Vec<IconImage>,
+    /// underlying [`crate::encode_all`] rejects an empty batch.
+    pub images: Vec<IcoImage>,
 }
 
 /// Encode-time knobs for [`write_ani`] — the animation-level metadata and
@@ -221,7 +75,7 @@ pub struct AniWriteFrame {
 /// The defaults produce the simplest valid animation: identity playback
 /// order (each stored frame shown once, in order), every step held for
 /// `default_jiffies`, no `LIST 'INFO'` metadata, and per-sub-image PNG /
-/// BMP selection per [`WriteOptions::default`].
+/// DIB selection per [`EncodeOptions::default`].
 #[derive(Debug, Clone)]
 pub struct AniWriteOptions {
     /// Optional `LIST 'INFO'` title (`INAM`) / author (`IART`) payload
@@ -247,9 +101,10 @@ pub struct AniWriteOptions {
     /// zero-jiffy step has no defined display behaviour and
     /// [`crate::AniFile::playback_steps`] rejects it on the read side.
     pub default_jiffies: u32,
-    /// Per-sub-image PNG / BMP selection forwarded to [`write_ico`] for
-    /// every frame.
-    pub ico: WriteOptions,
+    /// Per-sub-image PNG / DIB selection forwarded to
+    /// [`crate::encode_all`] for every frame (its `icon_type` is
+    /// overridden by each frame's own).
+    pub ico: EncodeOptions,
 }
 
 impl Default for AniWriteOptions {
@@ -261,7 +116,7 @@ impl Default for AniWriteOptions {
             // 10 jiffies ≈ 1/6 s is a common cursor-animation cadence; any
             // non-zero value is valid. The caller overrides per animation.
             default_jiffies: 10,
-            ico: WriteOptions::default(),
+            ico: EncodeOptions::default(),
         }
     }
 }
@@ -269,9 +124,10 @@ impl Default for AniWriteOptions {
 /// Encode a set of RGBA animation frames into an ANI (RIFF/`ACON`) byte
 /// stream — the high-level, pixel-side counterpart to [`crate::read_ani`].
 ///
-/// Where [`write_ico`] serialises one icon resource's sub-images,
-/// `write_ani` serialises a whole animation: each [`AniWriteFrame`] is
-/// encoded to a complete ICO/CUR resource via [`write_ico`], the resolved
+/// Where [`crate::encode_all`] serialises one icon resource's
+/// sub-images, `write_ani` serialises a whole animation: each
+/// [`AniWriteFrame`] is encoded to a complete ICO/CUR resource via
+/// [`crate::encode_all`], the resolved
 /// `anih` header / `seq ` / `rate` / `LIST 'INFO'` chunks are assembled,
 /// and the lot is serialised through [`write_ani_raw`]. The result parses
 /// back through [`crate::read_ani`] to an equivalent animation.
@@ -289,8 +145,8 @@ impl Default for AniWriteOptions {
 /// * `sequence` carries an index `>= frames.len()`.
 /// * `rates.len()` doesn't match the resolved step count (the `sequence`
 ///   length when present, else `frames.len()`).
-/// * Any per-frame [`write_ico`] error (empty sub-image batch, a
-///   sub-image outside `1..=256`, a bad pixel-buffer length).
+/// * Any per-frame [`crate::encode_all`] error (empty sub-image batch,
+///   a sub-image outside `1..=256`).
 pub fn write_ani(frames: &[AniWriteFrame], opts: &AniWriteOptions) -> Result<Vec<u8>> {
     if frames.is_empty() {
         return Err(Error::invalid(
@@ -349,7 +205,7 @@ pub fn write_ani(frames: &[AniWriteFrame], opts: &AniWriteOptions) -> Result<Vec
     // Encode each frame to a complete ICO/CUR resource.
     let mut frame_payloads: Vec<Vec<u8>> = Vec::with_capacity(frames.len());
     for (i, frame) in frames.iter().enumerate() {
-        let bytes = write_ico(frame.icon_type, &frame.images, opts.ico)
+        let bytes = crate::encode_images(&frame.images, &opts.ico.with_icon_type(frame.icon_type))
             .map_err(|e| Error::invalid(format!("ANI: write_ani: frame {i}: {e}")))?;
         frame_payloads.push(bytes);
     }
@@ -393,7 +249,7 @@ pub fn write_ani(frames: &[AniWriteFrame], opts: &AniWriteOptions) -> Result<Vec
         frames: frame_payloads,
     };
 
-    Ok(write_ani_raw(&ani)?)
+    write_ani_raw(&ani)
 }
 
 /// Target bit-depth for the [`write_ani_raw_frames`] `AF_ICON`-clear
@@ -426,7 +282,7 @@ impl RawFrameBitDepth {
 /// Encode-time knobs for [`write_ani_raw_frames`] — the `AF_ICON`-clear
 /// counterpart of [`AniWriteOptions`]. The raw path has one shared
 /// geometry (in `anih`) and no per-frame ICO directory, so the
-/// per-sub-image `WriteOptions` of the icon path don't apply; the only
+/// per-sub-image [`EncodeOptions`] of the icon path don't apply; the only
 /// pixel-level knob is the target [`RawFrameBitDepth`].
 #[derive(Debug, Clone, Default)]
 pub struct AniRawWriteOptions {
@@ -625,13 +481,21 @@ pub fn write_ani_raw_frames(
         frames: frame_payloads,
     };
 
-    Ok(write_ani_raw(&ani)?)
+    write_ani_raw(&ani)
 }
 
 #[cfg(test)]
 mod bmp_depth_tests {
     use super::*;
-    use crate::reader::read_ico;
+    use crate::{decode_all, encode_images};
+
+    fn decode_images(bytes: &[u8]) -> Vec<IcoImage> {
+        decode_all(bytes)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.image)
+            .collect()
+    }
 
     /// 2×2 RGBA with `n` distinct opaque colours, cycling palette slots.
     fn rgba_palette(colours: &[[u8; 4]]) -> Vec<u8> {
@@ -642,12 +506,10 @@ mod bmp_depth_tests {
         v
     }
 
-    fn opts_bmp(depth: BmpBitDepth) -> WriteOptions {
-        WriteOptions {
-            png_size_threshold: None, // force BMP everywhere
-            bmp_bit_depth: depth,
-            per_image_bit_depth: false,
-        }
+    fn opts_bmp(depth: BmpBitDepth) -> EncodeOptions {
+        EncodeOptions::new()
+            .with_png_size_threshold(None) // force DIB everywhere
+            .with_bmp_bit_depth(depth)
     }
 
     #[test]
@@ -658,18 +520,18 @@ mod bmp_depth_tests {
             [0, 0, 255, 255],
             [255, 255, 0, 255],
         ];
-        let img = IconImage::from_rgba(2, 2, rgba_palette(&colours));
-        let bytes = write_ico(IconType::Ico, &[img], opts_bmp(BmpBitDepth::Indexed8)).unwrap();
+        let img = IcoImage::from_rgba8(2, 2, rgba_palette(&colours)).unwrap();
+        let bytes = encode_images(&[img], &opts_bmp(BmpBitDepth::Indexed8)).unwrap();
 
         // Directory wBitCount (entry 0, offset 6+6 = 12) must read 8.
         assert_eq!(u16::from_le_bytes([bytes[12], bytes[13]]), 8);
 
-        let (_, decoded) = read_ico(&bytes).unwrap();
+        let decoded = decode_images(&bytes);
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].bit_depth, 8);
         assert_eq!(decoded[0].sub_format, IconSubFormat::Bmp);
         for (i, c) in colours.iter().enumerate() {
-            assert_eq!(&decoded[0].pixels[i * 4..i * 4 + 4], c, "pixel {i}");
+            assert_eq!(&decoded[0].to_rgba8()[i * 4..i * 4 + 4], c, "pixel {i}");
         }
     }
 
@@ -682,13 +544,13 @@ mod bmp_depth_tests {
             [0, 0, 255, 255],
             [255, 255, 0, 255],
         ];
-        let img = IconImage::from_rgba(4, 1, rgba_palette(&colours));
-        let bytes = write_ico(IconType::Ico, &[img], opts_bmp(BmpBitDepth::Indexed4)).unwrap();
+        let img = IcoImage::from_rgba8(4, 1, rgba_palette(&colours)).unwrap();
+        let bytes = encode_images(&[img], &opts_bmp(BmpBitDepth::Indexed4)).unwrap();
         assert_eq!(u16::from_le_bytes([bytes[12], bytes[13]]), 4);
-        let (_, decoded) = read_ico(&bytes).unwrap();
+        let decoded = decode_images(&bytes);
         assert_eq!(decoded[0].bit_depth, 4);
         for (i, c) in colours.iter().enumerate() {
-            assert_eq!(&decoded[0].pixels[i * 4..i * 4 + 4], c, "pixel {i}");
+            assert_eq!(&decoded[0].to_rgba8()[i * 4..i * 4 + 4], c, "pixel {i}");
         }
     }
 
@@ -700,13 +562,13 @@ mod bmp_depth_tests {
             [0, 0, 0, 255],
             [255, 255, 255, 255],
         ];
-        let img = IconImage::from_rgba(2, 2, rgba_palette(&colours));
-        let bytes = write_ico(IconType::Ico, &[img], opts_bmp(BmpBitDepth::Indexed1)).unwrap();
+        let img = IcoImage::from_rgba8(2, 2, rgba_palette(&colours)).unwrap();
+        let bytes = encode_images(&[img], &opts_bmp(BmpBitDepth::Indexed1)).unwrap();
         assert_eq!(u16::from_le_bytes([bytes[12], bytes[13]]), 1);
-        let (_, decoded) = read_ico(&bytes).unwrap();
+        let decoded = decode_images(&bytes);
         assert_eq!(decoded[0].bit_depth, 1);
         for (i, c) in colours.iter().enumerate() {
-            assert_eq!(&decoded[0].pixels[i * 4..i * 4 + 4], c, "pixel {i}");
+            assert_eq!(&decoded[0].to_rgba8()[i * 4..i * 4 + 4], c, "pixel {i}");
         }
     }
 
@@ -719,14 +581,14 @@ mod bmp_depth_tests {
             [77, 88, 99, 255],
             [100, 110, 120, 255],
         ];
-        let img = IconImage::from_rgba(2, 2, rgba_palette(&colours));
-        let bytes = write_ico(IconType::Ico, &[img], opts_bmp(BmpBitDepth::Rgb24)).unwrap();
+        let img = IcoImage::from_rgba8(2, 2, rgba_palette(&colours)).unwrap();
+        let bytes = encode_images(&[img], &opts_bmp(BmpBitDepth::Rgb24)).unwrap();
         assert_eq!(u16::from_le_bytes([bytes[12], bytes[13]]), 24);
-        let (_, decoded) = read_ico(&bytes).unwrap();
+        let decoded = decode_images(&bytes);
         assert_eq!(decoded[0].bit_depth, 24);
-        assert_eq!(&decoded[0].pixels[0..4], &[11, 22, 33, 255]);
-        assert_eq!(decoded[0].pixels[7], 0, "(1,0) transparent");
-        assert_eq!(&decoded[0].pixels[8..12], &[77, 88, 99, 255]);
+        assert_eq!(&decoded[0].to_rgba8()[0..4], &[11, 22, 33, 255]);
+        assert_eq!(decoded[0].to_rgba8()[7], 0, "(1,0) transparent");
+        assert_eq!(&decoded[0].to_rgba8()[8..12], &[77, 88, 99, 255]);
     }
 
     #[test]
@@ -738,8 +600,8 @@ mod bmp_depth_tests {
             [0, 0, 3, 255],
             [1, 0, 0, 255],
         ];
-        let img = IconImage::from_rgba(2, 2, rgba_palette(&colours));
-        let err = write_ico(IconType::Ico, &[img], opts_bmp(BmpBitDepth::Indexed1)).unwrap_err();
+        let img = IcoImage::from_rgba8(2, 2, rgba_palette(&colours)).unwrap();
+        let err = encode_images(&[img], &opts_bmp(BmpBitDepth::Indexed1)).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("entry 0"), "error names the entry: {msg}");
         assert!(msg.contains("more than 2 colours"), "got: {msg}");
@@ -762,7 +624,7 @@ mod bmp_depth_tests {
     fn per_image_bit_depth_emits_mixed_depth_icon() {
         // One call producing a faithful mixed-depth multi-resolution
         // icon: a 1-bpp 2×2 monochrome entry next to an 8-bpp 2×2 entry.
-        let mut mono = IconImage::from_rgba(
+        let mono = IcoImage::from_rgba8(
             2,
             2,
             rgba_palette(&[
@@ -771,9 +633,10 @@ mod bmp_depth_tests {
                 [255, 255, 255, 255],
                 [0, 0, 0, 255],
             ]),
-        );
-        mono.bit_depth = 1;
-        let mut idx8 = IconImage::from_rgba(
+        )
+        .unwrap()
+        .with_bit_depth(1);
+        let idx8 = IcoImage::from_rgba8(
             2,
             2,
             rgba_palette(&[
@@ -782,37 +645,36 @@ mod bmp_depth_tests {
                 [0, 0, 255, 255],
                 [255, 255, 0, 255],
             ]),
-        );
-        idx8.bit_depth = 8;
+        )
+        .unwrap()
+        .with_bit_depth(8);
 
-        let opts = WriteOptions {
-            png_size_threshold: None,
-            bmp_bit_depth: BmpBitDepth::Bgra32, // default, overridden per image
-            per_image_bit_depth: true,
-        };
-        let bytes = write_ico(IconType::Ico, &[mono, idx8], opts).unwrap();
-        let (_, decoded) = read_ico(&bytes).unwrap();
+        // bmp_bit_depth stays at its Bgra32 default, overridden per image.
+        let opts = EncodeOptions::new()
+            .with_png_size_threshold(None)
+            .with_per_image_bit_depth(true);
+        let bytes = encode_images(&[mono, idx8], &opts).unwrap();
+        let decoded = decode_images(&bytes);
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded[0].bit_depth, 1, "first entry stays 1-bpp");
         assert_eq!(decoded[1].bit_depth, 8, "second entry stays 8-bpp");
         // Pixels survive both depths.
-        assert_eq!(&decoded[0].pixels[0..4], &[0, 0, 0, 255]);
-        assert_eq!(&decoded[1].pixels[0..4], &[255, 0, 0, 255]);
+        assert_eq!(&decoded[0].to_rgba8()[0..4], &[0, 0, 0, 255]);
+        assert_eq!(&decoded[1].to_rgba8()[0..4], &[255, 0, 0, 255]);
     }
 
     #[test]
     fn per_image_bit_depth_falls_back_for_unencodable_depth() {
         // bit_depth = 16 has no writer; the per-image path falls back to
         // the global bmp_bit_depth (here 32) rather than erroring.
-        let mut im = IconImage::from_rgba(2, 2, vec![100u8; 16]);
-        im.bit_depth = 16;
-        let opts = WriteOptions {
-            png_size_threshold: None,
-            bmp_bit_depth: BmpBitDepth::Bgra32,
-            per_image_bit_depth: true,
-        };
-        let bytes = write_ico(IconType::Ico, &[im], opts).unwrap();
-        let (_, decoded) = read_ico(&bytes).unwrap();
+        let im = IcoImage::from_rgba8(2, 2, vec![100u8; 16])
+            .unwrap()
+            .with_bit_depth(16);
+        let opts = EncodeOptions::new()
+            .with_png_size_threshold(None)
+            .with_per_image_bit_depth(true);
+        let bytes = encode_images(&[im], &opts).unwrap();
+        let decoded = decode_images(&bytes);
         assert_eq!(decoded[0].bit_depth, 32, "fell back to 32-bpp");
     }
 
@@ -821,14 +683,12 @@ mod bmp_depth_tests {
         // With a size threshold the 64×64 entry routes to PNG; the
         // indexed depth only governs the BMP path, so the PNG entry
         // still carries full RGBA at directory bit-depth 32.
-        let big = IconImage::from_rgba(64, 64, vec![128u8; 64 * 64 * 4]);
-        let opts = WriteOptions {
-            png_size_threshold: Some(64),
-            bmp_bit_depth: BmpBitDepth::Indexed8,
-            per_image_bit_depth: false,
-        };
-        let bytes = write_ico(IconType::Ico, &[big], opts).unwrap();
-        let (_, decoded) = read_ico(&bytes).unwrap();
+        let big = IcoImage::from_rgba8(64, 64, vec![128u8; 64 * 64 * 4]).unwrap();
+        let opts = EncodeOptions::new()
+            .with_png_size_threshold(64)
+            .with_bmp_bit_depth(BmpBitDepth::Indexed8);
+        let bytes = encode_images(&[big], &opts).unwrap();
+        let decoded = decode_images(&bytes);
         assert_eq!(decoded[0].sub_format, IconSubFormat::Png);
         assert_eq!(decoded[0].bit_depth, 32);
     }
@@ -851,7 +711,7 @@ mod ani_write_tests {
     fn frame(n: u32, rgba: [u8; 4]) -> AniWriteFrame {
         AniWriteFrame {
             icon_type: IconType::Ico,
-            images: vec![IconImage::from_rgba(n, n, solid_rgba(n, rgba))],
+            images: vec![IcoImage::from_rgba8(n, n, solid_rgba(n, rgba)).unwrap()],
         }
     }
 
@@ -859,10 +719,7 @@ mod ani_write_tests {
     /// any lossy PNG involvement.
     fn all_bmp_opts() -> AniWriteOptions {
         AniWriteOptions {
-            ico: WriteOptions {
-                png_size_threshold: None,
-                ..Default::default()
-            },
+            ico: EncodeOptions::new().with_png_size_threshold(None),
             ..AniWriteOptions::default()
         }
     }
@@ -882,11 +739,11 @@ mod ani_write_tests {
         assert_eq!(anim.frames[0].images.len(), 1);
         assert_eq!(anim.frames[0].images[0].width, 8);
         assert_eq!(
-            anim.frames[0].images[0].pixels,
+            anim.frames[0].images[0].to_rgba8(),
             solid_rgba(8, [200, 10, 10, 255])
         );
         assert_eq!(
-            anim.frames[1].images[0].pixels,
+            anim.frames[1].images[0].to_rgba8(),
             solid_rgba(8, [10, 200, 10, 255])
         );
         // Identity timeline: each frame once, default 12 jiffies.
@@ -906,11 +763,9 @@ mod ani_write_tests {
         let frames = [frame(8, [200, 10, 10, 255]), frame(8, [10, 200, 10, 255])];
         let opts = AniWriteOptions {
             default_jiffies: 8,
-            ico: WriteOptions {
-                png_size_threshold: None,
-                bmp_bit_depth: BmpBitDepth::Indexed8,
-                per_image_bit_depth: false,
-            },
+            ico: EncodeOptions::new()
+                .with_png_size_threshold(None)
+                .with_bmp_bit_depth(BmpBitDepth::Indexed8),
             ..AniWriteOptions::default()
         };
         let bytes = write_ani(&frames, &opts).unwrap();
@@ -918,11 +773,11 @@ mod ani_write_tests {
         assert_eq!(anim.frames.len(), 2);
         assert_eq!(anim.frames[0].images[0].bit_depth, 8);
         assert_eq!(
-            anim.frames[0].images[0].pixels,
+            anim.frames[0].images[0].to_rgba8(),
             solid_rgba(8, [200, 10, 10, 255])
         );
         assert_eq!(
-            anim.frames[1].images[0].pixels,
+            anim.frames[1].images[0].to_rgba8(),
             solid_rgba(8, [10, 200, 10, 255])
         );
     }
@@ -934,22 +789,20 @@ mod ani_write_tests {
         let frames = [frame(8, [255, 255, 255, 255]), frame(8, [0, 0, 0, 255])];
         let opts = AniWriteOptions {
             default_jiffies: 6,
-            ico: WriteOptions {
-                png_size_threshold: None,
-                bmp_bit_depth: BmpBitDepth::Indexed1,
-                per_image_bit_depth: false,
-            },
+            ico: EncodeOptions::new()
+                .with_png_size_threshold(None)
+                .with_bmp_bit_depth(BmpBitDepth::Indexed1),
             ..AniWriteOptions::default()
         };
         let bytes = write_ani(&frames, &opts).unwrap();
         let anim = read_ani(&bytes).unwrap();
         assert_eq!(anim.frames[0].images[0].bit_depth, 1);
         assert_eq!(
-            anim.frames[0].images[0].pixels,
+            anim.frames[0].images[0].to_rgba8(),
             solid_rgba(8, [255, 255, 255, 255])
         );
         assert_eq!(
-            anim.frames[1].images[0].pixels,
+            anim.frames[1].images[0].to_rgba8(),
             solid_rgba(8, [0, 0, 0, 255])
         );
     }
@@ -987,8 +840,8 @@ mod ani_write_tests {
         let multi = AniWriteFrame {
             icon_type: IconType::Ico,
             images: vec![
-                IconImage::from_rgba(8, 8, solid_rgba(8, [9, 8, 7, 255])),
-                IconImage::from_rgba(16, 16, solid_rgba(16, [1, 1, 1, 255])),
+                IcoImage::from_rgba8(8, 8, solid_rgba(8, [9, 8, 7, 255])).unwrap(),
+                IcoImage::from_rgba8(16, 16, solid_rgba(16, [1, 1, 1, 255])).unwrap(),
             ],
         };
         let bytes = write_ani(std::slice::from_ref(&multi), &all_bmp_opts()).unwrap();
@@ -1002,8 +855,9 @@ mod ani_write_tests {
 
     #[test]
     fn write_ani_cur_frame_round_trips_hotspot() {
-        let mut img = IconImage::from_rgba(16, 16, solid_rgba(16, [3, 3, 3, 255]));
-        img.hotspot = Some(HotSpot { x: 4, y: 5 });
+        let img = IcoImage::from_rgba8(16, 16, solid_rgba(16, [3, 3, 3, 255]))
+            .unwrap()
+            .with_hotspot(HotSpot { x: 4, y: 5 });
         let cur = AniWriteFrame {
             icon_type: IconType::Cur,
             images: vec![img],
@@ -1109,7 +963,7 @@ mod ani_write_tests {
         for _ in 0..16 {
             expect_red.extend_from_slice(&red);
         }
-        assert_eq!(anim.frames[0].images[0].pixels, expect_red);
+        assert_eq!(anim.frames[0].images[0].to_rgba8(), expect_red);
         assert_eq!(anim.steps.len(), 2);
         assert!(anim.steps.iter().all(|s| s.jiffies == 7));
     }
@@ -1133,7 +987,7 @@ mod ani_write_tests {
         assert_eq!((img.width, img.height), (3, 2));
         assert_eq!(img.bit_depth, 24);
         // Every pixel: source RGB, alpha snapped to opaque.
-        for px in img.pixels.chunks_exact(4) {
+        for px in img.to_rgba8().chunks_exact(4) {
             assert_eq!(&px[0..3], &[10, 20, 200]);
             assert_eq!(px[3], 255);
         }

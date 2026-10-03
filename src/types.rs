@@ -30,15 +30,14 @@ pub struct HotSpot {
     pub y: u16,
 }
 
-/// One decoded sub-image from an ICO / CUR, or an input image for the
-/// writer. Always stores pixels as `Rgba` in top-down order (row 0 =
-/// top), regardless of what the on-disk encoding was.
-///
-/// `sub_format` is purely advisory on the decode path — it records
-/// what the original container entry used so callers can decide
-/// whether to re-encode faithfully. On the write path, it's a hint
-/// the writer may override based on `WriteOptions` (e.g. force all
-/// images to PNG for compactness).
+/// The pre-contract sub-image record: top-down RGBA `pixels` plus the
+/// on-disk depth / encoding / hotspot. Superseded by [`crate::IcoImage`]
+/// (the image-crate contract shape: the same RGBA bytes as a
+/// [`crate::Plane`], plus `color` / `metadata`); the two convert into
+/// each other with `From`, and the deprecated [`crate::read_ico`] /
+/// [`crate::write_ico`] wrappers keep speaking this type for one
+/// release.
+#[deprecated(note = "use oxideav_ico::IcoImage (IMAGE_CRATE_API)")]
 #[derive(Debug, Clone)]
 pub struct IconImage {
     pub width: u32,
@@ -46,18 +45,15 @@ pub struct IconImage {
     /// Pixels in top-down RGBA order, tightly packed, stride =
     /// `width * 4`.
     pub pixels: Vec<u8>,
-    /// Bits per pixel the source entry claimed. Useful when roundtripping
-    /// (so 1-bpp icons stay 1-bpp, 32-bpp stay 32-bpp). On encode paths
-    /// we only produce 32-bpp BMP / 32-bpp PNG today, so this is
-    /// ignored for writes.
+    /// Bits per pixel the source entry claimed (or the depth the writer
+    /// should target under `per_image_bit_depth`).
     pub bit_depth: u8,
     pub sub_format: IconSubFormat,
-    /// `Some` for CUR entries, `None` for ICO entries (or when the
-    /// caller doesn't care). Ignored unless the containing file type
-    /// is `Cur`.
+    /// `Some` for CUR entries, `None` for ICO entries.
     pub hotspot: Option<HotSpot>,
 }
 
+#[allow(deprecated)]
 impl IconImage {
     /// Build an `IconImage` from top-down RGBA pixels.
     pub fn from_rgba(width: u32, height: u32, pixels: Vec<u8>) -> Self {
@@ -71,26 +67,48 @@ impl IconImage {
         }
     }
 
-    /// Builder-style setter for [`IconImage::bit_depth`] — the BMP depth
-    /// the writer should target for this sub-image when
-    /// [`WriteOptions::per_image_bit_depth`] is enabled. Returns `self`
-    /// so it chains off [`IconImage::from_rgba`]:
-    ///
-    /// ```
-    /// # use oxideav_ico::IconImage;
-    /// let im = IconImage::from_rgba(16, 16, vec![0; 16 * 16 * 4]).with_bit_depth(8);
-    /// assert_eq!(im.bit_depth, 8);
-    /// ```
+    /// Builder-style setter for [`IconImage::bit_depth`].
     pub fn with_bit_depth(mut self, bit_depth: u8) -> Self {
         self.bit_depth = bit_depth;
         self
     }
 
     /// Builder-style setter for [`IconImage::hotspot`] (CUR entries).
-    /// Returns `self` so it chains off [`IconImage::from_rgba`].
     pub fn with_hotspot(mut self, hotspot: HotSpot) -> Self {
         self.hotspot = Some(hotspot);
         self
+    }
+}
+
+#[allow(deprecated)]
+impl From<crate::IcoImage> for IconImage {
+    /// The contract image's RGBA plane (row padding removed) plus its
+    /// extras; `color` / `metadata` are dropped (the legacy record has
+    /// no place for them).
+    fn from(im: crate::IcoImage) -> Self {
+        let pixels = im.to_rgba8();
+        Self {
+            width: im.width,
+            height: im.height,
+            pixels,
+            bit_depth: im.bit_depth,
+            sub_format: im.sub_format,
+            hotspot: im.hotspot,
+        }
+    }
+}
+
+#[allow(deprecated)]
+impl TryFrom<IconImage> for crate::IcoImage {
+    type Error = crate::IcoError;
+    /// Wrap the legacy RGBA buffer as the contract image (validating the
+    /// `4 × width × height` length); colour is
+    /// [`crate::ColorInfo::ico_default`], metadata empty.
+    fn try_from(im: IconImage) -> crate::Result<Self> {
+        Ok(crate::IcoImage::from_rgba8(im.width, im.height, im.pixels)?
+            .with_bit_depth(im.bit_depth)
+            .with_sub_format(im.sub_format)
+            .with_hotspot(im.hotspot))
     }
 }
 
@@ -148,7 +166,7 @@ impl BmpBitDepth {
     /// Recognises the legal ICO depths `1/4/8/24/32`; `16` (which the
     /// reader accepts but the writer has no encoder for) and any other
     /// value map to `None`. Used by the per-image-depth write path to
-    /// turn a decoded [`IconImage::bit_depth`] back into an encode
+    /// turn a decoded [`crate::IcoImage::bit_depth`] back into an encode
     /// choice for a faithful round-trip.
     pub fn from_bits(bits: u8) -> Option<Self> {
         match bits {
@@ -162,43 +180,27 @@ impl BmpBitDepth {
     }
 }
 
-/// Options for the writer. Defaults favour modern icons (PNG for
-/// larger sub-images, BMP for smaller ones), matching what the
-/// Windows 10+ icon tooling produces.
+/// The pre-contract writer options, kept for the deprecated
+/// [`crate::write_ico`] / [`crate::write_ani`] paths. Superseded by
+/// [`crate::EncodeOptions`], which adds the directory type and metadata
+/// embedding as fields. Note the different PNG routing default: this
+/// record keeps its historical `Some(64)`, the contract options follow
+/// the format reference's `Some(256)` convention.
+#[deprecated(note = "use oxideav_ico::EncodeOptions (IMAGE_CRATE_API)")]
 #[derive(Debug, Clone, Copy)]
 pub struct WriteOptions {
     /// When `Some(n)`, use PNG for any sub-image whose smaller
     /// dimension is ≥ `n`; else BMP. When `None`, force BMP on every
-    /// sub-image (legacy / maximum-compat write).
-    ///
-    /// Default: `Some(64)` — 64×64 and up go PNG, smaller ones stay
-    /// BMP so they still render on Windows XP-era loaders that don't
-    /// understand PNG-in-ICO.
+    /// sub-image. Default `Some(64)`.
     pub png_size_threshold: Option<u32>,
-    /// Bit depth for the BMP-DIB path. Default [`BmpBitDepth::Bgra32`]
-    /// (the historical 32-bpp output). Set to an indexed or 24-bpp
-    /// variant to emit compact, legacy-faithful sub-images; the writer
-    /// quantises each BMP-bound sub-image to the requested depth and
-    /// errors if an indexed depth can't hold the image's colour count.
-    /// Ignored for any sub-image the size threshold routes to PNG, and
-    /// overridden per-image when [`WriteOptions::per_image_bit_depth`]
-    /// is set.
+    /// Bit depth for the BMP-DIB path. Default [`BmpBitDepth::Bgra32`].
     pub bmp_bit_depth: BmpBitDepth,
-    /// When `true`, each BMP-bound sub-image is encoded at the depth its
-    /// own [`IconImage::bit_depth`] field names (via
-    /// [`BmpBitDepth::from_bits`]) instead of the single
-    /// [`WriteOptions::bmp_bit_depth`]. This lets one `write_ico` call
-    /// emit a faithful **mixed-depth** multi-resolution icon — e.g. a
-    /// decoded `.ico` carrying a legacy 1-bpp 16×16 next to a 32-bpp
-    /// 32×32 re-encodes each entry at its original depth. A
-    /// `bit_depth` the writer can't encode (`16`, or anything outside
-    /// `1/4/8/24/32`) falls back to [`WriteOptions::bmp_bit_depth`].
-    ///
-    /// Default `false` — every BMP sub-image uses the single
-    /// `bmp_bit_depth`, preserving the historical behaviour.
+    /// Encode each BMP-bound sub-image at its own `bit_depth`. Default
+    /// `false`.
     pub per_image_bit_depth: bool,
 }
 
+#[allow(deprecated)]
 impl Default for WriteOptions {
     fn default() -> Self {
         Self {
@@ -209,20 +211,44 @@ impl Default for WriteOptions {
     }
 }
 
+#[allow(deprecated)]
+impl WriteOptions {
+    /// The equivalent [`crate::EncodeOptions`] for `icon_type`.
+    pub fn into_encode_options(self, icon_type: IconType) -> crate::EncodeOptions {
+        crate::EncodeOptions::new()
+            .with_icon_type(icon_type)
+            .with_png_size_threshold(self.png_size_threshold)
+            .with_bmp_bit_depth(self.bmp_bit_depth)
+            .with_per_image_bit_depth(self.per_image_bit_depth)
+    }
+}
+
 /// The three directory-row facts the sub-image selectors compare on:
-/// pixel dimensions plus advertised bit depth. Both [`IconImage`]
-/// (decoded RGBA) and [`IconEntryRaw`] (undecoded directory row +
-/// payload bytes) expose these, so the selection heuristics work over
-/// either without forcing the caller to decode every body just to pick
-/// one. The free `select_*` functions take `&[IconImage]`; the
-/// `select_*_raw` functions take `&[IconEntryRaw]` and share the exact
-/// same tie-break rules through this trait.
-pub(crate) trait Selectable {
+/// pixel dimensions plus advertised bit depth. [`crate::IcoImage`], the
+/// legacy [`IconImage`] and [`IconEntryRaw`](crate::IconEntryRaw) (undecoded directory row +
+/// payload bytes) all expose these, so the `select_*` heuristics work
+/// over any of them with the same tie-break rules. Implementation
+/// detail of the selectors; not a stable extension point.
+#[doc(hidden)]
+pub trait Selectable {
     fn sel_width(&self) -> u32;
     fn sel_height(&self) -> u32;
     fn sel_bit_depth(&self) -> u8;
 }
 
+impl Selectable for crate::IcoImage {
+    fn sel_width(&self) -> u32 {
+        self.width
+    }
+    fn sel_height(&self) -> u32 {
+        self.height
+    }
+    fn sel_bit_depth(&self) -> u8 {
+        self.bit_depth
+    }
+}
+
+#[allow(deprecated)]
 impl Selectable for IconImage {
     fn sel_width(&self) -> u32 {
         self.width
@@ -348,11 +374,11 @@ pub(crate) fn select_by_dimensions_impl<T: Selectable>(
 /// fits any target up to 32 px).
 ///
 /// See [`select_best_fit_raw`] for the directory-level variant that
-/// runs the same heuristic over undecoded [`IconEntryRaw`] rows — so a
+/// runs the same heuristic over undecoded [`IconEntryRaw`](crate::IconEntryRaw) rows — so a
 /// caller can pick a sub-image *before* spending a PNG / BMP decode on
 /// it (exactly the order Windows' `LookupIconIdFromDirectoryEx` works
 /// in).
-pub fn select_best_fit(images: &[IconImage], target: u32) -> Option<usize> {
+pub fn select_best_fit<T: Selectable>(images: &[T], target: u32) -> Option<usize> {
     select_best_fit_impl(images, target)
 }
 
@@ -364,8 +390,8 @@ pub fn select_best_fit(images: &[IconImage], target: u32) -> Option<usize> {
 /// multi-resolution `.ico` to feed a thumbnail pipeline.
 ///
 /// See [`select_largest_raw`] for the directory-level variant over
-/// undecoded [`IconEntryRaw`] rows.
-pub fn select_largest(images: &[IconImage]) -> Option<usize> {
+/// undecoded [`IconEntryRaw`](crate::IconEntryRaw) rows.
+pub fn select_largest<T: Selectable>(images: &[T]) -> Option<usize> {
     select_largest_impl(images)
 }
 
@@ -388,8 +414,8 @@ pub fn select_largest(images: &[IconImage]) -> Option<usize> {
 /// acceptable.
 ///
 /// See [`select_by_dimensions_raw`] for the directory-level variant
-/// over undecoded [`IconEntryRaw`] rows.
-pub fn select_by_dimensions(images: &[IconImage], width: u32, height: u32) -> Option<usize> {
+/// over undecoded [`IconEntryRaw`](crate::IconEntryRaw) rows.
+pub fn select_by_dimensions<T: Selectable>(images: &[T], width: u32, height: u32) -> Option<usize> {
     select_by_dimensions_impl(images, width, height)
 }
 
@@ -397,7 +423,7 @@ pub fn select_by_dimensions(images: &[IconImage], width: u32, height: u32) -> Op
 // Directory-level (raw) selection.
 //
 // These mirror the decoded `select_*` family but run against the
-// undecoded [`IconEntryRaw`] directory rows `read_ico_raw` produces.
+// undecoded [`IconEntryRaw`](crate::IconEntryRaw) directory rows `read_ico_raw` produces.
 // Windows' own `LookupIconIdFromDirectoryEx` picks a directory entry
 // from its `bWidth` / `bHeight` / `wBitCount` *before* the sub-image
 // body is ever decoded; these helpers let a caller follow that order —
@@ -413,7 +439,7 @@ pub fn select_by_dimensions(images: &[IconImage], width: u32, height: u32) -> Op
 // same generic core.
 // ---------------------------------------------------------------------------
 
-/// Directory-level [`select_best_fit`]: pick the [`IconEntryRaw`] whose
+/// Directory-level [`select_best_fit`]: pick the [`IconEntryRaw`](crate::IconEntryRaw) whose
 /// stored size best fits `target`, returning its index in `entries`.
 ///
 /// Identical heuristic to [`select_best_fit`] — smallest entry whose
@@ -431,14 +457,14 @@ pub fn select_best_fit_raw(entries: &[crate::raw::IconEntryRaw], target: u32) ->
 }
 
 /// Directory-level [`select_largest`]: pick the largest-area
-/// [`IconEntryRaw`] (highest-bit-depth tie-break) without decoding any
+/// [`IconEntryRaw`](crate::IconEntryRaw) (highest-bit-depth tie-break) without decoding any
 /// payload. Returns `None` only when `entries` is empty.
 pub fn select_largest_raw(entries: &[crate::raw::IconEntryRaw]) -> Option<usize> {
     select_largest_impl(entries)
 }
 
 /// Directory-level [`select_by_dimensions`]: strict pixel-exact lookup
-/// over the undecoded [`IconEntryRaw`] rows. Returns the index of the
+/// over the undecoded [`IconEntryRaw`](crate::IconEntryRaw) rows. Returns the index of the
 /// row whose stored `width × height` equals the request (highest bit
 /// depth wins when several rows share that size), or `None` when no row
 /// matches — no nearest-fit substitution (that's [`select_best_fit_raw`]).
@@ -454,15 +480,15 @@ pub fn select_by_dimensions_raw(
 mod tests {
     use super::*;
 
-    fn img(w: u32, h: u32, bpp: u8) -> IconImage {
-        let mut im = IconImage::from_rgba(w, h, vec![0u8; (w * h * 4) as usize]);
-        im.bit_depth = bpp;
-        im
+    fn img(w: u32, h: u32, bpp: u8) -> crate::IcoImage {
+        crate::IcoImage::from_rgba8(w, h, vec![0u8; (w * h * 4) as usize])
+            .unwrap()
+            .with_bit_depth(bpp)
     }
 
     #[test]
     fn select_largest_empty() {
-        assert!(select_largest(&[]).is_none());
+        assert!(select_largest::<crate::IcoImage>(&[]).is_none());
     }
 
     #[test]
@@ -481,7 +507,7 @@ mod tests {
 
     #[test]
     fn select_best_fit_empty() {
-        assert!(select_best_fit(&[], 32).is_none());
+        assert!(select_best_fit::<crate::IcoImage>(&[], 32).is_none());
     }
 
     #[test]
@@ -532,7 +558,7 @@ mod tests {
 
     #[test]
     fn select_by_dimensions_empty() {
-        assert!(select_by_dimensions(&[], 32, 32).is_none());
+        assert!(select_by_dimensions::<crate::IcoImage>(&[], 32, 32).is_none());
     }
 
     #[test]
@@ -658,7 +684,7 @@ mod tests {
         // whole point of sharing the generic core. Mixed sizes + a
         // legacy/modern bit-depth tie at 32×32.
         let facts = [(16u32, 16u32, 1u8), (32, 32, 1), (32, 32, 32), (64, 64, 32)];
-        let images: Vec<IconImage> = facts.iter().map(|&(w, h, b)| img(w, h, b)).collect();
+        let images: Vec<crate::IcoImage> = facts.iter().map(|&(w, h, b)| img(w, h, b)).collect();
         let entries: Vec<crate::raw::IconEntryRaw> =
             facts.iter().map(|&(w, h, b)| entry(w, h, b)).collect();
 

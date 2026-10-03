@@ -996,7 +996,7 @@ pub fn quantise_rgba_to_indexed(
             Some(p) => p,
             None => {
                 if palette.len() >= capacity {
-                    return Err(Error::invalid(format!(
+                    return Err(Error::unsupported(format!(
                         "ICO: image needs more than {capacity} colours — won't fit a \
                          {bpp}-bpp palette (use a deeper bit depth or pre-quantise)"
                     )));

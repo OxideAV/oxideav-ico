@@ -470,7 +470,14 @@ impl Demuxer for AniDemuxer {
 mod tests {
     use super::*;
     use crate::ani::{AF_ICON, AF_SEQUENCE};
-    use crate::{write_ico, IconImage, IconType, WriteOptions};
+    use crate::{encode_images, EncodeOptions, IcoImage, IconType};
+
+    /// All-DIB encode options for `icon_type`.
+    fn dib_opts(icon_type: IconType) -> EncodeOptions {
+        EncodeOptions::new()
+            .with_icon_type(icon_type)
+            .with_png_size_threshold(None)
+    }
     use oxideav_core::NullCodecResolver;
     use std::io::{Cursor, Seek, Write};
     use std::sync::{Arc, Mutex};
@@ -512,16 +519,8 @@ mod tests {
             .take((n * n) as usize)
             .flatten()
             .collect();
-        let img = IconImage::from_rgba(n, n, pixels);
-        write_ico(
-            IconType::Ico,
-            &[img],
-            WriteOptions {
-                png_size_threshold: None,
-                ..Default::default()
-            },
-        )
-        .unwrap()
+        let img = IcoImage::from_rgba8(n, n, pixels).unwrap();
+        encode_images(&[img], &dib_opts(IconType::Ico)).unwrap()
     }
 
     fn push_chunk(buf: &mut Vec<u8>, tag: &[u8; 4], payload: &[u8]) {
@@ -599,32 +598,26 @@ mod tests {
         // one packet per sub-image, in directory order, each packet
         // carrying that entry's raw payload bytes.
         let imgs = vec![
-            IconImage::from_rgba(
+            IcoImage::from_rgba8(
                 8,
                 8,
                 std::iter::repeat([1u8, 2, 3, 255])
                     .take(64)
                     .flatten()
                     .collect(),
-            ),
-            IconImage::from_rgba(
+            )
+            .unwrap(),
+            IcoImage::from_rgba8(
                 16,
                 16,
                 std::iter::repeat([9u8, 9, 9, 255])
                     .take(256)
                     .flatten()
                     .collect(),
-            ),
+            )
+            .unwrap(),
         ];
-        let bytes = write_ico(
-            IconType::Ico,
-            &imgs,
-            WriteOptions {
-                png_size_threshold: None,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let bytes = encode_images(&imgs, &dib_opts(IconType::Ico)).unwrap();
 
         let mut dx = open_ico(&bytes).unwrap();
         assert_eq!(dx.format_name(), "ico");
@@ -650,24 +643,17 @@ mod tests {
 
     #[test]
     fn ico_demuxer_surfaces_cur_hotspot_in_extradata() {
-        let mut img = IconImage::from_rgba(
+        let img = IcoImage::from_rgba8(
             16,
             16,
             std::iter::repeat([7u8, 7, 7, 255])
                 .take(256)
                 .flatten()
                 .collect(),
-        );
-        img.hotspot = Some(crate::HotSpot { x: 5, y: 9 });
-        let bytes = write_ico(
-            IconType::Cur,
-            &[img],
-            WriteOptions {
-                png_size_threshold: None,
-                ..Default::default()
-            },
         )
-        .unwrap();
+        .unwrap()
+        .with_hotspot(crate::HotSpot { x: 5, y: 9 });
+        let bytes = encode_images(&[img], &dib_opts(IconType::Cur)).unwrap();
         let dx = open_ico(&bytes).unwrap();
         let ed = &dx.streams()[0].params.extradata;
         assert_eq!(ed.len(), 4);
@@ -686,17 +672,9 @@ mod tests {
             .take(64)
             .flatten()
             .collect::<Vec<_>>();
-        let a = IconImage::from_rgba(8, 8, body.clone());
-        let b = IconImage::from_rgba(8, 8, body);
-        let mut bytes = write_ico(
-            IconType::Ico,
-            &[a, b],
-            WriteOptions {
-                png_size_threshold: None,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let a = IcoImage::from_rgba8(8, 8, body.clone()).unwrap();
+        let b = IcoImage::from_rgba8(8, 8, body).unwrap();
+        let mut bytes = encode_images(&[a, b], &dib_opts(IconType::Ico)).unwrap();
         // Entry 1's dwImageOffset lives at file offset 6 + 16 + 12 = 34.
         // Point it at entry 0's payload start (just past the directory).
         let dir_end = (6 + 16 * 2) as u32;
@@ -712,38 +690,32 @@ mod tests {
 
     #[test]
     fn ico_muxer_round_trips_through_demuxer() {
-        // Build an ICO via write_ico, demux it into streams + packets,
+        // Build an ICO via encode_images, demux it into streams + packets,
         // then re-mux those through the framework IcoMuxer and confirm
         // the muxed bytes parse back to the same two sub-images. Covers
         // open_muxer / write_header / write_packet / write_trailer, which
         // had no test.
         let imgs = vec![
-            IconImage::from_rgba(
+            IcoImage::from_rgba8(
                 8,
                 8,
                 std::iter::repeat([1u8, 2, 3, 255])
                     .take(64)
                     .flatten()
                     .collect(),
-            ),
-            IconImage::from_rgba(
+            )
+            .unwrap(),
+            IcoImage::from_rgba8(
                 16,
                 16,
                 std::iter::repeat([9u8, 8, 7, 255])
                     .take(256)
                     .flatten()
                     .collect(),
-            ),
+            )
+            .unwrap(),
         ];
-        let src = write_ico(
-            IconType::Ico,
-            &imgs,
-            WriteOptions {
-                png_size_threshold: None,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let src = encode_images(&imgs, &dib_opts(IconType::Ico)).unwrap();
 
         let mut dx = open_ico(&src).unwrap();
         let streams: Vec<StreamInfo> = dx.streams().to_vec();
