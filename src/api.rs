@@ -432,6 +432,29 @@ pub fn encode_entry(im: &IcoImage, opts: &EncodeOptions) -> Result<IconEntryRaw>
     })
 }
 
+/// Transitional adapter over `oxideav_png::PngImage::new`, which is
+/// infallible in the published `0.1.x` line and returns
+/// `Result<PngImage, PngError>` from the image-crate fleet sweep onward
+/// (fallible constructors ruling). Both shapes implement this trait, so
+/// the crate builds against the published png as well as a path-patched
+/// tree at the same version. Remove — and call `?` directly — once the
+/// lower bound is `oxideav-png = "0.2"`.
+trait PngConstructed {
+    fn into_png_result(self) -> std::result::Result<oxideav_png::PngImage, oxideav_png::PngError>;
+}
+
+impl PngConstructed for oxideav_png::PngImage {
+    fn into_png_result(self) -> std::result::Result<oxideav_png::PngImage, oxideav_png::PngError> {
+        Ok(self)
+    }
+}
+
+impl PngConstructed for std::result::Result<oxideav_png::PngImage, oxideav_png::PngError> {
+    fn into_png_result(self) -> std::result::Result<oxideav_png::PngImage, oxideav_png::PngError> {
+        self
+    }
+}
+
 fn encode_png_payload(im: &IcoImage, rgba: &[u8], opts: &EncodeOptions) -> Result<Vec<u8>> {
     let mut png = oxideav_png::PngImage::new(
         im.width,
@@ -441,7 +464,8 @@ fn encode_png_payload(im: &IcoImage, rgba: &[u8], opts: &EncodeOptions) -> Resul
             im.width as usize * 4,
             rgba.to_vec(),
         )],
-    );
+    )
+    .into_png_result()?;
     if im.color.is_specified() {
         png = png.with_color(color_to_png(&im.color));
     }

@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Sub-image decode / encode go through `oxideav_bmp::decode_dib_with` / `encode_dib` and `oxideav_png::decode_with` / `encode` (the standalone layer) instead of the `VideoFrame`-shaped wrappers; the PNG path carries `color` / `metadata` (sRGB / cICP / iCCP / gAMA / eXIf / XMP) both ways, the DIB path a V4 / V5 sRGB tag and V5 ICC profile
 - `Cargo.toml` sets `exclude = ["/tests", "/fuzz"]`; the `ci-standalone` job runs the full test suite and clippy with `--no-default-features`
 - fuzz: new `ico_contract` target drives `probe` / `info` / `decode` / `decode_all` / `decode_rgba8` / `decode_with` on arbitrary bytes with geometry invariants, limit checks and an `encode_all` re-encode pin
+- **Fleet sweep (round 470).** The embedded-PNG encode path builds its `PngImage` through a private adapter that accepts both the published `oxideav-png` 0.1.x infallible `PngImage::new` and the fallible `Result` form the png fleet sweep introduces, so the crate compiles against either until the lower bound tightens to `"0.2"`. Checklist re-verified with no other change: fallible `IcoImage` constructors, `exclude = ["/tests", "/fuzz"]`, `encode_all`, `Rgba` registry output, `ico_default` colour not stamped on frames, contract record shapes
 
 ### Deprecated
 
