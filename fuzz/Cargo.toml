@@ -15,6 +15,9 @@ cargo-fuzz = true
 # * `ico_self_roundtrip` — RGBA → codec encode → codec decode → RGBA
 #   pixel-equality. Catches encoder bugs that emit corrupt sub-images
 #   and decoder bugs that mis-parse legitimate output.
+# * `ico_contract` — arbitrary bytes → the standalone image-crate API
+#   (`probe` / `info` / `decode` / `decode_all` / `decode_rgba8`) with
+#   geometry invariants and a lossless `encode_all` re-encode pin.
 # * `ico_raw_parser` — arbitrary bytes → standalone `read_ico_raw`
 #   container parser, then writer round-trip on accepted inputs. Catches
 #   panics / overflows / OOB in the directory walker, the RIFF/ACON
@@ -73,5 +76,16 @@ doc = false
 [[bin]]
 name = "ani_raw_parser"
 path = "fuzz_targets/ani_raw_parser.rs"
+test = false
+doc = false
+
+# Standalone contract-surface harness. Drives `probe` / `info` /
+# `decode` / `decode_all` / `decode_rgba8` on arbitrary bytes with no
+# `oxideav-core` involved, checks the geometry invariants every decoded
+# sub-image must satisfy, and re-encodes accepted files through
+# `encode_all` as a lossless pin.
+[[bin]]
+name = "ico_contract"
+path = "fuzz_targets/ico_contract.rs"
 test = false
 doc = false

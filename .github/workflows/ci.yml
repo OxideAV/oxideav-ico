@@ -6,12 +6,17 @@ name: CI
 #   which exercises the registry-integrated path (oxideav-core dep +
 #   Decoder/Encoder trait impls + oxideav-bmp/oxideav-png sub-image
 #   decoders).
-# * `ci-standalone` (no-default-features) — inline job that builds and
-#   tests the lib with `--no-default-features`, exercising the
-#   `oxideav-core`-free standalone path (`read_ico_raw` /
-#   `write_ico_raw`). Catches regressions where the container parser
-#   accidentally regrows an oxideav-core / oxideav-bmp / oxideav-png
-#   import.
+# * `ci-standalone` (no-default-features) — inline job that builds,
+#   tests and clippy-checks the crate with `--no-default-features`,
+#   exercising the `oxideav-core`-free standalone layer (the whole
+#   image-crate contract: `probe` / `info` / `decode*` / `encode*`, plus
+#   `read_ico_raw` / `write_ico_raw` / the ANI model). Catches
+#   regressions where the standalone path accidentally regrows an
+#   oxideav-core import.
+#
+# Both paths resolve `oxideav-bmp` / `oxideav-png` from crates.io (the
+# newest 0.1.x / 0.2.x — the crate needs their image-crate-contract
+# surface, first published as bmp 0.1.7 / png 0.1.11).
 
 on:
   push:
@@ -43,7 +48,10 @@ jobs:
           key: standalone
 
       - name: Build (no-default-features)
-        run: cargo build --no-default-features --lib --verbose
+        run: cargo build --no-default-features --verbose
 
       - name: Test (no-default-features)
-        run: cargo test --no-default-features --lib --verbose
+        run: cargo test --no-default-features --verbose
+
+      - name: Clippy (no-default-features)
+        run: cargo clippy --no-default-features --all-targets --no-deps -- -D warnings
