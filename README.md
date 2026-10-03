@@ -2,148 +2,239 @@
 
 [![CI](https://github.com/OxideAV/oxideav-ico/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-ico/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-ico.svg)](https://crates.io/crates/oxideav-ico) [![docs.rs](https://docs.rs/oxideav-ico/badge.svg)](https://docs.rs/oxideav-ico) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Pure-Rust **ICO** + **CUR** (Windows icon / cursor) reader and writer
-for the [`oxideav`](https://github.com/OxideAV/oxideav) framework.
-Handles multi-resolution icons with mixed BMP + PNG sub-images exactly
-the way modern Windows produces them.
+Pure-Rust **ICO** + **CUR** (Windows icon / cursor) and **ANI**
+(animated cursor) reader and writer for the
+[`oxideav`](https://github.com/OxideAV/oxideav) framework, following
+the OxideAV image-crate API contract (`IMAGE_CRATE_API.md` in the
+umbrella). Handles multi-resolution icons with mixed DIB + PNG
+sub-images exactly the way modern Windows produces them.
 
 - `ICONDIR` (`idType = 1` for `.ico`, `2` for `.cur`)
-- N × `ICONDIRENTRY` → PNG body (sniffed by magic) or BMP DIB body
-  (doubled `biHeight` + 1-bpp AND mask)
-- BMP sub-images at 1/4/8-bpp indexed (palette + AND mask), 24-bpp
-  BGR, and 32-bpp BGRA — read **and** write, with mixed depths in a
-  single multi-resolution file
+- N × `ICONDIRENTRY` → PNG body (sniffed by magic) or DIB body
+  (`BITMAPINFOHEADER`, doubled `biHeight`, 1-bpp AND mask)
+- DIB sub-images at 1/4/8-bpp indexed (palette + AND mask), 16-bpp,
+  24-bpp BGR and 32-bpp BGRA — read **and** (except 16-bpp) write, with
+  mixed depths in a single multi-resolution file
 - CUR hotspot round-tripped via the `planes` / `bit_count` fields
+- ANI (RIFF/`ACON`) animated cursors: raw model, decoded playback,
+  encoders, framework demuxer
 
-## Read
+## Standalone use
+
+```toml
+oxideav-ico = { version = "0.0", default-features = false }
+```
 
 ```rust
-use oxideav_ico::{read_ico, IconType};
-
 let bytes = std::fs::read("app.ico")?;
-let (ty, images) = read_ico(&bytes)?;
-assert!(matches!(ty, IconType::Ico));
-for img in images {
-    println!("{}x{} ({:?}) {} bytes", img.width, img.height, img.sub_format, img.pixels.len());
+if oxideav_ico::probe(&bytes) {
+    let info = oxideav_ico::info(&bytes)?;     // directory walk only: no pixels decoded
+    println!("{} entries, primary {}×{} ({:?})",
+             info.frames, info.width, info.height, info.icon_type);
+
+    let img = oxideav_ico::decode(&bytes)?;    // the largest entry, native Rgba
+    let rgba: Vec<u8> = img.to_rgba8();        // tightly packed, 4 × width bytes per row
+    let (w, h) = (img.width(), img.height());
+
+    // Every entry, in directory order.
+    for frame in oxideav_ico::decode_all(&bytes)? {
+        let im = &frame.image;
+        println!("#{} {}×{} {}-bpp {:?}", frame.index, im.width, im.height, im.bit_depth, im.sub_format);
+    }
+
+    let opts = oxideav_ico::EncodeOptions::default();
+    let out = oxideav_ico::encode_rgba8(w, h, &rgba, &opts)?;   // single-entry icon
+    std::fs::write("copy.ico", out)?;
 }
 ```
 
-Each `IconImage` carries pixels as **top-down RGBA**, tightly packed.
-`sub_format` records whether the source entry was BMP or PNG so
-callers who want a faithful roundtrip can preserve that.
+The whole contract surface works with `default-features = false`: the
+sub-image codecs (`oxideav-bmp` for DIB payloads, `oxideav-png` for
+embedded PNG payloads) are image crates with their own standalone layer
+and are plain dependencies of this crate, so **every** ICO / CUR entry
+decodes standalone — no `oxideav-core` needed.
 
-## Write
+| Item | Notes |
+|---|---|
+| `probe(&[u8]) -> bool` | ICO has no magic: `ICONDIR` + first `ICONDIRENTRY` plausibility (reserved `0`, type `1`/`2`, count ≥ 1, entry reserved `0`, non-empty payload past the directory). RIFF/`ACON` is `false`. Allocation-free. |
+| `info(&[u8]) -> ImageInfo` | Directory walk, no pixels. Contract fields describe the primary entry; `frames` = entry count. Extras: `icon_type`, `primary` (index), `bit_depth`, `sub_format`, `hotspot`, `entries: Vec<IcoEntryInfo>` (every row). |
+| `decode(&[u8]) -> IcoImage` | The **primary** entry: largest by area, highest bit depth breaking a tie (`EntrySelection::Largest`). |
+| `decode_with(&[u8], &DecodeOptions)` | Limits, `strict`, and `entry: EntrySelection` (`Largest` / `Index(i)` / `BestFit(px)` / `Dimensions(w, h)`). |
+| `decode_rgb8` / `decode_rgba8` | The primary entry as packed `RgbImage` / `RgbaImage`. |
+| `decode_all(&[u8]) -> Vec<Frame>` | Every entry in directory order; `Frame { image, delay: None, index }`. `decode_all_with` takes options (`max_bytes` bounds the sum). |
+| `decode_from<R: Read>` | Reads to end, then `decode`. |
+| `encode(&IcoImage, &EncodeOptions)` | One-entry ICO / CUR (`icon_type` option). PNG or DIB by the size rule below. |
+| `encode_all(&[Frame], &EncodeOptions)` | Multi-entry icon, slice order = directory order (mirror of `decode_all`). `encode_images(&[IcoImage], …)` is the same without the `Frame` wrapper. |
+| `encode_rgb8` / `encode_rgba8` | One-call raw paths (RGB is widened to opaque RGBA). |
+| `encode_to<W: Write>` | Streaming `encode`. |
+| `IcoImage` | `width, height, format: PixelFormat, planes: Vec<Plane>, color: ColorInfo, metadata: Metadata` + extras `bit_depth`, `sub_format`, `hotspot`. `new` / `packed` / `from_rgb8` / `from_rgba8` return `Result`. |
+| `IcoError` (`Error`) | `InvalidData`, `Unsupported`, `LimitExceeded`, `Io(std::io::Error)`. |
 
-```rust
-use oxideav_ico::{write_ico, IconImage, IconType, WriteOptions};
+Beneath the floor: `decode_entry(&IconEntryRaw, &DecodeOptions)` and
+`encode_entry(&IcoImage, &EncodeOptions) -> IconEntryRaw` work on one
+directory entry (pick with the `select_*_raw` family, lay out with
+`write_ico_raw`); `decode_payload` decodes bare sub-image bytes.
 
-let imgs = vec![
-    IconImage::from_rgba(16,  16,  rgba_16),
-    IconImage::from_rgba(32,  32,  rgba_32),
-    IconImage::from_rgba(128, 128, rgba_128),
-    IconImage::from_rgba(256, 256, rgba_256),
-];
-let bytes = write_ico(IconType::Ico, &imgs, WriteOptions::default())?;
-std::fs::write("out.ico", bytes)?;
-```
+### Why every sub-image is `Rgba`
 
-`WriteOptions::default()` switches sub-images ≥ 64 px to PNG and
-keeps smaller ones as BMP — matches what Windows 10+ ships. Set
-`png_size_threshold = None` to force all-BMP (maximum legacy
-compatibility).
+An ICO / CUR sub-image is *defined* as the composition of a colour (XOR)
+bitmap with a 1-bpp transparency (AND) mask ("Compose RGBA: where the
+AND bit is set, output transparent; otherwise use the XOR colour" —
+`docs/image/ico/ico-cur-format.md`, decoder checklist step 6). The
+per-pixel mask cannot ride on an indexed `Pal8` or alpha-less `Bgr24`
+plane, so the one layout that carries every entry completely — whatever
+its on-disk depth, DIB or PNG — is packed `Rgba`. The on-disk depth and
+encoding survive as `IcoImage::bit_depth` / `sub_format`, and
+`EncodeOptions::per_image_bit_depth` re-encodes each entry at that
+depth, so a decode → edit → re-encode cycle stays faithful.
 
-### BMP bit depth
-
-The BMP-DIB path defaults to 32-bpp BGRA (lossless, alpha in the colour
-bits) but can emit any classic `ICONIMAGE` depth via
-`WriteOptions::bmp_bit_depth`:
-
-```rust
-use oxideav_ico::{write_ico, BmpBitDepth, IconImage, IconType, WriteOptions};
-
-let opts = WriteOptions {
-    png_size_threshold: None,            // all-BMP
-    bmp_bit_depth: BmpBitDepth::Indexed8, // 8-bpp palette + AND mask
-    ..Default::default()
-};
-let bytes = write_ico(IconType::Ico, &imgs, opts)?;
-```
-
-- `Bgra32` (default) — 32-bpp BGRA, no colour / transparency limits.
-- `Rgb24` — 24-bpp BGR; alpha collapses to the 1-bpp AND mask.
-- `Indexed8` / `Indexed4` / `Indexed1` — indexed DIB with a colour
-  table built by exact-colour collection (≤ 256 / 16 / 2 distinct
-  opaque colours) plus a 1-bpp AND mask. The writer errors with the
-  offending entry index when an image needs more colours than the
-  depth's palette can hold, so a successful encode is always
-  colour-exact.
-
-Indexed / 24-bpp bodies are built in-crate (the doubled-`biHeight` +
-AND-mask packing is intrinsic to the ICO sub-image): a
-`BITMAPINFOHEADER`, the RGBQUAD palette (indexed only), bottom-up XOR
-rows at the chosen depth, then the bottom-up 1-bpp AND mask. The
-directory `wBitCount` is written to match the body's `biBitCount` so a
-re-read passes the directory-vs-body cross-check. The lower-level
-`encode_indexed_dib_body` / `encode_rgb24_dib_body` /
-`quantise_rgba_to_indexed` (and the `PaletteEntry` type) are exported
-for callers driving the framework-free `write_ico_raw` directly.
-
-#### Mixed-depth multi-resolution icons
-
-A real-world `.ico` often mixes depths — a legacy 1-bpp 16×16 next to a
-32-bpp 256×256 PNG. Set `per_image_bit_depth = true` and each BMP-bound
-sub-image is encoded at the depth its own `IconImage::bit_depth` names
-(`BmpBitDepth::from_bits` maps `1/4/8/24/32`); an unencodable value
-(e.g. `16`) falls back to `bmp_bit_depth`. This lets one `write_ico`
-call re-emit a decoded mixed-depth icon faithfully.
-
-A 256×256 sub-image is the canonical large-icon case: the directory's
-single-byte width/height fields can't hold 256, so they serialise as
-`0` (the `0 == 256` convention) and the true size is recovered from
-the PNG body's IHDR on read. `write_ico` rejects any sub-image outside
-`1..=256` in either axis up front — before the encode pass — since the
-directory physically cannot describe it.
-
-## CUR
+## Framework use
 
 ```rust
-use oxideav_ico::{write_ico, HotSpot, IconImage, IconType, WriteOptions};
-
-let mut cur = IconImage::from_rgba(32, 32, rgba_32);
-cur.hotspot = Some(HotSpot { x: 10, y: 12 });
-let bytes = write_ico(IconType::Cur, &[cur], WriteOptions::default())?;
+let mut ctx = oxideav_core::RuntimeContext::new();
+oxideav_ico::register(&mut ctx);
+// "ico" codec (one sub-image payload per packet), "ico" demuxer + muxer
+// (.ico / .cur), "ani" demuxer are now available to the pipeline / CLI.
 ```
 
-## Registration
+With the default-on `registry` feature: `register(&mut RuntimeContext)`
+(also `register_codecs` / `register_containers` / `register_registries`
+for separately held registries), `make_decoder` / `make_encoder`,
+`From<IcoImage> for VideoFrame` and `IcoImage::from_video_frame(&frame,
+&params)` / `TryFrom<(&VideoFrame, &CodecParameters)>`. The framework
+`Decoder` / `Encoder` call the standalone `decode_payload` /
+`encode_entry` — one implementation.
 
-```rust
-let mut codecs = oxideav_codec::CodecRegistry::new();
-let mut containers = oxideav_container::ContainerRegistry::new();
-oxideav_ico::register(&mut codecs, &mut containers);
-// "ico" codec + container are now available to the pipeline / CLI.
-```
+The `"ico"` demuxer emits one stream + one packet per directory entry
+(the raw PNG / DIB payload; CUR hotspots as 4-byte extradata); the
+`"ico"` codec decodes a payload to an `Rgba` frame and encodes an
+`Rgba` / `Bgra` / `Rgb24` / `Bgr24` frame to a payload, with
+`EncodeOptions` exposed as codec options (`png_size_threshold`,
+`bmp_bit_depth`, `per_image_bit_depth`, `embed_metadata`, `icon_type`).
+Registry frames carry a colour-signal side-channel **only** when the
+payload signalled colour (an embedded PNG's `sRGB` / `cICP` / `iCCP`, a
+V4 / V5 DIB tag); the crate's `ico_default` convention is never stamped.
 
-The framework `Demuxer` shares the same `read_ico_raw` directory walk
-as the standalone API, so it inherits the full validation surface below
-(overlap rejection, range checks, directory-vs-body cross-checks) rather
-than a thinner copy — the demuxer and `read_ico_raw` can never disagree
-on what a well-formed file is.
+The framework `Demuxer` shares the `read_ico_raw` directory walk with
+the standalone API, so it inherits the full validation surface below.
+
+## Supported layouts
+
+Decode (every entry composes to one native layout):
+
+| On-disk entry | Native `PixelFormat` | Notes |
+|---|---|---|
+| DIB 1 / 4 / 8-bpp indexed + AND mask | `Rgba` | palette expanded, mask → alpha 0 |
+| DIB 16-bpp (`BI_RGB` 555 / `BI_BITFIELDS`) + AND mask | `Rgba` | mask → alpha 0 |
+| DIB 24-bpp BGR + AND mask | `Rgba` | mask → alpha 0 |
+| DIB 32-bpp BGRA + AND mask | `Rgba` | XOR alpha kept, mask bits force alpha 0 |
+| Embedded PNG (any PNG colour type / depth) | `Rgba` | through `oxideav_png::decode` + `to_rgba8` |
+
+Encode (`IcoImage` is always `Rgba`; the options pick the payload):
+
+| Payload | Selected by | Lossless? |
+|---|---|---|
+| Embedded PNG (RGBA) | smaller side ≥ `png_size_threshold` (default **256**) | yes |
+| DIB 32-bpp BGRA + alpha-derived AND mask | default below the threshold (`BmpBitDepth::Bgra32`) | yes |
+| DIB 24-bpp BGR + AND mask | `BmpBitDepth::Rgb24` | alpha collapses to on/off; colour under alpha 0 lost |
+| DIB 8 / 4 / 1-bpp indexed + AND mask | `BmpBitDepth::Indexed8/4/1` | exact-colour palette (≤ 256 / 16 / 2 opaque colours, else `Unsupported`); colour under alpha 0 lost |
+
+`decode(encode(img)) == img` holds for planes, colour and metadata on
+the PNG and 32-bpp DIB paths (pinned by tests and the `ico_contract`
+fuzz target). Unrepresentable input is `Error::Unsupported`: a
+dimension outside `1..=256` (the directory stores sizes in one byte,
+`0 == 256`), or more colours than an indexed depth holds. Nothing is
+converted silently — ICO has only the one native layout.
+
+## Options
+
+`EncodeOptions` (`#[non_exhaustive]`, `Default`, `with_*`):
+
+| Field | Default | Meaning |
+|---|---|---|
+| `icon_type: IconType` | `Ico` | directory type; CUR writes each image's `hotspot` (`(0, 0)` when `None`) |
+| `png_size_threshold: Option<u32>` | `Some(256)` | PNG when the smaller side is ≥ this; `None` = DIB everywhere; `Some(1)` = PNG everywhere. Follows the format reference ("PNG … used for large icons, typically 256×256") |
+| `bmp_bit_depth: BmpBitDepth` | `Bgra32` | DIB depth: `Bgra32`, `Rgb24`, `Indexed8`, `Indexed4`, `Indexed1` |
+| `per_image_bit_depth: bool` | `false` | encode each DIB entry at its own `IcoImage::bit_depth` (`1/4/8/24/32`; anything else falls back to `bmp_bit_depth`) — faithful mixed-depth re-encode |
+| `embed_metadata: bool` | `true` | write ICC / Exif / XMP / gamma into PNG-routed entries (DIBs cannot carry them) |
+
+`DecodeOptions` (`#[non_exhaustive]`, `Default`, `with_*`):
+
+| Field | Default | Meaning |
+|---|---|---|
+| `max_width` / `max_height: Option<u32>` | `None` | per-entry geometry limits (the format caps both at 256 anyway) |
+| `max_pixels: Option<u64>` | `None` | per-entry pixel limit |
+| `max_bytes: Option<u64>` | `Some(1 GiB)` | decoded RGBA bytes a call may produce (one entry for `decode`, the sum for `decode_all`) |
+| `strict: bool` | `false` | refuse trailing bytes after the last payload; forwarded to the PNG / DIB decoders |
+| `entry: EntrySelection` | `Largest` | which entry `decode` returns (ignored by `decode_all`) |
+
+Limits are checked against the directory rows and payload headers
+before any pixel buffer is allocated, and forwarded to the `oxideav-png`
+/ `oxideav-bmp` decoders so a payload header that disagrees with its
+directory row cannot bypass them. A hit is `Error::LimitExceeded`.
+
+## Metadata and colour
+
+The ICO / CUR container carries no colour information and no metadata
+of its own; both come from the sub-image payload:
+
+- **Embedded PNG**: `color` from `sRGB` / `cICP` / `iCCP` / `gAMA` +
+  `cHRM` as `oxideav-png` resolves them; `metadata.icc` / `exif` / `xmp`
+  from `iCCP` / `eXIf` / XMP `iTXt`, `metadata.gamma` from `gAMA` (the
+  PNG file-gamma exponent, e.g. `0.45455`). On encode the same chunks
+  are written back (`embed_metadata`).
+- **DIB**: a V4 / V5 header's `LCS_sRGB` / `LCS_WINDOWS_COLOR_SPACE` tag
+  decodes to `ColorInfo::srgb()`, a V5 embedded ICC profile to
+  `metadata.icc`. The classic 40-byte `BITMAPINFOHEADER` — every
+  real-world icon — has neither.
+- **Default** when the payload says nothing: `ColorInfo::ico_default()`
+  = full-range device RGB (`range: Full`, `primaries: 2`, `transfer: 2`,
+  `matrix: 0`). This is a convention of the crate, not a definition of
+  the format, so it is reported on the standalone `IcoImage` but **not**
+  stamped on registry frames.
+
+`info` reports `color` / `has_icc` / `has_exif` / `has_xmp` for the
+primary entry from the payload header alone (PNG chunk walk, DIB V4/V5
+header), without decoding pixels.
+
+## Limits
+
+- Dimensions `1..=256` per axis (the directory format), checked on read
+  and on write; up to 65 535 entries per file.
+- Default decode budget 1 GiB of RGBA output per call; every entry is
+  bounded before its payload is touched.
+- `decode_all` on a hostile 65 535-entry directory checks the whole
+  directory against the limits first, so it cannot allocate its way past
+  `max_bytes` one entry at a time.
+- Hostile input never panics: `probe` / `info` / `decode` /
+  `decode_all` / `decode_rgba8` are fuzzed (`ico_contract`), the raw
+  directory and ANI walkers separately (`ico_raw_parser`,
+  `ani_raw_parser`), the codec round trip too (`ico_self_roundtrip`).
 
 ## Scope
 
-- Read: ICO + CUR, PNG + BMP sub-images at 1/4/8/16/24/32-bpp
+- Read: ICO + CUR, PNG + DIB sub-images at 1/4/8/16/24/32-bpp
   (indexed + direct), 1..=256 px in each axis.
 - Write: RGBA inputs; PNG, 32-bpp BGRA, 24-bpp BGR, or 1/4/8-bpp
-  indexed BMP output per entry (mixed depths in one file via
-  `per_image_bit_depth`).
-- Not implemented: Windows Vista-era `PNG-inside-BMP-header` quirk
-  (where the directory entry claims BMP but the body is secretly
-  PNG). Nobody writes this; the reader already handles it because it
-  sniffs the body bytes.
-- ANI (Windows animated cursor, RIFF/ACON) is parsed by the
-  separate `read_ani_raw` helper (see "ANI" below). `read_ico_raw`
-  still refuses ANI input cleanly — its error message points the
-  caller at `read_ani_raw`.
+  indexed DIB output per entry (mixed depths in one file via
+  `per_image_bit_depth`). No 16-bpp DIB writer.
+- Not implemented: the Windows Vista-era "PNG inside a BMP-claiming
+  directory entry" quirk is handled implicitly — the reader sniffs the
+  body bytes, never the directory's claim.
+- ANI (Windows animated cursor, RIFF/ACON) has its own model (see
+  "ANI" below). `read_ico_raw` refuses ANI input cleanly — its error
+  message points the caller at `read_ani_raw`; `probe` returns `false`.
+
+## Deprecated pre-contract names
+
+Kept for one release as thin wrappers: `read_ico(&[u8]) -> (IconType,
+Vec<IconImage>)` (use `info` + `decode_all`), `write_ico(IconType,
+&[IconImage], WriteOptions)` (use `encode_all` / `encode_images`),
+`IconImage` (RGBA `pixels` + extras; converts to / from `IcoImage`) and
+`WriteOptions` (keeps its historical `png_size_threshold = Some(64)`
+default; `into_encode_options(icon_type)` maps it). The ANI depth API
+(`AniFrame`, `AniWriteFrame`, `AniWriteOptions::ico`) now speaks
+`IcoImage` / `EncodeOptions` directly.
 
 ## Picking a sub-image
 
@@ -151,9 +242,9 @@ For multi-resolution `.ico` files where the caller wants a single best
 match for a given render size:
 
 ```rust
-use oxideav_ico::{read_ico, select_best_fit, select_by_dimensions, select_largest};
+use oxideav_ico::{decode_all, select_best_fit, select_by_dimensions, select_largest, IcoImage};
 
-let (_, images) = read_ico(&bytes)?;
+let images: Vec<IcoImage> = decode_all(&bytes)?.into_iter().map(|f| f.image).collect();
 // Closest fit for a 32×32 slot. Prefers the smallest entry ≥ 32,
 // falls back to the largest available when every entry is smaller.
 // Bit-depth breaks ties (32-bpp beats 1-bpp at the same resolution).
@@ -171,11 +262,15 @@ let idx = select_by_dimensions(&images, 256, 256);
 
 `select_best_fit` / `select_largest` match the spirit of Windows'
 `LookupIconIdFromDirectoryEx`; `select_by_dimensions` is the strict
-equality variant for callers that want a specific size or nothing.
+equality variant for callers that want a specific size or nothing. The
+same three heuristics drive `decode_with` through
+`DecodeOptions::entry` (`EntrySelection::BestFit(px)` / `Largest` /
+`Dimensions(w, h)`, plus `Index(i)`), which picks the entry from the
+directory rows and decodes only that one.
 
 ### Directory-level selection (before any decode)
 
-The three `select_*` functions above operate on a `Vec<IconImage>` —
+The three `select_*` functions above operate on decoded `IcoImage`s —
 i.e. **after** every sub-image has been decoded to RGBA. Windows'
 `LookupIconIdFromDirectoryEx` works the other way around: it picks a
 *directory entry* from its `bWidth` / `bHeight` / `wBitCount` first,
@@ -190,7 +285,8 @@ let (_ty, entries) = read_ico_raw(&bytes)?;
 // Closest fit for a 32-px slot — chosen from directory metadata only,
 // no PNG / BMP body decoded yet.
 let idx = select_best_fit_raw(&entries, 32).unwrap();
-let chosen = &entries[idx];           // now decode just chosen.data
+let chosen = &entries[idx];           // now decode just this one:
+let img = oxideav_ico::decode_entry(chosen, &oxideav_ico::DecodeOptions::default())?;
 ```
 
 `select_largest_raw` and `select_by_dimensions_raw` are the directory
@@ -305,8 +401,8 @@ ANI input, so the two containers stay disjoint at probe time.
 
 ### Decoded playback (`read_ani`)
 
-`read_ani` is the ANI-side counterpart of `read_ico`: where `read_ico`
-decodes one icon resource's sub-images to RGBA, `read_ani` decodes a
+`read_ani` is the ANI-side counterpart of `decode_all`: where
+`decode_all` decodes one icon resource's sub-images, `read_ani` decodes a
 whole animation — every stored frame's sub-images **and** the resolved
 playback timeline — in one call.
 
@@ -329,7 +425,7 @@ for step in &anim.steps {
 ```
 
 It walks the RIFF/`ACON` tree (via `read_ani_raw`), decodes each
-`LIST 'fram'` `icon` frame to RGBA (via `read_ico` — each frame is a
+`LIST 'fram'` `icon` frame to RGBA (via `decode_all` — each frame is a
 complete ICO/CUR resource, so it may itself carry several resolutions,
 grouped per frame in `AniFrame { icon_type, images }`), and resolves
 the `seq ` / `rate` chunks into the same flat `Vec<AniStep>` timeline
@@ -378,8 +474,8 @@ the raw pixel rows through the same BMP-DIB decoder, yielding one
 opaque). Only the non-indexed depths `{16, 24, 32}` are decodable: at
 `iBitCount <= 8` the ACON reference leaves the raw colour-table layout
 *undefined*, so those frames are refused (the raw bytes stay reachable
-via `read_ani_raw` + `raw_bmp_descriptor`). Gated behind the
-default-on `registry` feature, alongside `read_ico`.
+via `read_ani_raw` + `raw_bmp_descriptor`). Like the rest of the
+decode surface, `read_ani` works with `default-features = false`.
 
 The `LIST 'INFO'` metadata is surfaced both raw and decoded. The
 `AniInfo::title` / `author` fields hold the verbatim `INAM` / `IART`
@@ -599,11 +695,12 @@ RIFF/`ACON` byte stream that `read_ani` parses back to an equivalent
 animation. Each frame is one `AniWriteFrame` (a complete ICO/CUR
 resource's worth of sub-images, mixed-resolution allowed, with its own
 `icon_type` — ICO and CUR frames may be mixed); every sub-image is encoded
-to its `icon` chunk via `write_ico`, and `AniWriteOptions` carries the
+to its `icon` chunk via `encode_all`, and `AniWriteOptions` carries the
 animation-level metadata (`LIST 'INFO'` title / author), the optional
 `seq ` playback order, the optional per-step `rate` table, the default
-per-step duration (`anih.iDispRate`), and the per-sub-image PNG / BMP
-`WriteOptions`. `write_ani` produces the common `AF_ICON`-set path (each
+per-step duration (`anih.iDispRate`), and the per-sub-image PNG / DIB
+`EncodeOptions` (its `icon_type` is overridden by each frame's own).
+`write_ani` produces the common `AF_ICON`-set path (each
 frame is a full ICO/CUR resource); the compact `AF_ICON`-clear raw-BMP
 path has its own encoder, `write_ani_raw_frames` (below). It rejects up
 front anything `read_ani` would
@@ -620,19 +717,19 @@ case (the reader applies its `nSteps = nFrames` default) and set to the
 ```rust
 use oxideav_ico::{
     read_ani, write_ani, AniInfo, AniWriteFrame, AniWriteOptions,
-    IconImage, IconType, WriteOptions,
+    EncodeOptions, IcoImage, IconType,
 };
 
 let frames = vec![
-    AniWriteFrame { icon_type: IconType::Cur, images: vec![IconImage::from_rgba(32, 32, rgba_a)] },
-    AniWriteFrame { icon_type: IconType::Cur, images: vec![IconImage::from_rgba(32, 32, rgba_b)] },
+    AniWriteFrame { icon_type: IconType::Cur, images: vec![IcoImage::from_rgba8(32, 32, rgba_a)?] },
+    AniWriteFrame { icon_type: IconType::Cur, images: vec![IcoImage::from_rgba8(32, 32, rgba_b)?] },
 ];
 let opts = AniWriteOptions {
     info: AniInfo { title: Some(b"Spinner\0".to_vec()), author: None },
     sequence: Some(vec![0, 1, 0, 1]),   // play A,B,A,B
     rates: Some(vec![6, 6, 6, 6]),      // 6 jiffies each
     default_jiffies: 6,
-    ico: WriteOptions { png_size_threshold: None, ..Default::default() }, // all-BMP
+    ico: EncodeOptions::new().with_png_size_threshold(None), // all-DIB
 };
 let bytes = write_ani(&frames, &opts)?;
 let anim = read_ani(&bytes)?;            // decodes back to an equivalent animation
@@ -785,8 +882,18 @@ the authoritative bound). `write_ani_raw` mirrors the reject.
 
 ## Fuzzing
 
-The `fuzz/` crate ships three complementary cargo-fuzz targets:
+The `fuzz/` crate ships four complementary cargo-fuzz targets:
 
+- `ico_contract` — arbitrary fuzz bytes → the standalone image-crate
+  API (`probe` / `info` / `decode` / `decode_all` / `decode_rgba8` /
+  `decode_rgb8` / `decode_with` + `EntrySelection`). Asserts the
+  geometry invariants every decoded entry must satisfy (one packed
+  `Rgba` plane of `4 × w × h` bytes, `1..=256` dimensions, `info` and
+  `decode` agreeing, `decode_all` yielding `info.frames` frames with
+  ascending `index`), that tight `DecodeOptions` fail with
+  `LimitExceeded`, and that an accepted file re-encodes through
+  `encode_all` (32-bpp DIB: byte-exact; per-image depth: alpha exact,
+  opaque colour exact) and decodes back.
 - `ico_self_roundtrip` — RGBA → `make_encoder` → packet → `make_decoder`
   → RGBA pixel-equality. Catches encoder bugs that emit corrupt
   sub-images and decoder bugs that mis-parse legitimate output.
@@ -808,5 +915,5 @@ The `fuzz/` crate ships three complementary cargo-fuzz targets:
   per-chunk lengths, the `nFrames` / `nSteps` counts, and the `seq `
   step indices all feed offset arithmetic and allocation sizing.
 
-Run with `cargo fuzz run ico_raw_parser` (or `ico_self_roundtrip` /
-`ani_raw_parser`).
+Run with `cargo fuzz run ico_contract` (or `ico_raw_parser` /
+`ico_self_roundtrip` / `ani_raw_parser`).
