@@ -46,6 +46,7 @@ if oxideav_ico::probe(&bytes) {
     let out = oxideav_ico::encode_rgba8(w, h, &rgba, &opts)?;   // single-entry icon
     std::fs::write("copy.ico", out)?;
 }
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 The whole contract surface works with `default-features = false`: the
@@ -244,6 +245,7 @@ match for a given render size:
 ```rust
 use oxideav_ico::{decode_all, select_best_fit, select_by_dimensions, select_largest, IcoImage};
 
+# let bytes = std::fs::read("app.ico")?;
 let images: Vec<IcoImage> = decode_all(&bytes)?.into_iter().map(|f| f.image).collect();
 // Closest fit for a 32×32 slot. Prefers the smallest entry ≥ 32,
 // falls back to the largest available when every entry is smaller.
@@ -258,6 +260,7 @@ let idx = select_largest(&images).unwrap();
 // that size (no nearest-fit substitution). Bit-depth breaks ties when
 // the same size appears at several depths.
 let idx = select_by_dimensions(&images, 256, 256);
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 `select_best_fit` / `select_largest` match the spirit of Windows'
@@ -281,12 +284,14 @@ that order, running the same heuristics over the undecoded
 ```rust
 use oxideav_ico::{read_ico_raw, select_best_fit_raw};
 
+# let bytes = std::fs::read("app.ico")?;
 let (_ty, entries) = read_ico_raw(&bytes)?;
 // Closest fit for a 32-px slot — chosen from directory metadata only,
 // no PNG / BMP body decoded yet.
 let idx = select_best_fit_raw(&entries, 32).unwrap();
 let chosen = &entries[idx];           // now decode just this one:
 let img = oxideav_ico::decode_entry(chosen, &oxideav_ico::DecodeOptions::default())?;
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 `select_largest_raw` and `select_by_dimensions_raw` are the directory
@@ -422,6 +427,7 @@ for step in &anim.steps {
         largest.width, largest.height, frame.icon_type, step.jiffies
     );
 }
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 It walks the RIFF/`ACON` tree (via `read_ani_raw`), decodes each
@@ -444,12 +450,15 @@ resource with its own directory — `AniAnimation::frame_at_step(i)` /
 loop gets the displayed frame and its active hotspot per step directly:
 
 ```rust
+# use oxideav_ico::read_ani;
+# let elapsed: u64 = 0;
 let anim = read_ani(&std::fs::read("cursor.ani")?)?;
 // At some elapsed jiffy offset into one cycle:
 let step = anim.step_at_jiffy(elapsed % anim.total_jiffies())?;
 let frame = anim.frame_at_step(step).unwrap();
 let hot = anim.hotspot_at_step(step);   // where to anchor the cursor now
 let display = frame.primary_image().unwrap();
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 `AniAnimation` also carries the same wall-clock helpers `AniFile` does,
@@ -492,6 +501,7 @@ if let Some(title) = ani.info.title_str() {
 if let Some(author) = ani.info.author_str() {
     println!("author: {author}");
 }
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 The accessors interpret the payload as Latin-1 (every byte
@@ -571,6 +581,7 @@ let frame_bytes = &ani.frames[steps[active_step].frame_index as usize];
 // the call site (loop with `seconds % cycle_seconds`).
 let elapsed_seconds: f64 = 0.28 % cycle_seconds;
 let active_step = ani.step_at_second(elapsed_seconds)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 `playback_steps` resolves the spec's defaulting rules — `nSteps = nFrames`
@@ -684,6 +695,7 @@ use oxideav_ico::{read_ani_raw, write_ani_raw};
 let ani = read_ani_raw(&std::fs::read("cursor.ani")?)?;
 let bytes = write_ani_raw(&ani)?;        // value-stable round-trip
 assert_eq!(read_ani_raw(&bytes)?, ani);
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 ### Encoded playback (`write_ani`)
@@ -719,6 +731,8 @@ use oxideav_ico::{
     read_ani, write_ani, AniInfo, AniWriteFrame, AniWriteOptions,
     EncodeOptions, IcoImage, IconType,
 };
+# let rgba_a = vec![0u8; 32 * 32 * 4];
+# let rgba_b = rgba_a.clone();
 
 let frames = vec![
     AniWriteFrame { icon_type: IconType::Cur, images: vec![IcoImage::from_rgba8(32, 32, rgba_a)?] },
@@ -734,6 +748,7 @@ let opts = AniWriteOptions {
 let bytes = write_ani(&frames, &opts)?;
 let anim = read_ani(&bytes)?;            // decodes back to an equivalent animation
 assert_eq!(anim.steps.len(), 4);
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 ### Encoding `AF_ICON`-clear raw-BMP frames (`write_ani_raw_frames`)
@@ -750,6 +765,8 @@ sub-image per frame).
 use oxideav_ico::{
     read_ani, write_ani_raw_frames, AniRawWriteOptions, RawFrameBitDepth,
 };
+# let rgba_a = vec![0u8; 32 * 32 * 4];
+# let rgba_b = rgba_a.clone();
 
 // Every frame shares one geometry — the raw path has a single anih
 // descriptor for the whole file. Each is (width, height, RGBA bytes).
@@ -765,6 +782,7 @@ let opts = AniRawWriteOptions {
 let bytes = write_ani_raw_frames(&frames, &opts)?;
 let anim = read_ani(&bytes)?;
 assert_eq!(anim.frames.len(), 2);
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 Only the two direct-colour depths `read_ani` can decode on the raw path
@@ -796,6 +814,7 @@ surfaces exactly the four `anih` fields that path needs:
 
 ```rust
 use oxideav_ico::read_ani_raw;
+# fn decode_headerless_bmp(_frame: &[u8], _w: u32, _h: u32, _bpp: u32, _planes: u32) {}
 
 let ani = read_ani_raw(&std::fs::read("raw-cursor.ani")?)?;
 match ani.raw_bmp_descriptor()? {
@@ -813,6 +832,7 @@ match ani.raw_bmp_descriptor()? {
         }
     }
 }
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 It returns `None` for the icon/cursor path (the `anih` advisory geometry
