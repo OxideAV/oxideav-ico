@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-ico/compare/v0.0.7...v0.0.8) - 2026-10-04
+
+### Other
+
+- README examples use the current registry API
+- fleet-sweep verification + dual-shape adapter for oxideav_png::PngImage::new
+- README in the contract order + CHANGELOG for the image-crate API
+- ci-standalone runs the full suite and clippy; ico_contract fuzz target
+- image-crate API contract — root vocabulary, Rgba IcoImage, standalone bmp/png decode, registry adapter
+- *(ani)* satisfy clippy::byte_char_slices in a padding test
+- *(ani)* test 16-bpp AF_ICON-clear raw-BMP decode path
+- *(ani)* add ani_raw_parser cargo-fuzz target
+- *(ani)* reject duplicate seq / rate chunks in read_ani_raw
+- add CI / crates.io / docs.rs / MIT-license badges
+- assert write_ani_raw_frames wire form is byte-stable
+- document write_ani_raw_frames + raw-path demuxer bit-depth
+- integration-test write_ani_raw_frames across read_ani + demuxer
+- ANI demuxer surfaces AF_ICON-clear raw-BMP bit-depth
+- write_ani_raw_frames — AF_ICON-clear raw-BMP encoder
+- IconImage::with_bit_depth/with_hotspot builders + re-encode test
+- document indexed / 24-bpp / mixed-depth BMP write path
+- per-image BMP bit-depth for faithful mixed-depth icons
+- indexed/24-bpp ANI frame round-trips + 4-bpp encode coverage
+- writer emits 1/4/8-bpp indexed + 24-bpp BMP sub-images
+- indexed (1/4/8-bpp) + 24-bpp DIB sub-image encoders
+- test the framework Muxer (IcoMuxer) round-trip + error paths
+- document anih.cbSize validation + demuxer-shares-read_ico_raw hardening
+- integration-test the framework registration glue
+- test the Decoder/Encoder trait impls + make_* factories
+- ICO demuxer delegates directory walk to hardened read_ico_raw
+- integration-test indexed/low-bpp BMP-inside-ICO decode (1/4/8 bpp)
+- validate anih.cbSize on read + write (spec §'anih' mandate)
+- per-frame / per-step renderer accessors (primary image + hotspot)
+- directory-level select_*_raw (pick entry before decoding body)
+- demuxer surfaces anih geometry + carries AF_ICON-clear raw frames
+- register RIFF/ACON as a first-class framework Demuxer ("ani")
+- read_ani decodes AF_ICON-clear (headerless raw BMP) frames for {16,24,32} bpp
+- reject reserved anih.bfAttributes bits (31..2) on read + write
+- write_ani_raw enforces AF_SEQUENCE flag ⇄ seq-chunk coherence
+
 ### Changed
 
 - **Image-crate API contract** (`IMAGE_CRATE_API`, wave 4). The crate root now carries the fleet vocabulary: `probe`, `info -> ImageInfo`, `decode -> IcoImage`, `decode_with(&DecodeOptions)`, `decode_rgb8` / `decode_rgba8`, `decode_all -> Vec<Frame>` (+ `decode_all_with`), `decode_from<R: Read>`, `encode(&IcoImage, &EncodeOptions)`, `encode_all(&[Frame], …)` (+ `encode_images(&[IcoImage], …)`), `encode_rgb8` / `encode_rgba8`, `encode_to<W: Write>`; records `IcoImage { width, height, format, planes, color, metadata }` (+ extras `bit_depth`, `sub_format`, `hotspot`; fallible `new` / `packed` / `from_rgb8` / `from_rgba8`), `Plane`, `ColorInfo` / `ColorRange`, `Metadata`, `RgbImage` / `RgbaImage`, `ImageInfo` (+ `IcoEntryInfo` rows), `Frame { image, delay, index }`, `IcoPixelFormat` (`PixelFormat` alias; only `Rgba` — an ICO sub-image is the XOR + AND composition, which no indexed or alpha-less layout can carry), `EncodeOptions`, `DecodeOptions` (+ `EntrySelection`). `decode` returns the primary entry: largest by area, highest bit depth breaking a tie; `DecodeOptions::entry` selects otherwise (`Index` / `BestFit` / `Dimensions`)
