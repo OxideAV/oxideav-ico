@@ -85,22 +85,22 @@ pub use options::{DecodeOptions, EncodeOptions, EntrySelection};
 
 // ---- ICO-specific depth (the contract is a floor, not a ceiling) ----------
 pub use ani::{
-    read_ani_raw, write_ani_raw, AniFile, AniHeader, AniInfo, AniStep, RawBmpDescriptor, AF_ICON,
-    AF_SEQUENCE,
+    AF_ICON, AF_SEQUENCE, AniFile, AniHeader, AniInfo, AniStep, RawBmpDescriptor, read_ani_raw,
+    write_ani_raw,
 };
 pub use api::{decode_entry, decode_payload, encode_entry, encode_images};
 pub use raw::{
-    encode_indexed_dib_body, encode_rgb24_dib_body, quantise_rgba_to_indexed, read_ico_raw,
-    write_ico_raw, IconEntryRaw, PaletteEntry,
+    IconEntryRaw, PaletteEntry, encode_indexed_dib_body, encode_rgb24_dib_body,
+    quantise_rgba_to_indexed, read_ico_raw, write_ico_raw,
 };
-pub use reader::{read_ani, AniAnimation, AniFrame};
+pub use reader::{AniAnimation, AniFrame, read_ani};
 pub use types::{
-    select_best_fit, select_best_fit_raw, select_by_dimensions, select_by_dimensions_raw,
-    select_largest, select_largest_raw, BmpBitDepth, HotSpot, IconSubFormat, IconType,
+    BmpBitDepth, HotSpot, IconSubFormat, IconType, select_best_fit, select_best_fit_raw,
+    select_by_dimensions, select_by_dimensions_raw, select_largest, select_largest_raw,
 };
 pub use writer::{
-    write_ani, write_ani_raw_frames, AniRawWriteOptions, AniWriteFrame, AniWriteOptions,
-    RawFrameBitDepth,
+    AniRawWriteOptions, AniWriteFrame, AniWriteOptions, RawFrameBitDepth, write_ani,
+    write_ani_raw_frames,
 };
 
 // ---- Deprecated pre-contract names (one release) --------------------------
@@ -113,7 +113,7 @@ pub use writer::write_ico;
 
 // ---- Registry-gated framework surface -------------------------------------
 #[cfg(feature = "registry")]
-pub use codec::{make_decoder, make_encoder, IcoDecoder, IcoEncoder};
+pub use codec::{IcoDecoder, IcoEncoder, make_decoder, make_encoder};
 #[cfg(feature = "registry")]
 pub use registry::{
     __oxideav_entry, from_color_signal, register, register_codecs, register_containers,

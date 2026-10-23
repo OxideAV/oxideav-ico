@@ -6,7 +6,7 @@
 //! this module builds the animated-cursor model on top of it. Everything
 //! here is framework-free.
 
-use crate::ani::{read_ani_raw, AniInfo, AniStep};
+use crate::ani::{AniInfo, AniStep, read_ani_raw};
 use crate::error::{IcoError as Error, Result};
 use crate::image::IcoImage;
 use crate::options::DecodeOptions;
@@ -446,7 +446,7 @@ fn synthesize_headerless_dib(desc: &crate::RawBmpDescriptor, pixels: &[u8]) -> R
 mod tests {
     use super::*;
     use crate::ani::{AF_ICON, AF_SEQUENCE};
-    use crate::{decode_all, encode_images, EncodeOptions};
+    use crate::{EncodeOptions, decode_all, encode_images};
 
     /// All-DIB encode options (no PNG routing) for `icon_type`.
     fn dib_opts(icon_type: IconType) -> EncodeOptions {
@@ -868,10 +868,10 @@ mod tests {
         }
         // Every white pixel decodes to opaque white, every black to
         // opaque black (raw frames carry no AND mask → all opaque).
-        for px in anim.frames[0].images[0].to_rgba8().chunks_exact(4) {
+        for px in anim.frames[0].images[0].to_rgba8().as_chunks::<4>().0 {
             assert_eq!(px, &[255, 255, 255, 255]);
         }
-        for px in anim.frames[1].images[0].to_rgba8().chunks_exact(4) {
+        for px in anim.frames[1].images[0].to_rgba8().as_chunks::<4>().0 {
             assert_eq!(px, &[0, 0, 0, 255]);
         }
         assert_eq!(anim.steps.len(), 2);
@@ -962,7 +962,7 @@ mod tests {
         // write_ani_raw_frames produces a headerless-BMP ANI, and both
         // read_ani (pixel decode) and read_ani_raw + raw_bmp_descriptor
         // (geometry) consume its output.
-        use crate::{read_ani_raw, write_ani_raw_frames, AniRawWriteOptions, RawFrameBitDepth};
+        use crate::{AniRawWriteOptions, RawFrameBitDepth, read_ani_raw, write_ani_raw_frames};
         let red = [190, 30, 40, 255];
         let blue = [40, 30, 190, 255];
         let mkframe = |c: [u8; 4]| -> (u32, u32, Vec<u8>) {

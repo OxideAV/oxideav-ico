@@ -418,7 +418,7 @@ impl IcoImage {
             )));
         }
         let mut rgba = Vec::with_capacity(pixels * 4);
-        for px in data.chunks_exact(3) {
+        for px in data.as_chunks::<3>().0 {
             rgba.extend_from_slice(&[px[0], px[1], px[2], 0xFF]);
         }
         Self::packed(width, height, PixelFormat::Rgba, width as usize * 4, rgba)
@@ -524,7 +524,7 @@ impl IcoImage {
         if let Some(plane) = self.planes.first() {
             for y in 0..h {
                 let row = &plane.data[y * plane.stride..y * plane.stride + w * 4];
-                for px in row.chunks_exact(4) {
+                for px in row.as_chunks::<4>().0 {
                     out.extend_from_slice(&px[..3]);
                 }
             }
@@ -873,9 +873,11 @@ mod tests {
         assert!(!ColorInfo::ico_default().is_specified());
         assert!(ColorInfo::srgb().is_specified());
         assert!(!ColorInfo::unspecified().is_specified());
-        assert!(ColorInfo::unspecified()
-            .with_range(ColorRange::Limited)
-            .is_specified());
+        assert!(
+            ColorInfo::unspecified()
+                .with_range(ColorRange::Limited)
+                .is_specified()
+        );
         assert_eq!(ColorInfo::default(), ColorInfo::ico_default());
         assert!(Metadata::new().is_empty());
         assert!(!Metadata::new().with_gamma(0.45455).is_empty());

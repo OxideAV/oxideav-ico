@@ -20,7 +20,7 @@ use oxideav_core::{
     StreamInfo, TimeBase,
 };
 use oxideav_core::{
-    ContainerRegistry, Demuxer, Muxer, ProbeData, ProbeScore, ReadSeek, WriteSeek, MAX_PROBE_SCORE,
+    ContainerRegistry, Demuxer, MAX_PROBE_SCORE, Muxer, ProbeData, ProbeScore, ReadSeek, WriteSeek,
 };
 
 pub fn register(reg: &mut ContainerRegistry) {
@@ -470,7 +470,7 @@ impl Demuxer for AniDemuxer {
 mod tests {
     use super::*;
     use crate::ani::{AF_ICON, AF_SEQUENCE};
-    use crate::{encode_images, EncodeOptions, IcoImage, IconType};
+    use crate::{EncodeOptions, IcoImage, IconType, encode_images};
 
     /// All-DIB encode options for `icon_type`.
     fn dib_opts(icon_type: IconType) -> EncodeOptions {
@@ -515,8 +515,7 @@ mod tests {
 
     /// A solid-colour single-sub-image ICO byte stream, forced all-BMP.
     fn ico_frame(n: u32, rgba: [u8; 4]) -> Vec<u8> {
-        let pixels: Vec<u8> = std::iter::repeat(rgba)
-            .take((n * n) as usize)
+        let pixels: Vec<u8> = std::iter::repeat_n(rgba, (n * n) as usize)
             .flatten()
             .collect();
         let img = IcoImage::from_rgba8(n, n, pixels).unwrap();
@@ -601,8 +600,7 @@ mod tests {
             IcoImage::from_rgba8(
                 8,
                 8,
-                std::iter::repeat([1u8, 2, 3, 255])
-                    .take(64)
+                std::iter::repeat_n([1u8, 2, 3, 255], 64)
                     .flatten()
                     .collect(),
             )
@@ -610,8 +608,7 @@ mod tests {
             IcoImage::from_rgba8(
                 16,
                 16,
-                std::iter::repeat([9u8, 9, 9, 255])
-                    .take(256)
+                std::iter::repeat_n([9u8, 9, 9, 255], 256)
                     .flatten()
                     .collect(),
             )
@@ -646,8 +643,7 @@ mod tests {
         let img = IcoImage::from_rgba8(
             16,
             16,
-            std::iter::repeat([7u8, 7, 7, 255])
-                .take(256)
+            std::iter::repeat_n([7u8, 7, 7, 255], 256)
                 .flatten()
                 .collect(),
         )
@@ -668,8 +664,7 @@ mod tests {
         // walk only bounds-checked payload extents and would have
         // accepted this; delegating to `read_ico_raw` inherits its
         // cross-entry overlap rejection (a known icon-parser CVE shape).
-        let body = std::iter::repeat([1u8, 2, 3, 255])
-            .take(64)
+        let body = std::iter::repeat_n([1u8, 2, 3, 255], 64)
             .flatten()
             .collect::<Vec<_>>();
         let a = IcoImage::from_rgba8(8, 8, body.clone()).unwrap();
@@ -699,8 +694,7 @@ mod tests {
             IcoImage::from_rgba8(
                 8,
                 8,
-                std::iter::repeat([1u8, 2, 3, 255])
-                    .take(64)
+                std::iter::repeat_n([1u8, 2, 3, 255], 64)
                     .flatten()
                     .collect(),
             )
@@ -708,8 +702,7 @@ mod tests {
             IcoImage::from_rgba8(
                 16,
                 16,
-                std::iter::repeat([9u8, 8, 7, 255])
-                    .take(256)
+                std::iter::repeat_n([9u8, 8, 7, 255], 256)
                     .flatten()
                     .collect(),
             )
@@ -965,12 +958,10 @@ mod tests {
         // demuxer passes the raw bytes through and surfaces the anih
         // geometry on the stream params (the raw bodies are headerless,
         // so the geometry has nowhere else to live).
-        let f0: Vec<u8> = std::iter::repeat([0u8, 0, 200, 255])
-            .take(16)
+        let f0: Vec<u8> = std::iter::repeat_n([0u8, 0, 200, 255], 16)
             .flatten()
             .collect();
-        let f1: Vec<u8> = std::iter::repeat([0u8, 200, 0, 255])
-            .take(16)
+        let f1: Vec<u8> = std::iter::repeat_n([0u8, 200, 0, 255], 16)
             .flatten()
             .collect();
         let ani = build_raw_ani(&[f0.clone(), f1.clone()], 4, 4, 32, 7);
@@ -998,7 +989,7 @@ mod tests {
         // The AF_ICON-clear encoder's output flows through the framework
         // demuxer: geometry on the stream (width/height + bit-depth
         // extradata), one packet per step carrying the raw body bytes.
-        use crate::{write_ani_raw_frames, AniRawWriteOptions, RawFrameBitDepth};
+        use crate::{AniRawWriteOptions, RawFrameBitDepth, write_ani_raw_frames};
         let mk = |c: [u8; 4]| -> (u32, u32, Vec<u8>) {
             let mut v = Vec::new();
             for _ in 0..16 {

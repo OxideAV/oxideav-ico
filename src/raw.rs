@@ -134,7 +134,7 @@ pub fn read_ico_raw(input: &[u8]) -> Result<(IconType, Vec<IconEntryRaw>)> {
         other => {
             return Err(Error::invalid(format!(
                 "ICO: unknown idType {other} (expected 1=ICO or 2=CUR)"
-            )))
+            )));
         }
     };
     if count == 0 {
@@ -329,14 +329,14 @@ pub fn read_ico_raw(input: &[u8]) -> Result<(IconType, Vec<IconEntryRaw>)> {
         // BMP with biWidth=2 + biHeight=66 (doubled → 33), and the
         // hotspot (0, 128) silently slipped through the first-pass
         // check.
-        if let Some(ref h) = hotspot {
-            if (h.x as u32) >= width || (h.y as u32) >= height {
-                return Err(Error::invalid(format!(
-                    "CUR: entry {i} hotspot ({},{}) outside body sub-image {width}×{height} \
+        if let Some(ref h) = hotspot
+            && ((h.x as u32) >= width || (h.y as u32) >= height)
+        {
+            return Err(Error::invalid(format!(
+                "CUR: entry {i} hotspot ({},{}) outside body sub-image {width}×{height} \
                      (probe-vs-render: directory declared {declared_width}×{declared_height})",
-                    h.x, h.y
-                )));
-            }
+                h.x, h.y
+            )));
         }
         let bit_depth = sniff_bpp(&payload);
 
@@ -428,16 +428,15 @@ pub fn read_ico_raw(input: &[u8]) -> Result<(IconType, Vec<IconEntryRaw>)> {
         // u32 (< 4 bytes), the value is unobservable and earlier
         // dim/bit-depth checks have already taken responsibility for
         // "this isn't a DIB".
-        if sub_format == IconSubFormat::Bmp {
-            if let Some(size) = parse_dib_size(&payload) {
-                if !VALID_DIB_HEADER_SIZES.contains(&size) {
-                    return Err(Error::invalid(format!(
-                        "ICO: entry {i} body biSize = {size} \
+        if sub_format == IconSubFormat::Bmp
+            && let Some(size) = parse_dib_size(&payload)
+            && !VALID_DIB_HEADER_SIZES.contains(&size)
+        {
+            return Err(Error::invalid(format!(
+                "ICO: entry {i} body biSize = {size} \
                          (must be one of 40 = BITMAPINFOHEADER, \
                          108 = BITMAPV4HEADER, 124 = BITMAPV5HEADER)"
-                    )));
-                }
-            }
+            )));
         }
 
         // BMP body `biPlanes` consistency. The ICO/CUR spec mandates
@@ -460,15 +459,14 @@ pub fn read_ico_raw(input: &[u8]) -> Result<(IconType, Vec<IconEntryRaw>)> {
         // accepted ("unspecified — defer to a different field") for
         // tolerance with the wider ecosystem; `1` is the canonical
         // value. PNG entries don't have a `biPlanes` to validate.
-        if sub_format == IconSubFormat::Bmp {
-            if let Some(planes) = parse_dib_planes(&payload) {
-                if planes > 1 {
-                    return Err(Error::invalid(format!(
-                        "ICO: entry {i} body biPlanes = {planes} \
+        if sub_format == IconSubFormat::Bmp
+            && let Some(planes) = parse_dib_planes(&payload)
+            && planes > 1
+        {
+            return Err(Error::invalid(format!(
+                "ICO: entry {i} body biPlanes = {planes} \
                          (must be 0 or 1)"
-                    )));
-                }
-            }
+            )));
         }
 
         // BMP body `biCompression` consistency. The ICO spec narrows
@@ -501,15 +499,15 @@ pub fn read_ico_raw(input: &[u8]) -> Result<(IconType, Vec<IconEntryRaw>)> {
         // `biCompression` field (`< 20` bytes), the value is
         // unobservable and we don't flag it — earlier checks have
         // already taken responsibility for "this isn't a DIB".
-        if sub_format == IconSubFormat::Bmp {
-            if let Some(compression) = parse_dib_compression(&payload) {
-                if compression != BI_RGB && compression != BI_BITFIELDS {
-                    return Err(Error::invalid(format!(
-                        "ICO: entry {i} body biCompression = {compression} \
+        if sub_format == IconSubFormat::Bmp
+            && let Some(compression) = parse_dib_compression(&payload)
+            && compression != BI_RGB
+            && compression != BI_BITFIELDS
+        {
+            return Err(Error::invalid(format!(
+                "ICO: entry {i} body biCompression = {compression} \
                          (must be 0 = BI_RGB or 3 = BI_BITFIELDS)"
-                    )));
-                }
-            }
+            )));
         }
 
         // `bColorCount` consistency: must be 0 for ≥ 8 bpp (the palette
@@ -563,15 +561,14 @@ pub fn write_ico_raw(icon_type: IconType, entries: &[IconEntryRaw]) -> Result<Ve
         }
         // CUR hotspot must fall inside the sub-image. We mirror
         // `read_ico_raw`'s tolerance: `(0, 0)` is always accepted.
-        if icon_type == IconType::Cur {
-            if let Some(h) = e.hotspot {
-                if (h.x as u32) >= e.width || (h.y as u32) >= e.height {
-                    return Err(Error::invalid(format!(
-                        "CUR: entry {i} hotspot ({},{}) outside sub-image {}×{}",
-                        h.x, h.y, e.width, e.height
-                    )));
-                }
-            }
+        if icon_type == IconType::Cur
+            && let Some(h) = e.hotspot
+            && ((h.x as u32) >= e.width || (h.y as u32) >= e.height)
+        {
+            return Err(Error::invalid(format!(
+                "CUR: entry {i} hotspot ({},{}) outside sub-image {}×{}",
+                h.x, h.y, e.width, e.height
+            )));
         }
     }
 
@@ -624,11 +621,7 @@ pub fn write_ico_raw(icon_type: IconType, entries: &[IconEntryRaw]) -> Result<Ve
 /// The `ICONDIRENTRY` width / height fields are `u8`s; `0` encodes
 /// the 256 case (since a literal `256` doesn't fit).
 fn normalise_dim(byte: u8) -> u32 {
-    if byte == 0 {
-        256
-    } else {
-        byte as u32
-    }
+    if byte == 0 { 256 } else { byte as u32 }
 }
 
 /// Recognise the sub-image encoding by sniffing the first bytes of
@@ -1817,7 +1810,7 @@ mod tests {
         dib[0..4].copy_from_slice(&40u32.to_le_bytes()); // biSize = 40
         dib[4..8].copy_from_slice(&16u32.to_le_bytes()); // biWidth
         dib[8..12].copy_from_slice(&32u32.to_le_bytes()); // doubled biHeight → 16
-                                                          // biPlanes = 7 — outside the legal {0, 1} set.
+        // biPlanes = 7 — outside the legal {0, 1} set.
         dib[12..14].copy_from_slice(&7u16.to_le_bytes());
         dib[14..16].copy_from_slice(&32u16.to_le_bytes()); // biBitCount
         let entry = IconEntryRaw {
@@ -2541,7 +2534,7 @@ mod tests {
         dib[4..8].copy_from_slice(&16u32.to_le_bytes()); // biWidth = 16
         dib[8..12].copy_from_slice(&32u32.to_le_bytes()); // doubled biHeight → 16
         dib[12..14].copy_from_slice(&1u16.to_le_bytes()); // biPlanes = 1
-                                                          // biBitCount left at 0 (unspecified).
+        // biBitCount left at 0 (unspecified).
         let entry = IconEntryRaw {
             width: 16,
             height: 16,

@@ -7,7 +7,7 @@
 //! this module builds the animated-cursor files on top of it. Everything
 //! here is framework-free.
 
-use crate::ani::{write_ani_raw, AniFile, AniHeader, AniInfo, AF_ICON, AF_SEQUENCE};
+use crate::ani::{AF_ICON, AF_SEQUENCE, AniFile, AniHeader, AniInfo, write_ani_raw};
 use crate::error::{IcoError as Error, Result};
 use crate::image::IcoImage;
 use crate::options::EncodeOptions;
@@ -987,7 +987,7 @@ mod ani_write_tests {
         assert_eq!((img.width, img.height), (3, 2));
         assert_eq!(img.bit_depth, 24);
         // Every pixel: source RGB, alpha snapped to opaque.
-        for px in img.to_rgba8().chunks_exact(4) {
+        for px in img.to_rgba8().as_chunks::<4>().0 {
             assert_eq!(&px[0..3], &[10, 20, 200]);
             assert_eq!(px[3], 255);
         }

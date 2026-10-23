@@ -18,12 +18,12 @@ use crate::image::{
 };
 use crate::options::{DecodeOptions, EncodeOptions, EntrySelection};
 use crate::raw::{
-    encode_indexed_dib_body, encode_rgb24_dib_body, quantise_rgba_to_indexed, read_ico_raw,
-    write_ico_raw, IconEntryRaw,
+    IconEntryRaw, encode_indexed_dib_body, encode_rgb24_dib_body, quantise_rgba_to_indexed,
+    read_ico_raw, write_ico_raw,
 };
 use crate::types::{
-    select_best_fit_raw, select_by_dimensions_raw, select_largest_raw, BmpBitDepth, HotSpot,
-    IconSubFormat, IconType,
+    BmpBitDepth, HotSpot, IconSubFormat, IconType, select_best_fit_raw, select_by_dimensions_raw,
+    select_largest_raw,
 };
 
 const PNG_MAGIC: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
@@ -107,17 +107,17 @@ pub fn info(bytes: &[u8]) -> Result<ImageInfo> {
                 .get(..4)
                 .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                 .unwrap_or(0);
-            if bi_size >= 108 {
-                if let Ok(meta) = oxideav_bmp::BmpMetadata::from_dib(&p.data) {
-                    if matches!(
-                        meta.color_space,
-                        Some(oxideav_bmp::BmpColorSpace::SRgb)
-                            | Some(oxideav_bmp::BmpColorSpace::Windows)
-                    ) {
-                        out.color = ColorInfo::srgb();
-                    }
-                    out.has_icc = meta.icc_profile.is_some();
+            if bi_size >= 108
+                && let Ok(meta) = oxideav_bmp::BmpMetadata::from_dib(&p.data)
+            {
+                if matches!(
+                    meta.color_space,
+                    Some(oxideav_bmp::BmpColorSpace::SRgb)
+                        | Some(oxideav_bmp::BmpColorSpace::Windows)
+                ) {
+                    out.color = ColorInfo::srgb();
                 }
+                out.has_icc = meta.icc_profile.is_some();
             }
         }
     }
@@ -503,7 +503,7 @@ fn encode_dib_payload(width: u32, height: u32, rgba: &[u8], depth: BmpBitDepth) 
             let pixels = width as usize * height as usize;
             let mut rgb = Vec::with_capacity(pixels * 3);
             let mut transparent = Vec::with_capacity(pixels);
-            for px in rgba.chunks_exact(4) {
+            for px in rgba.as_chunks::<4>().0 {
                 rgb.extend_from_slice(&px[..3]);
                 transparent.push(px[3] == 0);
             }

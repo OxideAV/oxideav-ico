@@ -162,7 +162,9 @@ impl IcoImage {
                 need(4)?;
                 let mut out = Vec::with_capacity(w * h * 4);
                 for y in 0..h {
-                    for px in plane.data[y * plane.stride..y * plane.stride + w * 4].chunks_exact(4)
+                    for px in plane.data[y * plane.stride..y * plane.stride + w * 4]
+                        .as_chunks::<4>()
+                        .0
                     {
                         out.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
                     }
@@ -173,7 +175,9 @@ impl IcoImage {
                 need(3)?;
                 let mut out = Vec::with_capacity(w * h * 4);
                 for y in 0..h {
-                    for px in plane.data[y * plane.stride..y * plane.stride + w * 3].chunks_exact(3)
+                    for px in plane.data[y * plane.stride..y * plane.stride + w * 3]
+                        .as_chunks::<3>()
+                        .0
                     {
                         out.extend_from_slice(&[px[0], px[1], px[2], 0xFF]);
                     }
@@ -184,7 +188,9 @@ impl IcoImage {
                 need(3)?;
                 let mut out = Vec::with_capacity(w * h * 4);
                 for y in 0..h {
-                    for px in plane.data[y * plane.stride..y * plane.stride + w * 3].chunks_exact(3)
+                    for px in plane.data[y * plane.stride..y * plane.stride + w * 3]
+                        .as_chunks::<3>()
+                        .0
                     {
                         out.extend_from_slice(&[px[2], px[1], px[0], 0xFF]);
                     }
@@ -194,7 +200,7 @@ impl IcoImage {
             other => {
                 return Err(IcoError::unsupported(format!(
                     "ICO: pixel format {other:?} (expected Rgba, Bgra, Rgb24 or Bgr24)"
-                )))
+                )));
             }
         };
         let mut img = IcoImage::new(
@@ -336,7 +342,7 @@ oxideav_core::register!("ico", register);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{encode_images, EncodeOptions, IconType};
+    use crate::{EncodeOptions, IconType, encode_images};
     use oxideav_core::{CodecParameters, NullCodecResolver};
     use std::io::Cursor;
 
@@ -350,8 +356,7 @@ mod tests {
         let img = IcoImage::from_rgba8(
             8,
             8,
-            std::iter::repeat([3u8, 4, 5, 255])
-                .take(64)
+            std::iter::repeat_n([3u8, 4, 5, 255], 64)
                 .flatten()
                 .collect(),
         )

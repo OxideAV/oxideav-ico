@@ -127,34 +127,34 @@ impl DecodeOptions {
     /// running decoded-output total the call has committed to so far
     /// (including this sub-image).
     pub(crate) fn check(&self, width: u32, height: u32, bytes: u64) -> Result<()> {
-        if let Some(m) = self.max_width {
-            if width > m {
-                return Err(IcoError::limit(format!(
-                    "ICO: sub-image width {width} exceeds max_width {m}"
-                )));
-            }
+        if let Some(m) = self.max_width
+            && width > m
+        {
+            return Err(IcoError::limit(format!(
+                "ICO: sub-image width {width} exceeds max_width {m}"
+            )));
         }
-        if let Some(m) = self.max_height {
-            if height > m {
-                return Err(IcoError::limit(format!(
-                    "ICO: sub-image height {height} exceeds max_height {m}"
-                )));
-            }
+        if let Some(m) = self.max_height
+            && height > m
+        {
+            return Err(IcoError::limit(format!(
+                "ICO: sub-image height {height} exceeds max_height {m}"
+            )));
         }
         let pixels = u64::from(width) * u64::from(height);
-        if let Some(m) = self.max_pixels {
-            if pixels > m {
-                return Err(IcoError::limit(format!(
-                    "ICO: sub-image of {pixels} pixels exceeds max_pixels {m}"
-                )));
-            }
+        if let Some(m) = self.max_pixels
+            && pixels > m
+        {
+            return Err(IcoError::limit(format!(
+                "ICO: sub-image of {pixels} pixels exceeds max_pixels {m}"
+            )));
         }
-        if let Some(m) = self.max_bytes {
-            if bytes > m {
-                return Err(IcoError::limit(format!(
-                    "ICO: decoded output of {bytes} bytes exceeds max_bytes {m}"
-                )));
-            }
+        if let Some(m) = self.max_bytes
+            && bytes > m
+        {
+            return Err(IcoError::limit(format!(
+                "ICO: decoded output of {bytes} bytes exceeds max_bytes {m}"
+            )));
         }
         Ok(())
     }
@@ -324,10 +324,12 @@ mod tests {
             bytes.check(1, 1, 11),
             Err(IcoError::LimitExceeded(_))
         ));
-        assert!(DecodeOptions::new()
-            .unlimited()
-            .check(u32::MAX, u32::MAX, u64::MAX)
-            .is_ok());
+        assert!(
+            DecodeOptions::new()
+                .unlimited()
+                .check(u32::MAX, u32::MAX, u64::MAX)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -337,9 +339,11 @@ mod tests {
         assert!(e.routes_to_png(256, 256));
         assert!(!e.routes_to_png(255, 256));
         assert!(!e.with_png_size_threshold(None).routes_to_png(256, 256));
-        assert!(EncodeOptions::new()
-            .with_png_size_threshold(1)
-            .routes_to_png(1, 1));
+        assert!(
+            EncodeOptions::new()
+                .with_png_size_threshold(1)
+                .routes_to_png(1, 1)
+        );
         assert_eq!(e.icon_type, IconType::Ico);
         assert_eq!(e.bmp_bit_depth, BmpBitDepth::Bgra32);
     }

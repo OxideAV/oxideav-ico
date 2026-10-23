@@ -376,21 +376,21 @@ impl AniFile {
         // a caller constructing `AniFile` by hand could pass an
         // unexpected length; the accessor catches it rather than
         // silently truncating / panicking on out-of-bounds index.
-        if let Some(seq) = &self.sequence {
-            if seq.len() != step_count {
-                return Err(Error::invalid(format!(
-                    "ANI: playback_steps: sequence len {} != step count {step_count}",
-                    seq.len()
-                )));
-            }
+        if let Some(seq) = &self.sequence
+            && seq.len() != step_count
+        {
+            return Err(Error::invalid(format!(
+                "ANI: playback_steps: sequence len {} != step count {step_count}",
+                seq.len()
+            )));
         }
-        if let Some(rates) = &self.rates {
-            if rates.len() != step_count {
-                return Err(Error::invalid(format!(
-                    "ANI: playback_steps: rates len {} != step count {step_count}",
-                    rates.len()
-                )));
-            }
+        if let Some(rates) = &self.rates
+            && rates.len() != step_count
+        {
+            return Err(Error::invalid(format!(
+                "ANI: playback_steps: rates len {} != step count {step_count}",
+                rates.len()
+            )));
         }
 
         let mut out = Vec::with_capacity(step_count);
@@ -482,13 +482,13 @@ impl AniFile {
             ));
         }
         let step_count = self.resolved_step_count() as usize;
-        if let Some(rates) = &self.rates {
-            if rates.len() != step_count {
-                return Err(Error::invalid(format!(
-                    "ANI: total_jiffies: rates len {} != step count {step_count}",
-                    rates.len()
-                )));
-            }
+        if let Some(rates) = &self.rates
+            && rates.len() != step_count
+        {
+            return Err(Error::invalid(format!(
+                "ANI: total_jiffies: rates len {} != step count {step_count}",
+                rates.len()
+            )));
         }
         let default_jiffies = self.header.i_disp_rate;
         let mut total: u64 = 0;
@@ -828,7 +828,7 @@ pub fn read_ani_raw(input: &[u8]) -> Result<AniFile> {
                                 return Err(Error::invalid(
                                     "ANI: LIST 'fram' appeared before anih — \
                                      frame count is unknown",
-                                ))
+                                ));
                             }
                         };
                         frames = Some(parse_fram_list(list_body, expected)?);
@@ -959,7 +959,7 @@ pub fn write_ani_raw(ani: &AniFile) -> Result<Vec<u8>> {
         n => {
             return Err(Error::invalid(format!(
                 "ANI: write: header.i_bit_count = {n} (must be one of {{0, 1, 4, 8, 16, 24, 32}})"
-            )))
+            )));
         }
     }
     // `bfAttributes` reserved bits — mirror of `parse_anih`'s read-side
@@ -1014,13 +1014,13 @@ pub fn write_ani_raw(ani: &AniFile) -> Result<Vec<u8>> {
             }
         }
     }
-    if let Some(rates) = &ani.rates {
-        if rates.len() != step_count {
-            return Err(Error::invalid(format!(
-                "ANI: write: rates len {} != resolved step count {step_count}",
-                rates.len()
-            )));
-        }
+    if let Some(rates) = &ani.rates
+        && rates.len() != step_count
+    {
+        return Err(Error::invalid(format!(
+            "ANI: write: rates len {} != resolved step count {step_count}",
+            rates.len()
+        )));
     }
 
     // --- AF_SEQUENCE flag ⇄ seq-chunk coherence ------------------------
@@ -1305,7 +1305,7 @@ fn parse_anih(payload: &[u8]) -> Result<AniHeader> {
         n => {
             return Err(Error::invalid(format!(
                 "ANI: anih.iBitCount = {n} (must be one of {{0, 1, 4, 8, 16, 24, 32}})"
-            )))
+            )));
         }
     }
     // `bfAttributes` reserved bits. Per spec (the `ani-acon-format.md`
@@ -2200,7 +2200,7 @@ mod tests {
         // valid ICO. This is the contract the docstring promises:
         // "ready to feed to read_ico_raw when frames_are_icons()".
         use crate::types::{HotSpot, IconSubFormat, IconType};
-        use crate::{read_ico_raw, write_ico_raw, IconEntryRaw};
+        use crate::{IconEntryRaw, read_ico_raw, write_ico_raw};
 
         // Two distinct ICO frames — one ICO, one CUR with hotspot —
         // each carrying a PNG-magic-prefixed payload (the raw layer

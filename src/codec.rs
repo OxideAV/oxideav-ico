@@ -9,8 +9,8 @@
 //! [`crate::encode_entry`] — a thin adapter, one implementation.
 
 use oxideav_core::{
-    parse_options, CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Result, TimeBase,
-    VideoFrame,
+    CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Result, TimeBase, VideoFrame,
+    parse_options,
 };
 use oxideav_core::{Decoder, Encoder};
 
