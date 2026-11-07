@@ -45,6 +45,7 @@ fn decode_resource(input: &[u8], opts: &DecodeOptions) -> Result<(IconType, Vec<
 /// frame; this struct groups one frame's sub-images together, tagged
 /// with the container type the frame declared (`Ico` or `Cur`).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct AniFrame {
     /// The frame's own ICO/CUR container type (frames may be mixed —
     /// the ACON spec permits ICO and CUR frames in one file).
@@ -92,6 +93,7 @@ impl AniFrame {
 /// every frame's sub-images *and* the `seq ` / `rate` timeline merged
 /// into a flat step table a renderer can drive directly.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct AniAnimation {
     /// Optional `LIST 'INFO'` metadata (title / author).
     pub info: AniInfo,

@@ -59,6 +59,7 @@ pub fn write_ico(icon_type: IconType, images: &[IconImage], opts: WriteOptions) 
 /// several resolutions exactly as a `.ico` does — they all share the
 /// frame's `icon_type` and become one `icon` chunk.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct AniWriteFrame {
     /// The container type to write this frame as (`Ico` or `Cur`). The
     /// ACON spec permits mixing ICO and CUR frames in one file.
@@ -69,6 +70,25 @@ pub struct AniWriteFrame {
     pub images: Vec<IcoImage>,
 }
 
+impl AniWriteFrame {
+    /// Build a record from its mandatory fields.
+    pub fn new(icon_type: IconType, images: Vec<IcoImage>) -> Self {
+        Self { icon_type, images }
+    }
+
+    /// Set `icon_type`.
+    pub fn with_icon_type(mut self, icon_type: IconType) -> Self {
+        self.icon_type = icon_type;
+        self
+    }
+
+    /// Set `images`.
+    pub fn with_images(mut self, images: Vec<IcoImage>) -> Self {
+        self.images = images;
+        self
+    }
+}
+
 /// Encode-time knobs for [`write_ani`] — the animation-level metadata and
 /// timeline that sit alongside the per-frame pixel data.
 ///
@@ -77,6 +97,7 @@ pub struct AniWriteFrame {
 /// `default_jiffies`, no `LIST 'INFO'` metadata, and per-sub-image PNG /
 /// DIB selection per [`EncodeOptions::default`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct AniWriteOptions {
     /// Optional `LIST 'INFO'` title (`INAM`) / author (`IART`) payload
     /// bytes, written verbatim. `None` omits the chunk entirely (no empty
@@ -105,6 +126,38 @@ pub struct AniWriteOptions {
     /// [`crate::encode_all`] for every frame (its `icon_type` is
     /// overridden by each frame's own).
     pub ico: EncodeOptions,
+}
+
+impl AniWriteOptions {
+    /// Set `info`.
+    pub fn with_info(mut self, info: AniInfo) -> Self {
+        self.info = info;
+        self
+    }
+
+    /// Set `sequence`.
+    pub fn with_sequence(mut self, sequence: Option<Vec<u32>>) -> Self {
+        self.sequence = sequence;
+        self
+    }
+
+    /// Set `rates`.
+    pub fn with_rates(mut self, rates: Option<Vec<u32>>) -> Self {
+        self.rates = rates;
+        self
+    }
+
+    /// Set `default_jiffies`.
+    pub fn with_default_jiffies(mut self, default_jiffies: u32) -> Self {
+        self.default_jiffies = default_jiffies;
+        self
+    }
+
+    /// Set `ico`.
+    pub fn with_ico(mut self, ico: EncodeOptions) -> Self {
+        self.ico = ico;
+        self
+    }
 }
 
 impl Default for AniWriteOptions {
@@ -261,6 +314,7 @@ pub fn write_ani(frames: &[AniWriteFrame], opts: &AniWriteOptions) -> Result<Vec
 ///
 /// [`read_ani`]: crate::read_ani
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum RawFrameBitDepth {
     /// 32-bpp BGRA — full alpha preserved in the colour bits.
     #[default]
@@ -285,6 +339,7 @@ impl RawFrameBitDepth {
 /// per-sub-image [`EncodeOptions`] of the icon path don't apply; the only
 /// pixel-level knob is the target [`RawFrameBitDepth`].
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct AniRawWriteOptions {
     /// Optional `LIST 'INFO'` title / author, written verbatim (same as
     /// [`AniWriteOptions::info`]).
@@ -300,6 +355,38 @@ pub struct AniRawWriteOptions {
     pub default_jiffies: u32,
     /// Target bit-depth for the raw pixel rows.
     pub bit_depth: RawFrameBitDepth,
+}
+
+impl AniRawWriteOptions {
+    /// Set `info`.
+    pub fn with_info(mut self, info: AniInfo) -> Self {
+        self.info = info;
+        self
+    }
+
+    /// Set `sequence`.
+    pub fn with_sequence(mut self, sequence: Option<Vec<u32>>) -> Self {
+        self.sequence = sequence;
+        self
+    }
+
+    /// Set `rates`.
+    pub fn with_rates(mut self, rates: Option<Vec<u32>>) -> Self {
+        self.rates = rates;
+        self
+    }
+
+    /// Set `default_jiffies`.
+    pub fn with_default_jiffies(mut self, default_jiffies: u32) -> Self {
+        self.default_jiffies = default_jiffies;
+        self
+    }
+
+    /// Set `bit_depth`.
+    pub fn with_bit_depth(mut self, bit_depth: RawFrameBitDepth) -> Self {
+        self.bit_depth = bit_depth;
+        self
+    }
 }
 
 /// Pack a top-down RGBA image into the bottom-up direct-colour pixel

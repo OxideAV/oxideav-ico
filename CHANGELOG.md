@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `#[non_exhaustive]`: the enums `BmpBitDepth` and `RawFrameBitDepth`; the ANI records `AniInfo`, `AniFile`, `AniFrame`, `AniAnimation`, `AniWriteFrame`, `AniWriteOptions` and `AniRawWriteOptions`. Code outside the crate builds the write-side records through the constructors below and needs a `_ =>` arm when matching the bit-depth enums. Left as they are: `IconType` / `IconSubFormat` (closed by the format), the wire records `AniHeader`, `IconEntryRaw`, `RawBmpDescriptor`, the value types `HotSpot`, `AniStep`, `PaletteEntry`, and the deprecated `IconImage` / `WriteOptions`.
+
+### Added
+
+- `AniWriteFrame::new(icon_type, images)`; `with_*` setters for every field of `AniInfo`, `AniWriteFrame`, `AniWriteOptions` and `AniRawWriteOptions`.
+
 - edition 2024, MSRV 1.95
 
 ## [0.0.8](https://github.com/OxideAV/oxideav-ico/compare/v0.0.7...v0.0.8) - 2026-10-04

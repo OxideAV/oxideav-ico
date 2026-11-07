@@ -111,11 +111,26 @@ impl AniHeader {
 /// `String` apply their own decoder (commonly Windows-1252 or
 /// UTF-8).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AniInfo {
     /// `INAM` payload — animation title.
     pub title: Option<Vec<u8>>,
     /// `IART` payload — author.
     pub author: Option<Vec<u8>>,
+}
+
+impl AniInfo {
+    /// Set `title`.
+    pub fn with_title(mut self, title: Option<Vec<u8>>) -> Self {
+        self.title = title;
+        self
+    }
+
+    /// Set `author`.
+    pub fn with_author(mut self, author: Option<Vec<u8>>) -> Self {
+        self.author = author;
+        self
+    }
 }
 
 /// Decode a raw RIFF `INFO` string payload into a `String`.
@@ -174,6 +189,7 @@ impl AniInfo {
 
 /// Parsed ANI file: header + optional metadata + frame payloads.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AniFile {
     /// `anih` — animation header.
     pub header: AniHeader,

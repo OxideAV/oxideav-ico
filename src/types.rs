@@ -120,6 +120,7 @@ impl TryFrom<IconImage> for crate::IcoImage {
 /// PNG sub-images always carry full RGBA regardless of this setting —
 /// it only governs the BMP path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum BmpBitDepth {
     /// 32-bpp BGRA — the modern, lossless default (alpha in the colour
     /// bits, all-zero AND mask). No colour or transparency limits.
